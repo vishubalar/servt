@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'sync_failed' => 'No se pudo aplicar la tarea cron en el servidor.',
+    // One sentence per privileged step. They all used to share
+    // `sync_failed`, so a full disk and a missing group read the same.
+    'step' => [
+        'log_dir' => 'No se pudo crear el directorio de registros de tareas cron. Compruebe que haya espacio libre en disco y que /var/log sea escribible.',
+        'log_touch' => 'No se pudo crear el archivo de registro de la tarea cron en /var/log/cronjobs. Compruebe que hay espacio libre en disco y que la carpeta admite escritura.',
+        'log_chown' => 'No se pudo asignar el archivo de registro a la cuenta con la que se ejecuta la tarea. Compruebe que esa cuenta siga existiendo.',
+        'log_chmod' => 'No se pudieron establecer los permisos del archivo de registro.',
+        'rotation' => 'No se pudo instalar la política de rotación de registros, así que la tarea no se programó: su salida crecería sin límite.',
+        'write' => 'No se pudo escribir el archivo cron. Compruebe que haya espacio libre en disco.',
+        'chmod' => 'No se pudieron establecer los permisos del archivo cron. Cron ignora un archivo en el que no confía, así que la tarea no se programó.',
+        'remove' => 'No se pudo eliminar el archivo cron, así que la tarea sigue programada en el servidor.',
+        'remove_stale' => 'No se pudo eliminar el archivo cron antiguo tras el cambio de nombre. No se cambió nada, así que la tarea no queda programada dos veces.',
+        'detach_source' => 'No se pudo eliminar el archivo cron original del que se importó esta tarea. No se cambió nada, así que el comando no se ejecuta dos veces.',
+        'run_now' => 'No se pudo iniciar la tarea. Busque la referencia de abajo en el registro del sistema del servidor.',
+        'read_history' => 'No se pudo leer el registro de la tarea, así que no se pueden mostrar sus ejecuciones.',
+    ],
+    'invalid_expression' => 'La programación no es una expresión cron válida.',
+    'invalid_user' => 'El usuario seleccionado no existe en el servidor.',
+    'user_not_allowed' => 'Solo el administrador del panel puede ejecutar una tarea cron con una cuenta que no sea uno de los usuarios del sistema del panel.',
+    'unresolved_placeholder' => 'El comando aún contiene el marcador {path} o {php}; reemplázalo por el directorio de la aplicación y su binario de PHP.',
+    'no_newline' => 'Este valor no puede contener saltos de línea.',
+    'reserved_name' => 'Este nombre está reservado y no se puede usar.',
+    'shell_comment' => 'El comando contiene un comentario de shell (un # al principio de una palabra). Cron cortaría la línea ahí y la tarea no se ejecutaría bien. Quite el comentario o ponga el # entre comillas.',
+    'run_paused' => 'Esta tarea cron está en pausa. Actívela antes de ejecutarla.',
+    'run_already_running' => 'Esta tarea cron ya se está ejecutando desde «Ejecutar ahora». Espere a que termine esa ejecución.',
+    'switch_not_this_site' => 'Esta tarea cron no pertenece a este sitio.',
+    'switch_unknown_php' => 'La tarea cron :name no indica un PHP que el panel pueda cambiar. Edite su comando en su lugar.',
+    'switch_too_long' => 'La tarea cron :name superaría los 1000 caracteres con la nueva ruta de PHP. Edite su comando en su lugar.',
+];

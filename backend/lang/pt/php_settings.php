@@ -1,0 +1,61 @@
+<?php
+
+return [
+    'presets' => [
+        'low' => [
+            'title' => 'Tráfego baixo',
+            'description' => 'Alguns processos. Adequado à maioria das aplicações pequenas e o mais suave para um servidor pequeno.',
+        ],
+        'balanced' => [
+            'title' => 'Equilibrado',
+            'description' => 'Aguenta tráfego normal sem reservar memória que raramente precisa.',
+        ],
+        'high' => [
+            'title' => 'Tráfego alto',
+            'description' => 'Mantém processos prontos. Use quando a aplicação estiver realmente ocupada — reserva memória seja usada ou não.',
+        ],
+    ],
+
+    'disable_functions_presets' => [
+        'safe' => [
+            'title' => 'Recomendado',
+            'description' => 'Bloqueia todas as formas de executar um programa a partir do PHP — o que um web shell precisa e o que uma aplicação normal quase nunca faz.',
+        ],
+        'strict' => [
+            'title' => 'Rigoroso',
+            'description' => 'Bloqueia mais funções. É mais seguro, mas pode quebrar algumas aplicações.',
+        ],
+    ],
+
+    'errors' => [
+        'missing_account' => 'A conta Linux com que esta aplicação é executada não existe no servidor, por isso não foi escrito nenhum pool de PHP. O PHP-FPM não arranca de todo com um pool cujo utilizador não consegue resolver.',
+        'version_not_installed' => 'O PHP :version não está instalado neste servidor. Instale-o primeiro e depois selecione-o aqui.',
+        'version_busy' => 'O PHP :version ainda está a ser instalado ou removido. Aguarde que termine e depois mude a versão.',
+        'directive_invalid' => '":line" não é uma definição PHP. Use uma definição por linha, como display_errors = Off.',
+        'directive_managed' => '":line" altera :name, que é gerido pelo painel, por isso não pode ser definido aqui. Se esta tela tiver um campo para isso, use-o.',
+        'directive_extension' => '":line" carrega uma extensão PHP. Use a tela de extensões PHP.',
+        'directive_pm' => '":line" define o gerenciador de processos, que tem seus próprios campos nesta tela. Use esses campos.',
+        'directive_pool_forbidden' => '":line" muda como o pool PHP deste site é executado (usuário, socket, ambiente ou quais arquivos contam como PHP), por isso não pode ser definido aqui.',
+        'directive_fpm_only' => '":line" é uma configuração de pool do PHP-FPM. Este servidor usa OpenLiteSpeed, que não tem pools PHP-FPM, então não pode ser aplicada.',
+        'directive_slowlog_path' => '":line": o log lento deve ser gravado dentro da pasta logs deste site.',
+        'pm_spare_inconsistent' => 'Servidores iniciais, reserva mínima e reserva máxima devem estar todos definidos (ou todos vazios) e seguir reserva mín. (:min) ≤ início (:start) ≤ reserva máx. (:max) ≤ máx. filhos (:children). Caso contrário, o PHP-FPM não inicia.',
+        'unsupported_stack' => 'Este servidor usa OpenLiteSpeed, que não utiliza pools de PHP-FPM.',
+        'not_php_site' => 'Esta aplicação não serve PHP, portanto não há pool para lhe atribuir. Altere primeiro a forma como ela é servida.',
+        'already_isolated' => 'Esta aplicação já tem o seu próprio pool de PHP.',
+        'not_isolated' => 'Esta aplicação não está isolada.',
+        'needs_isolation' => 'Esta aplicação ainda não tem o seu próprio pool de PHP, por isso estes limites não poderiam ser aplicados. Atribua-lhe um primeiro e depois guarde.',
+        'basedir_absolute' => 'Cada caminho tem de ser absoluto, começando por /. «:path» não é.',
+        'basedir_root' => '«/» permite todo o sistema de ficheiros, o que deixaria o open_basedir ligado sem aplicar nada. Desative antes a definição.',
+        'basedir_traversal' => '«:path» não é permitido — os caminhos não podem conter «..».',
+        'write_failed' => 'Não foi possível escrever a configuração do pool. Nada foi alterado.',
+        'config_test_failed' => 'O PHP-FPM rejeitou a configuração, por isso não foi aplicada nem recarregada. A aplicação continua a ser servida exatamente como antes.',
+        'reload_failed' => 'O PHP-FPM não recarregou, por isso a configuração anterior foi restaurada.',
+        'no_sections' => 'Cabeçalhos de secção não são permitidos aqui — iniciariam um segundo pool dentro deste.',
+        'function_list' => 'Tem de ser uma lista de nomes de funções separados por vírgulas.',
+        'memory_unlimited' => 'Memória ilimitada (-1) não é permitida: uma aplicação poderia usar toda a memória do servidor e derrubar todas as outras aplicações. Informe um limite, como 512M.',
+        'memory_over_ram' => 'Isso é mais memória do que o servidor tem (:ram). Informe um limite menor.',
+        'memory_too_low' => 'É memória de menos: o PHP lê um número sem unidade como bytes, então a aplicação não conseguiria iniciar. Informe pelo menos 32M, por exemplo :suggestion.',
+        'post_below_upload' => 'O tamanho máximo de POST (:post) deve ser pelo menos o tamanho máximo de upload (:upload). Um upload é enviado dentro da requisição; caso contrário, uploads maiores falham sem nenhum erro.',
+        'prepend_outside_site' => 'O arquivo deve estar dentro da pasta desta aplicação (:root/…).',
+    ],
+];

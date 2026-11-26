@@ -1,0 +1,107 @@
+import { PageHeader } from "@/components/ui/page-header";
+import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
+import { TriangleAlert } from "lucide-react";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import {
+  getApplicationWaf,
+  getServerCapabilities,
+  getWafOptions,
+} from "@/lib/applications/get-applications";
+import { FirewallSection } from "@/components/applications/firewall/firewall-section";
+import { HideWhileReloadPending } from "@/components/applications/reload-pending-provider";
+import { DetectLogCard } from "@/components/applications/firewall/detect-log-card";
+import { AutoRefresh } from "@/components/ui/auto-refresh";
+import { getApplicationLog } from "@/lib/applications/get-application-logs";
+import { parseDetectLog } from "@/lib/firewall/parse-detect-log";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+import { isSettled } from "@/lib/applications/settled";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata({ params }) {
+  const { application } = await params;
+  const [t, result] = await Promise.all([
+    getTranslations("applications.firewall"),
+    getApplicationWaf(application),
+  ]);
+  return { title: `${t("pageTitle")} — ${result.application?.name ?? ""}` };
+}
+
+export default async function ApplicationFirewallPage({ params }) {
+  const { application: id } = await params;
+  const [permissions, appPermissions, t, result] = await Promise.all([
+    getPermissions(),
+    getPermissions("application", id).catch(() => []),
+    getTranslations("applications.firewall"),
+    getApplicationWaf(id),
+  ]);
+
+  if (!can(permissions, "application", "view")) return <PermissionDenied title={t("pageTitle")} />;
+  if (result.status === 404) redirect("/applications?gone=1");
+  if (result.status === 403) return <PermissionDenied title={t("pageTitle")} />;
+  if (result.failed || !result.application) return <LoadFailed description={t("loadFailed")} status={result.status} failure={result.failure} message={result.message} debug={result.debug} />;
+
+  const application = result.application;
+  if (!can(appPermissions, "app_firewall", "view", "application")) {
+    return <PermissionDenied title={t("pageTitle")} />;
+  }
+  const canManage = can(appPermissions, "app_firewall", "manage", "application");
+  const settled = isSettled(application);
+
+  const [{ categories, modes, failed: optionsFailed, status: optionsStatus, failure: optionsFailure, message: optionsMessage }, { webServer }] = settled
+    ? await Promise.all([getWafOptions(), getServerCapabilities()])
+    : [{ categories: [], modes: [], failed: false }, { webServer: null }];
+
+  const watching = settled && application.waf_enabled && application.waf_mode === "detect";
+  const detect = watching
+    ? await getApplicationLog(id, "waf_detect", { lines: 200 })
+    : null;
+  const detectFailed = detect?.status === "failed" || detect?.status === "locked";
+  const detectRows = detect?.log?.lines?.length ? parseDetectLog(detect.log.lines) : [];
+
+  const unsupported =
+    typeof application.waf_supported === "boolean"
+      ? !application.waf_supported
+      : webServer === "openlitespeed";
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("pageTitle")} />
+
+      {!settled ? (
+        <div className="rounded-2xl border bg-muted/30 p-6 text-sm text-muted-foreground">
+          {t("provisioning")}
+        </div>
+      ) : optionsFailed || categories.length === 0 || modes.length === 0 ? (
+        <LoadFailed description={t("loadFailed")} status={optionsStatus} failure={optionsFailure} message={optionsMessage} />
+      ) : (
+        <>
+          {unsupported ? (
+            <div className="flex max-w-4xl items-start gap-2.5 rounded-xl border border-warning/40 bg-warning/10 p-4 text-sm">
+              <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warning" />
+              <p>{t("openlitespeed")}</p>
+            </div>
+          ) : null}
+          <FirewallSection
+            appId={id}
+            application={application}
+            categories={categories}
+            modes={modes}
+            canManage={canManage}
+            detectCount={detectRows.length}
+            detectFailed={detectFailed}
+          />
+          {watching ? (
+            <HideWhileReloadPending appId={id}>
+              <AutoRefresh intervalMs={30000} stopAfterMs={600000} />
+              <DetectLogCard rows={detectRows} failed={detectFailed} />
+            </HideWhileReloadPending>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}

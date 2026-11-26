@@ -1,0 +1,116 @@
+import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
+import { Image as ImageIcon, Loader2, Download } from "lucide-react";
+import { fetchFilePreview, fileDownloadUrl } from "@/lib/api/files";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+// The download endpoint sends nosniff, so use the preview endpoint.
+export function ImagePreviewDialog({ appId, file, open, onOpenChange }) {
+  const t = useTranslations("applications.files");
+  const [state, setState] = useState({ status: "loading" });
+
+  // Reset during render so the previous image never paints for a frame.
+  const [seenPath, setSeenPath] = useState(file?.path);
+  if (seenPath !== file?.path) {
+    setSeenPath(file?.path);
+    setState({ status: "loading" });
+  }
+
+  useEffect(() => {
+    if (!file?.path) return undefined;
+    const controller = new AbortController();
+    let objectUrl = null;
+
+    fetchFilePreview(appId, file.path, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) {
+          if (result.url) URL.revokeObjectURL(result.url);
+          return;
+        }
+        if (result.url) {
+          objectUrl = result.url;
+          setState({ status: "loaded", url: result.url });
+        } else {
+          setState({ status: "error", message: result.error?.message ?? null });
+        }
+      })
+      .catch((err) => {
+        if (err?.name === "AbortError") return;
+        setState({ status: "error", message: null });
+      });
+
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [appId, file?.path]);
+
+  const downloadHref = file?.path ? fileDownloadUrl(appId, file.path) : null;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+              <ImageIcon className="size-5" />
+            </span>
+            <DialogTitle className="truncate font-mono text-base" title={file?.path}>
+              {file?.path}
+            </DialogTitle>
+          </div>
+          <DialogDescription className="pt-1">{t("imagePreview.subtitle")}</DialogDescription>
+        </DialogHeader>
+
+        <div className="relative flex max-h-[60vh] items-center justify-center overflow-auto rounded-lg border bg-muted/30">
+          {state.status === "loading" ? (
+            <div className="flex h-56 items-center justify-center">
+              <Loader2 className="size-5 animate-spin text-muted-foreground" aria-hidden />
+              <span className="sr-only">{t("imagePreview.loading")}</span>
+            </div>
+          ) : null}
+
+          {state.status === "error" ? (
+            <div className="flex h-56 flex-col items-center justify-center gap-2 px-6 text-center">
+              <p className="max-w-sm text-sm text-muted-foreground">
+                {state.message ?? t("imagePreview.loadFailed")}
+              </p>
+            </div>
+          ) : null}
+
+          {state.status === "loaded" ? (
+            // A blob URL: next/image has nothing to optimise, so a plain <img> is right.
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={state.url}
+              alt={file?.name ?? ""}
+              className="max-h-[60vh] w-auto max-w-full object-contain"
+            />
+          ) : null}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange?.(false)}>
+            {t("cancel")}
+          </Button>
+          {downloadHref ? (
+            <Button asChild>
+              <a href={downloadHref} download={file?.name}>
+                <Download className="size-4" />
+                {t("actions.download")}
+              </a>
+            </Button>
+          ) : null}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

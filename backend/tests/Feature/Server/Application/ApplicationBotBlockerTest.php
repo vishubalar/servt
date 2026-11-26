@@ -1,0 +1,289 @@
+<?php
+
+use App\Enums\AiBotPolicy;
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\WebServers\ApacheDriver;
+use App\Services\Server\WebServers\NginxDriver;
+use App\Services\Server\WebServers\OlsDriver;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+
+/**
+ * AI Bot Blocker: four plain-language policies, each resolved server-side from
+ * `config/ai_bots.php`'s three buckets (training, search, agent).
+ *
+ * Neither `block_training` nor `block_agents` may touch the search/citation bots;
+ * `block_agents` blocks live assistants but keeps the site citable; the vhost swap is
+ * reversible like Basic Auth's; the catalog endpoint never drifts from what the vhost blocks.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    ServerCapability::create([
+        'stack' => 'lemp',
+        'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => true],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    $systemUser = SystemUser::create(['username' => 'siteowner', 'home_path' => '/home/siteowner']);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Blog',
+        'slug' => 'blog',
+        'domain' => 'blog.test',
+        'site_type' => 'php',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+        'php_version' => '8.4',
+    ]);
+});
+
+function botBlockerHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->admin->createToken('t')->plainTextToken];
+}
+
+/** @param bool $testPasses whether `nginx -t` succeeds. */
+function fakeBotBlockerWebServer(bool $testPasses = true): void
+{
+    Process::fake(function ($process) use ($testPasses) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($args[0] ?? '') === 'nginx' && ($args[1] ?? '') === '-t') {
+            return Process::result(exitCode: $testPasses ? 0 : 1, errorOutput: $testPasses ? '' : 'invalid');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function botBlockerUrl(): string
+{
+    return '/api/applications/'.test()->application->id.'/bot-blocker';
+}
+
+it('lists the three policies with their resolved bot lists', function () {
+    $this->withHeaders(botBlockerHeaders())
+        ->getJson('/api/ai-bot-policies')
+        ->assertOk()
+        ->assertJsonPath('ai_bot_policies.allow_all.blocked_count', 0)
+        ->assertJsonPath('ai_bot_policies.allow_all.blocked_bots', []);
+
+    $response = $this->withHeaders(botBlockerHeaders())->getJson('/api/ai-bot-policies');
+
+    $training = $response->json('ai_bot_policies.block_training.blocked_bots');
+    $blockAll = $response->json('ai_bot_policies.block_all.blocked_bots');
+
+    expect($training)->toContain('GPTBot', 'ClaudeBot')
+        ->and($training)->not->toContain('OAI-SearchBot', 'PerplexityBot')
+        ->and($blockAll)->toContain('GPTBot', 'OAI-SearchBot', 'PerplexityBot')
+        ->and(count($blockAll))->toBeGreaterThan(count($training));
+});
+
+it('sets the policy, re-renders the vhost, and logs the change', function () {
+    fakeBotBlockerWebServer();
+
+    $this->withHeaders(botBlockerHeaders())
+        ->putJson(botBlockerUrl(), ['policy' => 'block_training'])
+        ->assertOk()
+        ->assertJsonPath('application.ai_bot_policy', 'block_training');
+
+    expect($this->application->fresh()->ai_bot_policy)->toBe(AiBotPolicy::BlockTraining)
+        ->and(ActivityLog::where('type', 'application')->where('action', 'ai_bot_policy_updated')->exists())->toBeTrue();
+
+    Process::assertRan(fn ($p) => ($p->command[0] ?? '') === 'nginx' && ($p->command[1] ?? '') === '-t');
+});
+
+it('writes the training bot names into the rendered vhost, not the search ones', function () {
+    $written = false;
+    Process::fake(function ($process) use (&$written) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        // The bot blocker's own file in the site's conf folder (v7's name).
+        if (($args[0] ?? '') === 'tee' && str_ends_with((string) end($args), '/conf/nginx/ai-bot-blocker.conf')) {
+            $written = true;
+            expect($process->input ?? '')->toContain('GPTBot')->not->toContain('OAI-SearchBot');
+        }
+
+        if (($args[0] ?? '') === 'nginx' && ($args[1] ?? '') === '-t') {
+            return Process::result(exitCode: 0);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeaders(botBlockerHeaders())
+        ->putJson(botBlockerUrl(), ['policy' => 'block_training'])
+        ->assertOk();
+
+    expect($written)->toBeTrue();
+});
+
+it('blocks live AI assistants but keeps the search crawlers under block_agents', function () {
+    // An assistant fetch costs a request and returns nothing; a search crawl is how the site
+    // gets cited.
+    $bots = AiBotPolicy::BlockAgents->blockedBots();
+
+    expect($bots)->toContain('ChatGPT-User', 'Claude-User', 'Perplexity-User')
+        ->and($bots)->toContain('GPTBot', 'ClaudeBot')
+        ->and($bots)->not->toContain('OAI-SearchBot', 'Claude-SearchBot', 'PerplexityBot');
+});
+
+it('keeps the three bot buckets disjoint', function () {
+    // A name in two buckets makes "which policy blocks this?" ambiguous and
+    // silently widens whichever policy the duplicate leaks into.
+    $training = (array) config('ai_bots.training');
+    $search = (array) config('ai_bots.search');
+    $agent = (array) config('ai_bots.agent');
+
+    expect(array_intersect($training, $search))->toBe([])
+        ->and(array_intersect($training, $agent))->toBe([])
+        ->and(array_intersect($search, $agent))->toBe([]);
+
+    // And block_all really is all of them, so no bucket can be forgotten.
+    expect(AiBotPolicy::BlockAll->blockedBots())
+        ->toHaveCount(count($training) + count($search) + count($agent));
+});
+
+it('exposes the new policy in the catalog', function () {
+    $response = $this->withHeaders(botBlockerHeaders())->getJson('/api/ai-bot-policies');
+
+    $agents = $response->json('ai_bot_policies.block_agents');
+
+    expect($agents['title'])->not->toBeEmpty()
+        ->and($agents['description'])->not->toBeEmpty()
+        // Strictly between the two neighbours it sits between.
+        ->and($agents['blocked_count'])->toBeGreaterThan(count($response->json('ai_bot_policies.block_training.blocked_bots')))
+        ->and($agents['blocked_count'])->toBeLessThan(count($response->json('ai_bot_policies.block_all.blocked_bots')));
+});
+
+it('restores the previous policy before failing when the config test fails', function () {
+    fakeBotBlockerWebServer(testPasses: false);
+
+    $this->withHeaders(botBlockerHeaders())
+        ->putJson(botBlockerUrl(), ['policy' => 'block_all'])
+        ->assertStatus(500);
+
+    expect($this->application->fresh()->ai_bot_policy)->toBe(AiBotPolicy::AllowAll)
+        ->and(ActivityLog::where('action', 'ai_bot_policy_updated')->exists())->toBeFalse();
+});
+
+it('is a no-op when the policy is unchanged', function () {
+    fakeBotBlockerWebServer();
+    $this->application->forceFill(['ai_bot_policy' => 'block_training'])->save();
+
+    $this->withHeaders(botBlockerHeaders())
+        ->putJson(botBlockerUrl(), ['policy' => 'block_training'])
+        ->assertOk();
+
+    expect(ActivityLog::where('action', 'ai_bot_policy_updated')->exists())->toBeFalse();
+});
+
+it('rejects an unknown policy value', function () {
+    $this->withHeaders(botBlockerHeaders())
+        ->putJson(botBlockerUrl(), ['policy' => 'block_googlebot'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors(['policy']);
+});
+
+it('refuses without manage permission', function () {
+    fakeBotBlockerWebServer();
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_bot_blocker', view: true, manage: false);
+
+    $this->withHeaders(['Authorization' => 'Bearer '.$viewer->createToken('t')->plainTextToken])
+        ->putJson(botBlockerUrl(), ['policy' => 'block_training'])
+        ->assertStatus(403);
+});
+
+describe('the opt-outs a user-agent block cannot do', function () {
+    it('keeps robots.txt-only tokens out of every blocked list', function () {
+        foreach ([AiBotPolicy::AllowAll, AiBotPolicy::BlockTraining, AiBotPolicy::BlockAgents, AiBotPolicy::BlockAll] as $policy) {
+            expect($policy->blockedBots())->not->toContain('Google-Extended')->not->toContain('Applebot-Extended');
+        }
+
+        // v7 listed this token although a user-agent block cannot implement the robots.txt opt-out.
+        expect(AiBotPolicy::LegacyV7->blockedBots())->toContain('Google-Extended');
+    });
+
+    it('hands the owner the robots.txt lines instead, for every policy that blocks training', function () {
+        $admin = User::factory()->admin()->create();
+
+        $response = $this->actingAs($admin)->getJson('/api/ai-bot-policies')->assertOk();
+
+        expect($response->json('robots_txt.lines'))->toBe("User-agent: Google-Extended\nDisallow: /\n\nUser-agent: Applebot-Extended\nDisallow: /\n")
+            ->and($response->json('robots_txt.note'))->toContain('robots.txt')
+            ->and($response->json('ai_bot_policies.allow_all.robots_txt_recommended'))->toBeFalse()
+            ->and($response->json('ai_bot_policies.block_training.robots_txt_recommended'))->toBeTrue()
+            ->and($response->json('ai_bot_policies.block_all.robots_txt_recommended'))->toBeTrue();
+    });
+});
+
+it('stores the explicit legacy policy without changing the normal v8 catalog', function () {
+    fakeBotBlockerWebServer();
+    $normal = AiBotPolicy::BlockAll->blockedBots();
+
+    $this->withHeaders(botBlockerHeaders())->putJson(botBlockerUrl(), ['policy' => 'legacy_v7'])
+        ->assertOk()->assertJsonPath('application.ai_bot_policy', 'legacy_v7');
+
+    expect($this->application->fresh()->ai_bot_policy)->toBe(AiBotPolicy::LegacyV7)
+        ->and(AiBotPolicy::LegacyV7->blockedBots())->toContain('Jasper', 'GPT', 'YouBot')
+        ->and(AiBotPolicy::BlockAll->blockedBots())->toBe($normal)->not->toContain('Jasper');
+
+    $this->withHeaders(botBlockerHeaders())->getJson('/api/ai-bot-policies')->assertOk()
+        ->assertJsonPath('ai_bot_policies.legacy_v7.blocked_bots', AiBotPolicy::LegacyV7->blockedBots());
+});
+
+it('renders broad legacy matching with a whole-agent Yandex exemption on every stack', function (string $driver) {
+    Process::fake();
+    $this->application->forceFill(['ai_bot_policy' => AiBotPolicy::LegacyV7])->save();
+    $rendered = app($driver)->renderConfig($this->application, '/home/siteowner/blog/public_html');
+
+    preg_match('/\(\^\(\?![^\r\n]*\)\)/', $rendered, $match);
+    expect($match)->not->toBeEmpty();
+    $regex = '~'.$match[0].'~i';
+
+    expect(preg_match($regex, 'Mozilla compatible Jasper/1.0'))->toBe(1)
+        ->and(preg_match($regex, 'Mozilla compatible gPtBot/1.0'))->toBe(1)
+        ->and(preg_match($regex, 'YandexBot Jasper'))->toBe(0)
+        ->and(preg_match($regex, 'Jasper YANDEXBOT'))->toBe(0)
+        ->and(preg_match($regex, 'Mozilla Chrome/128.0'))->toBe(0)
+        // v7 names with a space still match, and none reaches the config as a bare space:
+        // OLS's RewriteCond is unquoted.
+        ->and(preg_match($regex, 'Mozilla (compatible; Hugging Face crawler)'))->toBe(1)
+        ->and($match[0])->not->toContain(' ');
+})->with([
+    NginxDriver::class,
+    ApacheDriver::class,
+    OlsDriver::class,
+]);
+
+it('lets an allowed bot through on legacy_v7 even when a short v7 token sits inside its name', function (string $driver) {
+    Process::fake();
+    $this->application->forceFill(['ai_bot_policy' => AiBotPolicy::LegacyV7])->save();
+    $this->application->botRules()->create(['type' => 'allow', 'value' => 'GPTBot']);
+    $rendered = app($driver)->renderConfig($this->application->fresh(), '/home/siteowner/blog/public_html');
+
+    preg_match('/\(\^\(\?![^\r\n]*\)\)/', $rendered, $match);
+    $regex = '~'.$match[0].'~i';
+
+    // "GPT" is in v7's list; without the exemption it matches inside "GPTBot".
+    expect(preg_match($regex, 'Mozilla/5.0 (compatible; GPTBot/1.3)'))->toBe(0)
+        ->and(preg_match($regex, 'Mozilla/5.0 (compatible; gptbot/1.3)'))->toBe(0)
+        ->and(preg_match($regex, 'Mozilla/5.0 GPT-4 crawler'))->toBe(1)
+        ->and(preg_match($regex, 'Mozilla/5.0 (compatible; AIMatrix/1.0)'))->toBe(1)
+        ->and(preg_match($regex, 'YandexBot/3.0 AIMatrix'))->toBe(0);
+})->with([
+    NginxDriver::class,
+    ApacheDriver::class,
+    OlsDriver::class,
+]);

@@ -1,0 +1,64 @@
+"use client";
+
+import Link from "@/components/ui/app-link";
+import { Shield, UserCog } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { useUser } from "@/hooks/use-user";
+import { SidebarToggle } from "@/components/sections/sidebar-toggle";
+import { ThemeToggle } from "@/components/theme-toggle";
+import { LocaleSwitcher } from "@/components/sections/locale-switcher";
+import { UserMenu } from "@/components/sections/user-menu";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { useUnsaved } from "@/components/ui/unsaved-guard";
+import { OperationsIndicator } from "@/components/sections/operations-indicator";
+
+export function AppHeader({ impersonating = false, breadcrumb = null, operations = null }) {
+  const user = useUser();
+  const t = useTranslations("admin");
+  const tAccount = useTranslations("account");
+  const { guardNavigation } = useUnsaved();
+  const isAdmin = user?.is_admin;
+
+  return (
+    <header className="flex h-16 shrink-0 items-center gap-3 border-b bg-background/80 px-4 backdrop-blur-xl supports-[backdrop-filter]:bg-background/70 sm:px-6 max-sm:[&_button]:min-h-11 max-sm:[&_button]:min-w-11">
+      <SidebarToggle />
+      <div className="min-w-0 flex-1 max-sm:invisible">{breadcrumb}</div>
+      <div className="flex shrink-0 items-center gap-2">
+        {operations ? <OperationsIndicator canOpenApplications={operations.canOpenApplications} /> : null}
+        <LocaleSwitcher />
+        <ThemeToggle />
+        <UserMenu
+          impersonating={impersonating}
+          extraItems={
+            <>
+              <DropdownMenuItem asChild>
+                <Link
+                  href="/account"
+                  onClick={(event) => {
+                    if (guardNavigation("/account")) event.preventDefault();
+                  }}
+                >
+                  <UserCog className="size-4" />
+                  {tAccount("title")}
+                </Link>
+              </DropdownMenuItem>
+              {isAdmin && (
+                <DropdownMenuItem asChild>
+                  <Link
+                    href="/admin"
+                    onClick={(event) => {
+                      if (guardNavigation("/admin")) event.preventDefault();
+                    }}
+                  >
+                    <Shield className="size-4" />
+                    {t("switchToAdmin")}
+                  </Link>
+                </DropdownMenuItem>
+              )}
+            </>
+          }
+        />
+      </div>
+    </header>
+  );
+}

@@ -1,0 +1,46 @@
+<?php
+
+/*
+ * PHP feature errors. Split from errors/runtime.php when PHP became its own
+ * feature: the shared keys carried a :runtime placeholder so Node and PHP
+ * could share a sentence, which is a coupling neither needed.
+ */
+
+return [
+    'not_installed' => 'PHP :version не установлен.',
+
+    // Version lookup, the ini editor and its rollback.
+    'unknown_version' => 'PHP :version не установлен на этом сервере.',
+    'unreadable' => 'Не удалось прочитать конфигурацию PHP :version.',
+    'invalid_ini' => 'PHP отклонил эту конфигурацию, предыдущая восстановлена. Перезагрузка не выполнялась.',
+    'ini_extension_outside_dir' => 'Расширения можно загружать только из собственной папки расширений PHP (:directory). Удалите или измените эту строку: :line',
+    'reload_failed' => 'Изменение внесено, но PHP :version не удалось перезагрузить, поэтому оно ещё не действует. Сообщите номер обращения в поддержку.',
+    'operation_failed' => 'Не удалось обновить конфигурацию PHP :version.',
+    'version_in_use' => 'PHP :version используется: :apps. Сначала измените эти приложения.',
+    'version_used_by_cronjobs' => 'PHP :version используется cron-задачами: :cronjobs. Сначала переключите их на другую версию или удалите.',
+    'version_is_default' => 'Это версия по умолчанию. Сначала выберите другую.',
+    'version_runs_panel' => 'Удаление PHP :version отключит панель — именно на этой версии она работает.',
+    'extension_builtin' => 'Расширение :extension встроено в PHP и не может быть отключено.',
+    'extension_runs_panel' => 'Отключение :extension остановит панель — ей нужны :modules.',
+
+    // LSPHP has no phpenmod equivalent. Refusing beats a control that
+    // reports success and changes nothing.
+    'unsupported_on_stack' => 'Это не поддерживается в стеке PHP :stack.',
+    'extension_not_disabled' => 'Не удалось отключить расширение :extension для PHP :version: оно по-прежнему загружено, поэтому ничего не изменилось.',
+    'extension_not_enabled' => 'Не удалось включить расширение :extension для PHP :version: оно по-прежнему не загружено, поэтому ничего не изменилось.',
+
+    'ioncube_unsupported_version' => 'ionCube не выпускает Loader для PHP :version.',
+    'ioncube_unsupported_architecture' => 'ionCube не выпускает Loader для архитектуры этого сервера (:architecture).',
+    'ioncube_external' => 'ionCube для PHP :version установлен вне панели (более ранней версией панели или системным пакетом), поэтому панель не будет его изменять. Он удаляется вместе с PHP :version.',
+    'ioncube_v7' => 'ionCube для PHP :version установлен Control Panel v7. Сначала удалите его здесь, затем установите заново.',
+    'ioncube_download_failed' => 'Не удалось скачать ionCube Loader. Проверьте доступ сервера в интернет и повторите попытку.',
+    'ioncube_invalid_loader' => 'Скачанный файл не является корректным ionCube Loader для этого сервера. Ничего не установлено.',
+    'ioncube_install_failed' => 'Не удалось установить ionCube Loader.',
+    'ioncube_discovery_failed' => 'Обнаружение ionCube Loader не смогло безопасно определить вашу установку PHP, поэтому ничего не было изменено.',
+    'ioncube_extraction_failed' => 'Не удалось распаковать архив ionCube.',
+    'ioncube_removal_failed' => 'Не удалось удалить ранее установленный ionCube Loader. Подробности см. в обращении.',
+    'ioncube_reload_failed' => 'Не удалось перезагрузить PHP. Изменения могут быть ещё не активны. Все резервные копии сохранены.',
+    'ioncube_rollback_failed' => 'Откат не выполнен; все резервные копии сохранены. Требуется ручное восстановление.',
+    'ioncube_config_test_failed' => 'Проверка конфигурации PHP не пройдена. Предыдущие файлы конфигурации были восстановлены, PHP не перезагружался.',
+    'not_a_php_server' => 'Этот сервер размещает контейнеры, поэтому не обслуживает PHP-сайты и не имеет версий PHP для управления. PHP по-прежнему установлен для самой панели, а его службу можно перезапустить в разделе «Службы».',
+];

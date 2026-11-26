@@ -1,0 +1,177 @@
+import { useForm, useWatch } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useRefresh } from "@/hooks/use-refresh";
+import { toast } from "sonner";
+import { useTranslations } from "next-intl";
+import { Loader2, Pencil, Sparkles } from "lucide-react";
+import { databaseUserFormSchema } from "@/lib/schemas/database";
+import { updateDatabaseUser } from "@/lib/api/databases";
+import { handleValidationError } from "@/lib/api/handle-validation-error";
+import { useRestartConfirm } from "@/components/databases/use-restart-confirm";
+import { scrollToFirstError } from "@/lib/forms/scroll-to-first-error";
+import { Button } from "@/components/ui/button";
+import { ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { PasswordInput } from "@/components/ui/password-input";
+import { randomPassword } from "@/lib/databases/random";
+import { FormModal } from "@/components/ui/form-modal";
+import {
+  Form,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormControl,
+  FormMessage,
+} from "@/components/ui/form";
+import { UserFields } from "@/components/databases/user-fields";
+
+export function EditUserDialog({ database, user, open, onOpenChange, remoteUsers = true }) {
+  const t = useTranslations("databases.users");
+  const restart = useRestartConfirm();
+  const tc = useTranslations("common");
+  const { refreshAndWait } = useRefresh();
+  const isMongo = database?.driver === "mongo";
+
+  const defaults = {
+    username: user?.username ?? "",
+    password: "",
+    connection_preference: user?.connection_preference ?? "localhost",
+    host: user?.host ?? "",
+  };
+
+  const form = useForm({
+    resolver: zodResolver(databaseUserFormSchema),
+    mode: "onBlur",
+    defaultValues: defaults,
+  });
+
+  const values = useWatch({ control: form.control });
+
+  async function onSubmit(submitted) {
+    const payload = {};
+    if (submitted.username !== defaults.username) {
+      payload.username = submitted.username;
+    }
+    if (
+      submitted.connection_preference !== defaults.connection_preference ||
+      submitted.host !== defaults.host
+    ) {
+      payload.connection_preference = submitted.connection_preference;
+      if (submitted.connection_preference === "remote") {
+        payload.host = submitted.host;
+      }
+    }
+    if (submitted.password) payload.password = submitted.password;
+    if (submitted.restart_cluster) payload.restart_cluster = true;
+
+    if (Object.keys(payload).length === 0) {
+      onOpenChange?.(false);
+      return;
+    }
+
+    try {
+      await updateDatabaseUser(database.id, user.id, payload);
+      await refreshAndWait();
+      toast.success(t("updated"));
+      onOpenChange?.(false);
+    } catch (error) {
+      if (await restart.retry(error, () => onSubmit({ ...submitted, restart_cluster: true }))) return;
+      handleValidationError(error, form, { fallback: t("saveFailed") });
+    }
+  }
+
+  const isSubmitting = form.formState.isSubmitting;
+  const renaming = values.username !== defaults.username;
+  const needsPassword = isMongo && renaming && !values.password;
+
+  return (
+    <Form {...form}>
+      <FormModal
+        open={open}
+        onOpenChange={onOpenChange}
+        asForm
+        onSubmit={form.handleSubmit(onSubmit, () => scrollToFirstError())}
+        icon={Pencil}
+        title={t("editTitle", { username: user?.username ?? "" })}
+        description={t("editSubtitle")}
+        footer={
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isSubmitting}
+              onClick={() => onOpenChange?.(false)}
+            >
+              {t("cancel")}
+            </Button>
+            <ReasonTooltip
+              reason={
+                isSubmitting
+                  ? null
+                  : needsPassword
+                    ? tc("mongoRenameNeedsPassword")
+                    : !form.formState.isDirty
+                      ? tc("nothingToSave")
+                      : null
+              }
+            >
+              <Button
+                type="submit"
+                disabled={isSubmitting || !form.formState.isDirty || needsPassword}
+              >
+                {isSubmitting && <Loader2 className="size-4 animate-spin" />}
+                {isSubmitting ? t("saving") : t("save")}
+              </Button>
+            </ReasonTooltip>
+          </>
+        }
+      >
+        <UserFields form={form} access={values.connection_preference} remoteUsers={remoteUsers} />
+
+        {isMongo && renaming ? (
+          <>
+            <p className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs leading-relaxed">
+              {t("mongoRenameWarning")}
+            </p>
+
+            {/* Mongo recreates the user on rename, so a password is required (422 otherwise). */}
+            <FormField
+              control={form.control}
+              name="password"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel required hint={t("newPasswordRequiredHint")}>{t("newPasswordRequired")}</FormLabel>
+                  <div className="flex items-start gap-2">
+                    <FormControl>
+                      <PasswordInput
+                        autoComplete="new-password"
+                        placeholder={t("passwordPlaceholder")}
+                        {...field}
+                      />
+                    </FormControl>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() =>
+                        form.setValue("password", randomPassword(), {
+                          shouldDirty: true,
+                        })
+                      }
+                    >
+                      <Sparkles className="size-4" />
+                      {t("generate")}
+                    </Button>
+                  </div>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </>
+        ) : null}
+
+        <p className="text-xs text-muted-foreground">{t("editHint")}</p>
+      {restart.dialog}
+      </FormModal>
+    </Form>
+  );
+}

@@ -1,0 +1,285 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { phpmyadminState, userCount } from "../lib/databases/phpmyadmin-state.js";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("MongoDB gets no button at all", () => {
+  assert.equal(phpmyadminState({ engine: "mongodb", installed: true, users: 3 }), "hidden");
+  // Even with everything else wrong, the engine decides first.
+  assert.equal(phpmyadminState({ engine: "mongodb", installed: false, users: 0 }), "hidden");
+});
+
+test("no phpMyAdmin site offers the install instead of a refusal", () => {
+  assert.equal(phpmyadminState({ engine: "mysql", installed: false, users: 2 }), "install");
+});
+
+test("a database with no users cannot sign in to phpMyAdmin", () => {
+  assert.equal(phpmyadminState({ engine: "mysql", installed: true, users: 0 }), "needs-user");
+});
+
+test("the ordinary case still opens", () => {
+  assert.equal(phpmyadminState({ engine: "mysql", installed: true, users: 1 }), "open");
+  assert.equal(phpmyadminState({ engine: "mariadb", installed: true, users: 5 }), "open");
+});
+
+test("a failed lookup must not offer to install a second copy", () => {
+  /*
+   * The regression this guards: treating null as false. One timed-out request
+   * would tell somebody with a working phpMyAdmin to install another one.
+   */
+  assert.equal(phpmyadminState({ engine: "mysql", installed: null, users: 2 }), "open");
+  assert.equal(phpmyadminState({ engine: "mysql", users: 2 }), "open");
+});
+
+test("an unknown user count is not zero users", () => {
+  // `users: null` means we did not count, and a button greyed out with
+  // "add a user first" would be a guess presented as a fact.
+  assert.equal(phpmyadminState({ engine: "mysql", installed: true, users: null }), "open");
+  assert.equal(phpmyadminState({ engine: "mysql", installed: true }), "open");
+});
+
+test("the user count is read from either payload shape", () => {
+  // The list sends a count, the detail page sends the array.
+  assert.equal(userCount({ users_count: 0 }), 0);
+  assert.equal(userCount({ users_count: 3 }), 3);
+  assert.equal(userCount({ users: [] }), 0);
+  assert.equal(userCount({ users: [{ id: 1 }, { id: 2 }] }), 2);
+  // Neither present — unknown, not zero.
+  assert.equal(userCount({}), null);
+  assert.equal(userCount(undefined), null);
+});
+
+test("the install link matches the create page's own parameter", () => {
+  /*
+   * The button links to /applications/create?type=phpmyadmin and the page
+   * validates that value against the server's site-type list. If either side
+   * renames the parameter the link silently stops prefilling — it still opens
+   * a working page, so nothing would fail.
+   */
+  const button = fs.readFileSync(
+    path.join(root, "components/databases/phpmyadmin-button.jsx"),
+    "utf8",
+  );
+  const shared = fs.readFileSync(path.join(root, "components/databases/db-tool-button.jsx"), "utf8");
+  const page = fs.readFileSync(
+    path.join(root, "app/(app)/applications/create/page.jsx"),
+    "utf8",
+  );
+
+  assert.match(button, /type: "phpmyadmin"/, "the button no longer links with ?type=");
+  assert.match(shared, /\/applications\/create\?type=\$\{tool\.type\}/, "the button no longer links with ?type=");
+  assert.match(page, /sp\?\.type/, "the create page no longer reads ?type=");
+  assert.match(page, /siteTypes\.some/, "the create page no longer validates ?type= against the real list");
+});
+
+test("a loaded users array outranks a missing count", () => {
+  /*
+   * The regression this file exists for. `GET /databases/{id}` loads the users
+   * but does not count them, so `users_count` is absent on every detail
+   * payload while `users` holds the real rows. The schema used to fill that
+   * absence with `.default(0)`, and userCount used to read the count first — so
+   * a database with a user answered 0, and its detail page disabled phpMyAdmin
+   * with "add a database user first" printed directly above the user.
+   */
+  assert.equal(userCount({ users: [{ id: 1 }] }), 1, "a loaded user was not counted");
+  assert.equal(userCount({ users: [{ id: 1 }], users_count: 0 }), 1, "a stale zero outranked the real rows");
+  assert.equal(
+    phpmyadminState({ engine: "mysql", installed: true, users: userCount({ users: [{ id: 1 }], users_count: 0 }) }),
+    "open",
+    "the detail page still refuses a database that has a user",
+  );
+
+  // The list shape keeps working: no array, real count.
+  assert.equal(userCount({ users_count: 4 }), 4);
+  assert.equal(userCount({ users_count: 0 }), 0, "a counted zero must stay zero");
+  // Neither shape present is unknown, never zero.
+  assert.equal(userCount({}), null);
+  // An empty loaded array IS a positive zero.
+  assert.equal(userCount({ users: [] }), 0);
+});
+
+test("the schema never invents a user count the API did not send", () => {
+  const schema = fs.readFileSync(path.join(root, "lib/schemas/database.js"), "utf8");
+  const line = schema.split("\n").find((l) => l.includes("users_count:"));
+  assert.ok(line, "users_count left the schema");
+  assert.doesNotMatch(
+    line,
+    /\.default\(/,
+    "users_count defaults again — an absent count becomes 0 and phpMyAdmin locks on every detail page",
+  );
+});
+
+// --- The picker, added when the SSO endpoint learned `application_id` ---
+
+test("a server with several installations is asked which one, not guessed at", () => {
+  const button = fs.readFileSync(path.join(root, "components/databases/db-tool-button.jsx"), "utf8");
+  assert.match(
+    button,
+    /sites !== null && sites\.length > 1/,
+    "one installation must still open on the first click; the menu is only for a real choice",
+  );
+  assert.match(button, /onSelect=\{\(\) => open\(site\.id\)\}/, "each entry opens its own installation");
+});
+
+test("the plain button does not hand its click event to the site id", () => {
+  const button = fs.readFileSync(path.join(root, "components/databases/db-tool-button.jsx"), "utf8");
+  assert.match(
+    button,
+    /onClick=\{\(\) => open\(\)\}/,
+    "`onClick={open}` passes the React event as application_id, which the API rejects as a non-integer",
+  );
+});
+
+test("no tab opens until the phpMyAdmin URL exists (Krishna, 2026-09-29)", () => {
+  // The old flow opened about:blank on the click and held it through the SSO
+  // call. The button now carries the wait and the tab opens onto phpMyAdmin.
+  const button = fs.readFileSync(path.join(root, "components/databases/db-tool-button.jsx"), "utf8");
+  const body = button.slice(button.indexOf("async function open("));
+  const firstAwait = body.indexOf("await tool.sso(");
+  const openTab = body.indexOf("openUrlInNewTab(url)");
+  // Straight onto phpMyAdmin — an empty tab navigated later still showed about:blank.
+  assert.doesNotMatch(button, /openBlankTab|paintPlaceholder|location\.replace/);
+  assert.ok(firstAwait !== -1 && openTab > firstAwait, "the tab must open only once the URL is known");
+  // No fallback toast with a second click (Krishna, 2026-09-30).
+  assert.doesNotMatch(body, /linkReady|openAnyway/);
+  // The button says what it is waiting for.
+  assert.match(button, /const label = opening \? t\("signingShort"\)/);
+});
+
+test("the id reaches the API as application_id, beside the user id it already sent", () => {
+  const client = fs.readFileSync(path.join(root, "lib/api/databases.js"), "utf8");
+  const fn = client.slice(client.indexOf("export function phpmyadminSso"));
+  assert.match(fn, /params\.application_id = applicationId/);
+  assert.match(fn, /params\.database_user_id = databaseUserId/, "the existing parameter must survive");
+  assert.match(
+    fn,
+    /Object\.keys\(params\)\.length > 0 \? params : undefined/,
+    "neither given, no query string — the API's own fallback picks the site",
+  );
+});
+
+test("the lookup fetches every installation, not just the first", () => {
+  const fetcher = fs.readFileSync(path.join(root, "lib/applications/get-applications.js"), "utf8");
+  const fn = fetcher.slice(fetcher.indexOf("export const getPhpmyadminSite"));
+  assert.doesNotMatch(
+    fn.slice(0, fn.indexOf("});")),
+    /per_page: 1\b/,
+    "per_page 1 cannot tell one installation from five",
+  );
+  assert.match(fn, /sites,/, "callers need the list to know whether there is a choice");
+});
+
+test("a failed lookup stays unknown rather than becoming an empty server", () => {
+  const fetcher = fs.readFileSync(path.join(root, "lib/applications/get-applications.js"), "utf8");
+  assert.match(
+    fetcher,
+    /if \(result\.failed\) return \{ sites: null, site: null, known: false \}/,
+    "an empty array would offer to install a second phpMyAdmin because one request timed out",
+  );
+});
+
+// --- PostgreSQL, the fourth engine (2026-09-10) ---
+
+test("the button hides for any driver phpMyAdmin cannot speak, not a list of names", () => {
+  // `IssuePhpmyadminSsoToken` refuses anything whose driver is not `sql`, so
+  // this asks the same question the same way.
+  assert.equal(phpmyadminState({ engine: "postgresql", driver: "pgsql", users: 1 }), "hidden");
+  assert.equal(phpmyadminState({ engine: "mongodb", driver: "mongo", users: 1 }), "hidden");
+  assert.equal(
+    phpmyadminState({ engine: "cockroach", driver: "crdb", users: 1 }),
+    "hidden",
+    "a driver we have never heard of is still not sql",
+  );
+  assert.equal(phpmyadminState({ engine: "mariadb", driver: "sql", installed: true, users: 1 }), "open");
+});
+
+test("a payload with no driver still hides MongoDB", () => {
+  // The fallback for an API that predates the field. It cannot know about
+  // PostgreSQL, which is why the driver is preferred whenever it is there.
+  assert.equal(phpmyadminState({ engine: "mongodb", users: 1 }), "hidden");
+  assert.equal(phpmyadminState({ engine: "mariadb", installed: true, users: 1 }), "open");
+});
+
+test("every engine's system databases are refused before the 422", async () => {
+  const { RESERVED_NAMES } = await import("../lib/schemas/database.js");
+  for (const name of ["mysql", "information_schema", "admin", "postgres", "template0", "template1"]) {
+    assert.ok(RESERVED_NAMES.includes(name), `${name} is a name the server owns`);
+  }
+});
+
+test("an unmeasured slow-query count is not a rate of zero", async () => {
+  const { slowQueryRate, slowQueriesTone } = await import("../lib/databases/health.js");
+
+  // PostgreSQL has no such counter without pg_stat_statements. `Number(null)`
+  // is 0 and 0 is finite, so without the guard this read as "no slow queries".
+  assert.equal(slowQueryRate({ slow_queries: null, uptime_seconds: 3600 }), null);
+  assert.equal(slowQueryRate({ uptime_seconds: 3600 }), null);
+  assert.equal(slowQueriesTone({ slow_queries: null, uptime_seconds: 3600 }), "normal");
+
+  // A real zero is still a real measurement.
+  assert.equal(slowQueryRate({ slow_queries: 0, uptime_seconds: 3600 }), 0);
+  assert.equal(slowQueryRate({ slow_queries: 10, uptime_seconds: 3600 }), 10);
+});
+
+test("the engines payload keeps the capability, and it defaults to permissive", async () => {
+  const { engineSchema } = await import("../lib/schemas/database.js");
+
+  const pg = engineSchema.parse({ engine: "postgresql", driver: "pgsql", supports_remote_users: false });
+  assert.equal(pg.supports_remote_users, false, "Zod strips what is not declared");
+
+  const older = engineSchema.parse({ engine: "mariadb", driver: "sql" });
+  assert.equal(
+    older.supports_remote_users,
+    true,
+    "an API that predates the field must not hide a control that works",
+  );
+});
+
+test("every engine the API can name has a label in every locale", async () => {
+  const fs = await import("node:fs");
+  for (const locale of ["en", "es", "hi"]) {
+    const engines = JSON.parse(fs.readFileSync(`messages/${locale}.json`, "utf8")).databases.engines;
+    for (const engine of ["mysql", "mariadb", "mongodb", "postgresql"]) {
+      // Built as `engines.${name}` from data, so check-i18n cannot catch a
+      // missing one — it renders the raw key path instead.
+      assert.ok(engines[engine], `${locale} is missing a label for ${engine}`);
+    }
+  }
+});
+
+test("remote access is offered from the capability, never from the engine name", async () => {
+  const fs = await import("node:fs");
+  const dialog = fs.readFileSync("components/databases/create-database-dialog.jsx", "utf8");
+
+  assert.match(dialog, /engine\?\.supports_remote_users !== false/);
+  assert.match(dialog, /<UserFields form=\{form\} access=\{values\.connection_preference\} remoteUsers=\{remoteUsers\} \/>/);
+  assert.match(fs.readFileSync("components/databases/user-fields.jsx", "utf8"), /\.\.\.\(remoteUsers/, "the two options are spread in, not rendered disabled");
+  assert.doesNotMatch(dialog, /=== "postgresql"/, "the engine name must not appear in this decision");
+
+  // Switching engine has to clear a preference the new one cannot honour, or
+  // an invisible `remote` stays in the form and the API refuses it.
+  assert.match(dialog, /form\.setValue\("connection_preference", "localhost"\)/);
+});
+
+test("the charset selects use each engine's own two words", async () => {
+  const fs = await import("node:fs");
+  const dialog = fs.readFileSync("components/databases/create-database-dialog.jsx", "utf8");
+  assert.match(dialog, /engine\?\.driver === "pgsql" \? "pgsqlWords" : "sqlWords"/);
+
+  for (const locale of ["en", "es", "hi"]) {
+    const create = JSON.parse(fs.readFileSync(`messages/${locale}.json`, "utf8")).databases.create;
+    for (const words of ["sqlWords", "pgsqlWords"]) {
+      assert.ok(create[words]?.charset, `${locale}.${words}.charset`);
+      assert.ok(create[words]?.collation, `${locale}.${words}.collation`);
+    }
+  }
+  assert.notEqual(
+    JSON.parse(fs.readFileSync("messages/en.json", "utf8")).databases.create.pgsqlWords.charset,
+    "Character set",
+    "PostgreSQL has an encoding, not a character set",
+  );
+});

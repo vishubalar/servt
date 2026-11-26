@@ -1,0 +1,391 @@
+<?php
+
+use App\Enums\DeploymentTrigger;
+use App\Jobs\DeployApplication;
+use App\Models\Application;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\ActivityLogger;
+use App\Services\Applications\SiteTypeManager;
+use App\Services\Server\Applications\ApplicationProvisioner;
+use App\Services\Server\Applications\DeploymentRecorder;
+use App\Services\Server\Applications\GitDeployer;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    $this->home = sys_get_temp_dir().'/sv-oss-script-'.getmypid();
+
+    $systemUser = SystemUser::create([
+        'username' => 'scriptuser', 'home_path' => $this->home, 'shell' => '/bin/bash', 'sudo' => false,
+    ]);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'App',
+        'slug' => 'app',
+        'domain' => 'app.example.com',
+        'site_type' => 'git',
+        'serving_profile' => 'php',
+        'php_version' => '8.4',
+        'web_root' => '/',
+        'status' => 'active',
+        'repository' => 'acme/app',
+        'repository_url' => 'https://github.com/acme/app.git',
+        'branch' => 'develop',
+    ]);
+
+    Process::fake(fn ($process) => fakeGitRemoteAnswer($process) ?? Process::result(exitCode: 0));
+});
+
+function deployNow(): void
+{
+    (new DeployApplication(test()->application->id, test()->admin->id))->handle(
+        app(GitDeployer::class),
+        app(ApplicationProvisioner::class),
+        app(ActivityLogger::class),
+        app(DeploymentRecorder::class),
+    );
+}
+
+/** The shell command the script ran inside, or null if none ran. */
+function scriptCommand(): ?string
+{
+    $found = null;
+
+    Process::assertRan(function ($process) use (&$found) {
+        $command = $process->command;
+
+        // `set -e` alone is not enough: seeding the .env is also a `set -e` runuser script.
+        // The `cd` into the checkout identifies the deploy script.
+        if (in_array('runuser', $command, true)
+            && str_contains(end($command), 'set -e')
+            && str_contains(end($command), "\ncd ")) {
+            $found = end($command);
+
+            return true;
+        }
+
+        return false;
+    });
+
+    return $found;
+}
+
+it('runs the deploy script as the site user, never as root', function () {
+    $this->application->update(['deploy_script' => "composer install --no-dev\nphp artisan migrate --force"]);
+
+    deployNow();
+
+    // `application:manage` must not be a route to running commands as root; the script is
+    // whatever the user typed, so the privilege drop is the control, not a character denylist.
+    Process::assertRan(fn ($process) => in_array('runuser', $process->command, true)
+        && in_array('-u', $process->command, true)
+        && in_array('scriptuser', $process->command, true));
+
+    expect(scriptCommand())->toContain('php artisan migrate --force');
+});
+
+it('stops at the first failing line', function () {
+    $this->application->update(['deploy_script' => "composer install\nphp artisan migrate --force"]);
+
+    deployNow();
+
+    // Without `set -e` a failed composer install is followed by the migration and the deploy
+    // reports success on a half-updated site.
+    expect(scriptCommand())->toStartWith('set -e');
+});
+
+it('substitutes the placeholders', function () {
+    $this->application->update(['deploy_script' => 'echo {path} {branch} {domain}']);
+
+    deployNow();
+
+    $command = scriptCommand();
+
+    expect($command)->toContain($this->home.'/app/public_html')
+        ->toContain('develop')
+        ->toContain('app.example.com')
+        ->not->toContain('{path}');
+});
+
+it('falls back to the old build command when no script is written', function () {
+    // An application configured before the Deployment screen existed must keep deploying as it did.
+    $this->application->update(['deploy_script' => null, 'build_command' => 'npm run build']);
+
+    expect(app(GitDeployer::class)->script($this->application))->toBe('npm run build');
+
+    deployNow();
+
+    expect(scriptCommand())->toContain('npm run build');
+});
+
+it('prefers the script once one is written', function () {
+    $this->application->update([
+        'build_command' => 'npm run build',
+        'deploy_script' => 'composer install',
+    ]);
+
+    expect(app(GitDeployer::class)->script($this->application))->toBe('composer install');
+});
+
+it('runs nothing extra when neither is set', function () {
+    $this->application->update(['deploy_script' => null, 'build_command' => null]);
+
+    deployNow();
+
+    // "Nothing extra" means nothing of the user's: .env seeding always runs and is also a runuser
+    // script, so match the deploy script by its `cd` rather than the shared mechanism.
+    Process::assertNotRan(fn ($process) => in_array('runuser', $process->command, true)
+        && str_contains((string) end($process->command), "\ncd "));
+});
+
+it('saves a script and reports what will run', function () {
+    $response = $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", [
+            'deploy_script' => "composer install --no-dev\nphp artisan migrate --force",
+            'branch' => 'main',
+        ])
+        ->assertOk();
+
+    expect($response->json('settings.deploy_script'))->toContain('artisan migrate')
+        ->and($response->json('settings.deploy_script_customised'))->toBeTrue()
+        ->and($response->json('settings.branch'))->toBe('main')
+        // Sent by the API, not hardcoded in the frontend, like the cron presets.
+        ->and($response->json('settings.placeholders'))->toContain('{path}');
+
+    $this->assertDatabaseHas('activity_logs', [
+        'type' => 'application',
+        'action' => 'deploy_script_updated',
+    ]);
+});
+
+it('strips carriage returns from a script pasted on Windows', function () {
+    $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", [
+            'deploy_script' => "composer install\r\nphp artisan migrate\r\n",
+        ])
+        ->assertOk();
+
+    // `sh` reads the \r as part of the command ("command not found: composer\r"), invisible in a
+    // terminal.
+    expect($this->application->fresh()->deploy_script)->not->toContain("\r");
+});
+
+it('refuses a branch that does not exist in the repository (bug #71)', function () {
+    // The repository answers, but has no such branch: an empty ls-remote.
+    Process::fake(fn ($process) => Process::result(output: ''));
+
+    $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", ['branch' => 'no-such-branch'])
+        ->assertStatus(422)
+        ->assertJsonPath('errors.branch.0', __('validation.git_branch_missing', ['branch' => 'no-such-branch']));
+
+    expect($this->application->fresh()->branch)->not->toBe('no-such-branch');
+    Process::assertRan(fn ($process) => in_array('ls-remote', $process->command, true)
+        && end($process->command) === 'refs/heads/no-such-branch');
+});
+
+it('asks the repository only when the branch actually changes', function () {
+    Process::fake();
+
+    $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", [
+            'deploy_script' => 'echo ok',
+            'branch' => $this->application->branch,
+        ])
+        ->assertOk();
+
+    Process::assertNotRan(fn ($process) => in_array('ls-remote', $process->command, true));
+});
+
+it('refuses a branch name that is not one', function (string $branch) {
+    $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", ['branch' => $branch])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('branch');
+})->with(['main; rm -rf /', 'feature branch', '$(whoami)', 'main`id`']);
+
+it('offers a starting script suited to the runtime', function () {
+    $response = $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments")
+        ->assertOk();
+
+    // A starting point, not a policy: it is the user's file once they open the screen.
+    expect($response->json('settings.default_deploy_script'))->toStartWith('cd {path}')
+        ->and($response->json('settings.deploy_script_customised'))->toBeFalse();
+});
+
+it('offers no starting script that pulls from git itself', function (array $attributes) {
+    $this->application->update($attributes);
+
+    // The panel fetches the branch with the account's credential before the script runs; a pull
+    // inside the script has no credential and fails on private repositories.
+    $default = $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments")
+        ->json('settings.default_deploy_script');
+
+    expect($default)->not->toContain('git ');
+})->with([
+    'php' => [['serving_profile' => 'php']],
+    'node' => [['serving_profile' => 'node']],
+    'node with a package manager' => [['serving_profile' => 'node', 'package_manager' => 'pnpm']],
+    'static' => [['serving_profile' => 'static']],
+    'proxy' => [['serving_profile' => 'proxy']],
+]);
+
+it('needs manage to change the script', function () {
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_deployment');
+
+    $this->actingAs($viewer)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", [
+            'deploy_script' => 'rm -rf /',
+        ])
+        ->assertForbidden();
+});
+
+it('still reports the default as the default after it is saved unchanged', function () {
+    $default = $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments")
+        ->json('settings.default_deploy_script');
+
+    // As the editor sends it back: Windows line endings, a trailing blank line.
+    $response = $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", [
+            'deploy_script' => str_replace("\n", "\r\n", $default)."\r\n",
+        ])
+        ->assertOk();
+
+    expect($response->json('settings.deploy_script_customised'))->toBeFalse();
+
+    // One real change and it is the user's own script.
+    $response = $this->actingAs($this->admin)
+        ->putJson("/api/applications/{$this->application->id}/deployment-settings", [
+            'deploy_script' => $default."php artisan migrate --force\n",
+        ])
+        ->assertOk();
+
+    expect($response->json('settings.deploy_script_customised'))->toBeTrue();
+});
+
+it('offers a PHP starting script that installs composer packages only when there are any', function () {
+    $default = $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments")
+        ->json('settings.default_deploy_script');
+
+    // Guarded, so a PHP repository with no composer.json does not fail.
+    expect($default)->toContain("if [ -f composer.json ]; then\n    composer install --no-dev");
+});
+
+it('lists each deploy stage once, however many commands it took', function () {
+    $deployment = app(DeploymentRecorder::class)->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+    $recorder = app(DeploymentRecorder::class);
+    $recorder->resume($deployment);
+
+    // `init` is git init and then setting the remote.
+    foreach (['init', 'init', 'fetch', 'checkout'] as $step) {
+        $recorder->step($step);
+    }
+
+    expect($deployment->fresh()->steps)->toBe(['init', 'fetch', 'checkout']);
+});
+
+/*
+ * v7's `{PHP81}`-style variables: one per installed version; a version that is not installed is
+ * refused.
+ */
+describe('v7 {PHPxx} variables', function () {
+    beforeEach(function () {
+        $this->phpDir = sys_get_temp_dir().'/sv-oss-deploy-php-'.getmypid();
+        foreach (['8.3', '8.4'] as $version) {
+            @mkdir("{$this->phpDir}/{$version}/fpm", 0755, true);
+        }
+        config(['server.php_dir' => $this->phpDir]);
+    });
+
+    afterEach(fn () => exec('rm -rf '.escapeshellarg($this->phpDir)));
+
+    it('turns {PHP83} into that version\'s PHP', function () {
+        $this->application->update(['deploy_script' => "{PHP83} artisan migrate --force\n{PHP84} -v"]);
+
+        deployNow();
+
+        expect(scriptCommand())->toContain('/usr/bin/php8.3 artisan migrate --force')
+            ->toContain('/usr/bin/php8.4 -v')
+            ->not->toContain('{PHP');
+    });
+
+    it('refuses to save a script naming a PHP that is not installed', function () {
+        $this->actingAs($this->admin)
+            ->putJson("/api/applications/{$this->application->id}/deployment-settings", ['deploy_script' => "{PHP74} artisan migrate\n{PHP84} -v"])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['deploy_script' => __('deployment.script_php_missing', ['variables' => '{PHP74}', 'versions' => '7.4'])]);
+
+        $this->actingAs($this->admin)
+            ->putJson("/api/applications/{$this->application->id}/deployment-settings", ['deploy_script' => '{PHP84} artisan migrate'])
+            ->assertOk();
+    });
+
+    it('stops a deploy before anything runs when the version has gone since', function () {
+        // Saved while 7.4 was installed, removed since.
+        $this->application->update(['deploy_script' => '{PHP74} artisan migrate']);
+
+        deployNow();
+
+        Process::assertNotRan(fn ($process) => in_array('runuser', $process->command, true)
+            && str_contains((string) end($process->command), "\ncd "));
+
+        expect($this->application->fresh()->failed_reason)->toBe('script_php_missing')
+            ->and($this->application->fresh()->failed_step)->toBe('script');
+    });
+
+    it('lists a variable for every installed version', function () {
+        $placeholders = $this->actingAs($this->admin)
+            ->getJson("/api/applications/{$this->application->id}/deployments")
+            ->json('settings.placeholders');
+
+        expect($placeholders)->toContain('{php}')->toContain('{PHP83}')->toContain('{PHP84}')->not->toContain('{PHP74}');
+    });
+
+    it('refuses the same when a git site is created with one', function () {
+        $rules = app(SiteTypeManager::class)->find('git')->rules();
+
+        expect(validator(['deploy_script' => '{PHP74} artisan migrate'], ['deploy_script' => $rules['deploy_script']])->fails())->toBeTrue()
+            ->and(validator(['deploy_script' => '{PHP83} artisan migrate'], ['deploy_script' => $rules['deploy_script']])->fails())->toBeFalse();
+    });
+
+    it('sends what each variable becomes, the values the deploy substitutes', function () {
+        $settings = $this->actingAs($this->admin)
+            ->getJson("/api/applications/{$this->application->id}/deployments")
+            ->json('settings');
+
+        expect($settings['placeholder_values'])->toMatchArray([
+            '{path}' => $this->application->codePath(),
+            '{branch}' => 'develop',
+            '{domain}' => 'app.example.com',
+            '{php}' => '/usr/bin/php8.4',
+            '{PHP83}' => '/usr/bin/php8.3',
+            '{PHP84}' => '/usr/bin/php8.4',
+        ])
+            // Every variable listed has a value to show.
+            ->and(array_keys($settings['placeholder_values']))->toEqualCanonicalizing($settings['placeholders']);
+
+        // And they are the values a deploy really uses.
+        $this->application->update(['deploy_script' => 'echo {path} {php} {PHP83}']);
+        deployNow();
+
+        expect(scriptCommand())->toContain('echo '.$settings['placeholder_values']['{path}'].' /usr/bin/php8.4 /usr/bin/php8.3');
+    });
+
+    it('leaves a script without them exactly as it was', function () {
+        $this->application->update(['deploy_script' => 'php artisan migrate --force']);
+
+        deployNow();
+
+        expect(scriptCommand())->toContain("\nphp artisan migrate --force");
+    });
+});

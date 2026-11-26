@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'install_started' => 'fail2ban wird installiert. Das dauert einen Moment.',
+
+    'bantime' => [
+        '10m' => '10 Minuten',
+        '1h' => '1 Stunde',
+        '1d' => '1 Tag',
+        '1w' => '1 Woche',
+        'permanent' => 'Dauerhaft',
+    ],
+
+    'created_successfully' => 'Fail2ban wurde erfolgreich konfiguriert!',
+    'test_failed' => 'Der Fail2ban-Konfigurationstest ist fehlgeschlagen.',
+    'rejected' => 'Fail2ban hat diese Konfiguration abgelehnt, daher wurde nichts geändert.',
+    'already_disabled' => 'Fail2ban ist für diese Anwendung bereits deaktiviert.',
+    'disabled_successfully' => 'Fail2ban wurde erfolgreich deaktiviert!',
+
+    'validation' => [
+        'jail_content_required' => 'Die Jail-Konfiguration ist erforderlich.',
+        'jail_content_string' => 'Die Jail-Konfiguration muss Text sein.',
+        'jail_content_max' => 'Die Jail-Konfiguration ist zu groß (max. 65535 Zeichen).',
+        'filter_content_required' => 'Die Filter-Konfiguration ist erforderlich.',
+        'filter_content_string' => 'Die Filter-Konfiguration muss Text sein.',
+        'filter_content_max' => 'Die Filter-Konfiguration ist zu groß (max. 65535 Zeichen).',
+        'foreign_jail' => 'Dieser Jail darf nur den eigenen Jail dieser Website konfigurieren. Ersetzen Sie [:section] durch [{name}] (wird zu :name).',
+        'foreign_filter' => 'Dieser Jail darf nur den eigenen Filter dieser Website verwenden. Ersetzen Sie filter = :filter durch filter = {filter} (wird zu :name).',
+        'disallowed_setting' => 'Die Einstellung „:setting" ist in einem Website-Jail nicht erlaubt. Erlaubt: :allowed.',
+    ],
+    // FB-wp: the default filter is WordPress's.
+    'app_default_filter_wordpress_only' => 'Diese Anwendung hat noch keine Anmelderegel, daher wird niemand gesperrt. Fügen Sie eine Regel für ihre Anmeldeseite hinzu.',
+];

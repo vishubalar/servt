@@ -1,0 +1,600 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import {
+  compareVersions,
+  rangeLabel,
+  rangeUnsatisfied,
+  versionWithin,
+  versionsInRange,
+} from "../lib/runtime/version-range.js";
+import { preselectVersion } from "../lib/runtime/preselect-version.js";
+
+const v = (...list) => list.map((version) => ({ version }));
+
+// The real ranges, from GET /site-types.
+const NODEBB = { min: "22", max: null };
+const N8N = { min: "20.19", max: "24" };
+const PRESTASHOP = { min: "7.2", max: "8.1" };
+
+test("both ends are inclusive, as the backend compares them", () => {
+  assert.equal(versionWithin("22", NODEBB), true, "the minimum itself must qualify");
+  assert.equal(versionWithin("24", N8N), true, "the maximum itself must qualify");
+  assert.equal(versionWithin("8.1", PRESTASHOP), true);
+  assert.equal(versionWithin("21", NODEBB), false);
+  assert.equal(versionWithin("25", N8N), false);
+  assert.equal(versionWithin("8.2", PRESTASHOP), false);
+});
+
+test("a missing segment counts as zero", () => {
+  // "22" and "22.0" are the same version; the n8n floor is the case that cares.
+  assert.equal(compareVersions("22", "22.0"), 0);
+  assert.equal(versionWithin("20.19", N8N), true, "the exact n8n floor was excluded");
+  assert.equal(versionWithin("20.18", N8N), false);
+  assert.equal(versionWithin("20", N8N), false, "20 is below 20.19");
+  // 20.9 vs 20.19 is the comparison a string sort gets backwards.
+  assert.equal(compareVersions("20.9", "20.19") < 0, true);
+});
+
+test("the reported bug: Node 20 is no longer offered for NodeBB", () => {
+  const installed = v("24", "22", "20");
+  const offered = versionsInRange(installed, NODEBB).map((x) => x.version);
+  assert.deepEqual(offered, ["24", "22"]);
+  assert.ok(!offered.includes("20"));
+  // And the preselect can only land on something offerable.
+  assert.ok(offered.includes(preselectVersion(versionsInRange(installed, NODEBB), null)));
+});
+
+test("no range means every installed version, untouched", () => {
+  const installed = v("8.4", "8.3");
+  assert.equal(versionsInRange(installed, null), installed);
+  assert.equal(versionsInRange(installed, undefined), installed);
+  assert.equal(versionsInRange(installed, { min: null, max: null }), installed);
+});
+
+test("an unsatisfiable range offers NOTHING, never a version that will be refused", () => {
+  // This used to return the whole list, which is what made the filter look
+  // broken on a server with only PHP 8.4: PrestaShop wants 7.2–8.1, nothing
+  // qualified, and the picker offered 8.4 anyway.
+  const installed = v("8.4", "8.3");
+  assert.deepEqual(versionsInRange(installed, PRESTASHOP), []);
+});
+
+test("junk in never empties the dropdown or throws", () => {
+  assert.deepEqual(versionsInRange(null, NODEBB), []);
+  assert.deepEqual(versionsInRange(undefined, null), []);
+  assert.equal(versionWithin(undefined, NODEBB), false);
+  assert.equal(versionWithin("", NODEBB), false);
+  // An unreadable version must not decide a field is unusable on its own.
+  assert.equal(versionsInRange(v("lts", "22"), NODEBB).length, 1);
+});
+
+test("the form filters the pickers and drops a version the new type refuses", () => {
+  const source = fs.readFileSync(
+    new URL("../components/applications/create-application-form.jsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /phpVersions=\{typePhpVersions\}/, "the PHP picker shows unsupported versions again");
+  assert.match(source, /nodeVersions=\{typeNodeVersions\}/, "the Node picker shows unsupported versions again");
+  assert.match(source, /preselectVersion\(typePhpVersions/, "the preselect can pick an unsupported version");
+  assert.match(source, /versionWithin\(current, range\)/, "a switch no longer clears an unsupported version");
+  // The clear must be read before the two blocks that refill an empty field,
+  // or the field is emptied and never filled again.
+  assert.ok(
+    source.indexOf("lastType.current = selected") <
+      source.indexOf("preselectVersion(typePhpVersions"),
+    "the type-change reset runs after the preselect, so a cleared version stays empty",
+  );
+});
+
+
+// --- The block a server with no usable version has to show ---
+
+test("an unsatisfiable range is reported, so the picker can say so before the click", () => {
+  assert.equal(rangeUnsatisfied(v("8.4"), PRESTASHOP), true, "8.4 against 7.2–8.1");
+  // Version lists and ranges are paired by the caller; this only compares
+  // numbers, so it is never told which runtime it is looking at.
+  assert.equal(rangeUnsatisfied(v("20", "21"), NODEBB), true, "no installed Node reaches 22");
+});
+
+test("no range and no runtime are both 'not this problem'", () => {
+  assert.equal(rangeUnsatisfied(v("8.4"), null), false, "most types run on anything installed");
+  assert.equal(rangeUnsatisfied(v("8.4"), { min: null, max: null }), false);
+  assert.equal(
+    rangeUnsatisfied([], PRESTASHOP),
+    false,
+    "nothing installed is a different problem with a different fix, reported elsewhere",
+  );
+  assert.equal(rangeUnsatisfied(null, PRESTASHOP), false);
+});
+
+test("one usable version is enough", () => {
+  assert.equal(rangeUnsatisfied(v("8.4", "8.0"), PRESTASHOP), false);
+  assert.equal(rangeUnsatisfied(v("20", "22"), NODEBB), false);
+  assert.equal(rangeUnsatisfied(v("20", "21"), NODEBB), true);
+});
+
+test("the range reads the way the backend says it", () => {
+  assert.equal(rangeLabel(PRESTASHOP), "7.2 – 8.1");
+  assert.equal(rangeLabel(NODEBB), "22+");
+  assert.equal(rangeLabel({ min: null, max: "8.1" }), "≤ 8.1");
+  assert.equal(rangeLabel(null), "");
+});
+
+test("a blocked type is marked the way the picker already greys them", async () => {
+  const { runtimeBlocks } = await import("../lib/applications/runtime-readiness.js");
+  const { withAvailability } = await import("../lib/applications/blockers.js");
+
+  const prestashop = { name: "prestashop", available: true, php_version_range: PRESTASHOP };
+  const wordpress = { name: "wordpress", available: true, php_version_range: null };
+  const runtimes = { phpVersions: v("8.4"), nodeVersions: v("24") };
+
+  const [block] = runtimeBlocks({ type: prestashop, ...runtimes });
+  assert.equal(block.runtime, "php");
+  assert.equal(block.label, "7.2 – 8.1");
+  assert.deepEqual(block.installed, ["8.4"]);
+  assert.deepEqual(runtimeBlocks({ type: wordpress, ...runtimes }), []);
+
+  const marked = withAvailability([prestashop, wordpress], { runtimes }, () => "reason");
+  assert.equal(marked[0].available, false);
+  assert.equal(marked[0].unavailable_code, "runtime");
+  assert.equal(marked[0].unavailable_reason, "reason");
+  assert.equal(
+    marked[0].installable_runtime,
+    null,
+    "PHP is installed — the fix is another version of it, not the runtime",
+  );
+  assert.equal(marked[1], wordpress, "an unaffected type is returned untouched");
+});
+
+test("a failed runtime lookup greys nothing", async () => {
+  const { runtimeBlocks } = await import("../lib/applications/runtime-readiness.js");
+  const type = { name: "prestashop", available: true, php_version_range: PRESTASHOP };
+  assert.deepEqual(
+    runtimeBlocks({ type, phpVersions: v("8.4"), failed: true }),
+    [],
+    "one endpoint's wobble must not empty the catalogue",
+  );
+});
+
+test("the node range blocks on node versions, never on php ones", async () => {
+  const { runtimeBlocks } = await import("../lib/applications/runtime-readiness.js");
+  const nodebb = { name: "nodebb", available: true, node_version_range: NODEBB };
+  assert.equal(
+    runtimeBlocks({ type: nodebb, phpVersions: v("8.4"), nodeVersions: v("20") })[0].runtime,
+    "node",
+  );
+  assert.deepEqual(
+    runtimeBlocks({ type: nodebb, phpVersions: v("8.4"), nodeVersions: v("24") }),
+    [],
+  );
+});
+
+/*
+ * The user's report, in their words: "I wanted to install nextcloud and at
+ * first it told to install MySQL/MariaDB, I installed MySQL and got back to
+ * installing the nc app, and now its asking me to install node.js."
+ *
+ * Every assertion below is a place that used to answer with exactly one
+ * errand.
+ */
+test("a type failing two checks names BOTH, not one per visit", async () => {
+  const { typeBlockers } = await import("../lib/applications/blockers.js");
+
+  const type = {
+    name: "needy",
+    available: true,
+    needs_database: true,
+    accepted_engines: ["mysql"],
+    node_version_range: NODEBB,
+  };
+
+  const blockers = typeBlockers({
+    type,
+    runtimes: { phpVersions: v("8.4"), nodeVersions: v("20") },
+    engines: { engines: [{ engine: "mysql", installed: false }] },
+  });
+
+  assert.deepEqual(
+    blockers.map((blocker) => blocker.kind),
+    ["runtime", "database"],
+    "one visit, both errands",
+  );
+});
+
+test("a type declaring two runtimes names both of them", async () => {
+  const { runtimeBlocks } = await import("../lib/applications/runtime-readiness.js");
+
+  const both = runtimeBlocks({
+    type: { php_version_range: PRESTASHOP, node_version_range: NODEBB },
+    phpVersions: v("8.4"),
+    nodeVersions: v("20"),
+  });
+
+  assert.deepEqual(
+    both.map((blocker) => blocker.runtime),
+    ["php", "node"],
+    "returning on the first runtime hid the second until the first was fixed",
+  );
+});
+
+test("the server's own blocker fills a gap, and never doubles one we computed", async () => {
+  const { typeBlockers } = await import("../lib/applications/blockers.js");
+
+  const engines = { engines: [{ engine: "mysql", installed: false }] };
+  const base = { name: "wp", needs_database: true, accepted_engines: ["mysql"] };
+
+  // The API says "database" and so do we. Ours wins: it can tell missing from
+  // stopped from still-installing, and the API's sentence cannot.
+  const ourDatabase = typeBlockers({
+    type: {
+      ...base,
+      available: false,
+      unavailable_code: "database",
+      unavailable_reason: "server says database",
+    },
+    engines,
+  });
+  assert.deepEqual(ourDatabase.map((blocker) => blocker.kind), ["database"]);
+  assert.equal(ourDatabase[0].state, "missing");
+
+  // A category we cannot compute is kept, with the server's own sentence.
+  const unknown = typeBlockers({
+    type: {
+      ...base,
+      available: false,
+      unavailable_code: "something_new",
+      unavailable_reason: "server says something we have never seen",
+    },
+    engines,
+  });
+  assert.deepEqual(unknown.map((blocker) => blocker.kind), ["database", "server"]);
+  assert.equal(unknown[1].reason, "server says something we have never seen");
+});
+
+test("a web server that refuses the type ends the list", async () => {
+  const { typeBlockers } = await import("../lib/applications/blockers.js");
+
+  const blockers = typeBlockers({
+    type: {
+      name: "wp",
+      available: false,
+      needs_database: true,
+      accepted_engines: ["mysql"],
+      unavailable_code: "web_server",
+      unavailable_reason: "OpenLiteSpeed does not serve this",
+    },
+    engines: { engines: [{ engine: "mysql", installed: false }] },
+  });
+
+  assert.deepEqual(
+    blockers.map((blocker) => blocker.kind),
+    ["web_server"],
+    "nothing installable fixes it, so an errand underneath leads nowhere",
+  );
+});
+
+// --- The second half of the same report: "I couldn't install n8n because it
+// needed nodejs V20.19 which isn't available for install" ---
+
+test("a partial upper bound covers its whole line", () => {
+  // n8n declares max "24" and the backend's own comment beside it reads
+  // "Node 20.19 to 24.x inclusive". Padding it to 24.0.0 rejected the Node
+  // the server was actually running.
+  assert.equal(versionWithin("24.20.0", N8N), true, "24.20.0 IS Node 24");
+  assert.equal(versionWithin("24.0.0", N8N), true);
+  assert.equal(versionWithin("25.0.0", N8N), false, "the next line is still out");
+  // And the bound that states its minor still compares the minor.
+  assert.equal(versionWithin("8.1.9", PRESTASHOP), true, "8.1.9 IS PHP 8.1");
+  assert.equal(versionWithin("8.2.0", PRESTASHOP), false);
+});
+
+test("the card names a version ON OFFER that satisfies the range", async () => {
+  const { lowestInRange } = await import("../lib/runtime/version-range.js");
+  const { runtimeBlocks } = await import("../lib/applications/runtime-readiness.js");
+
+  // What the Node page actually offers: the 20 line is end-of-life and hidden,
+  // which is why the reporter could not find the 20.19 our message named. The
+  // filter runs over THIS list, so whatever comes back is installable —
+  // that part of the original fix is what still matters.
+  const installable = v("24.20.0", "22.14.0");
+  assert.equal(lowestInRange(installable, N8N), "22.14.0", "offered, and enough");
+
+  const [block] = runtimeBlocks({
+    type: { node_version_range: N8N },
+    nodeVersions: v("18.20.0"),
+    nodeInstallable: installable,
+  });
+  assert.equal(block.suggest, "22.14.0");
+
+  // Nothing on offer fits is a different sentence, not a worse guess.
+  const [dead] = runtimeBlocks({
+    type: { node_version_range: { min: "10", max: "12" } },
+    nodeVersions: v("18.20.0"),
+    nodeInstallable: installable,
+  });
+  assert.equal(dead.suggest, null);
+});
+
+test("what the application requires, not the newest thing we could install", async () => {
+  /*
+   * Krishna, on n8n blocking a fresh server: "the requirement should be based
+   * on n8n's actual runtime/dependency requirement, not simply whether the
+   * default/latest Node.js version is installed."
+   *
+   * Verified against the registry: n8n 2.39.9 declares `engines.node
+   * ">=24.0.0"`, and the backend's fallback range is `min 24, max null` —
+   * they agree. So Node 24 is enough, and the panel was naming 26.9.0 only
+   * because it was the newest on offer. The row reads "Node 26.9.0 — the
+   * runtime n8n runs on", which states a requirement n8n does not have.
+   */
+  const { lowestInRange, highestInRange } = await import("../lib/runtime/version-range.js");
+  const N8N_TODAY = { min: "24", max: null };
+  const offered = v("26.9.0", "24.12.0", "22.22.0");
+
+  assert.equal(lowestInRange(offered, N8N_TODAY), "24.12.0", "what n8n asks for");
+  assert.equal(highestInRange(offered, N8N_TODAY), "26.9.0", "what it used to name");
+
+  // And an installed Node 24 is not a blocker at all — the fresh-server case
+  // is the only one that should ever ask.
+  const { rangeUnsatisfied } = await import("../lib/runtime/version-range.js");
+  assert.equal(rangeUnsatisfied(v("24.12.0"), N8N_TODAY), false, "24 already satisfies n8n");
+  assert.equal(rangeUnsatisfied(v("22.22.0"), N8N_TODAY), true, "22 does not");
+});
+
+test("the row says what was required, so the exact build is not read as the requirement", async () => {
+  const fs = await import("node:fs");
+  const services = fs.readFileSync("components/applications/required-services.jsx", "utf8");
+  const panel = fs.readFileSync("components/applications/required-services-panel.jsx", "utf8");
+
+  assert.match(services, /requirement: blocker\.range \? rangeLabel\(blocker\.range\) : null/);
+  assert.match(panel, /service\.requirement/);
+  // Two sentences now: the plain one, and the one for a type whose whole
+  // window is end-of-life. Both are chosen from `service.eol` in one call.
+  assert.match(panel, /service\.eol \? `needsEol\.\$\{service\.kind\}` : `needs\.\$\{service\.kind\}`/);
+
+  const routing = fs.readFileSync("i18n/routing.js", "utf8");
+  const locales = routing
+    .match(/export const locales = \[([^\]]+)\]/)[1]
+    .split(",")
+    .map((c) => c.trim().replace(/['"]/g, ""))
+    .filter(Boolean);
+  for (const locale of locales) {
+    const rs = JSON.parse(fs.readFileSync(`messages/${locale}.json`, "utf8"))
+      .applications.requiredServices;
+    for (const key of ["needs", "needsEol"]) {
+      for (const kind of ["node", "php"]) {
+        assert.match(rs?.[key]?.[kind] ?? "", /\{requirement\}/, `${locale} ${key}.${kind}`);
+        assert.match(rs[key][kind], /\{app\}/, `${locale} ${key}.${kind}`);
+      }
+    }
+  }
+});
+
+// --- The same bug on the site's own PHP screen ---
+
+test("the per-site PHP screen warns when the chosen version is out of range", async () => {
+  const fs = await import("node:fs");
+  const panel = fs.readFileSync("components/applications/php/php-panel.jsx", "utf8");
+
+  // Both modes: the shared-mode switcher and the isolated form's field.
+  assert.equal(
+    (panel.match(/versionUnsupported/g) ?? []).length,
+    2,
+    "shared and dedicated both change the version, so both have to say it",
+  );
+  assert.match(
+    panel,
+    /!versionWithin\(version, phpRange\)/,
+    "the warning is derived from the range, never from a list of type names",
+  );
+});
+
+test("the PHP page reads the range from the catalogue and survives losing it", async () => {
+  const fs = await import("node:fs");
+  const page = fs.readFileSync("app/(app)/applications/[application]/php/page.jsx", "utf8");
+  assert.match(page, /getSiteTypes\(\)\.catch/, "the warning is a nicety; the page is not");
+  assert.match(page, /type\.name === application\.site_type/);
+  assert.match(page, /siteTypeTitle=/, "the PHP payload carries no site type, so the page passes it");
+});
+
+test("a blocked type says why, and the grid offers each way out exactly once", async () => {
+  const fs = await import("node:fs");
+  const picker = fs.readFileSync("components/applications/site-type-picker.jsx", "utf8");
+
+  assert.match(picker, /type\?\.unavailable_code !== "runtime"/, "only types blocked BY a runtime");
+  assert.match(picker, /href: "\/php", label: "form\.installPhpVersion"/);
+  assert.match(picker, /href: "\/node", label: "form\.installNodeVersion"/);
+
+  // A missing database engine is the same kind of blocker, and gets the same
+  // way out rather than only the one line in the footer.
+  assert.match(picker, /href: "\/databases", label: "form\.installDatabaseEngine"/);
+
+  // The card still says WHY it cannot be chosen — greyed and silent is a bug
+  // report waiting to happen.
+  assert.match(picker, /type\.unavailable_reason/, "the reason renders on the card");
+
+  /*
+   * The link no longer lives on the card, and that is the point.
+   *
+   * It did while this was a list: one link per row, beside the sentence. In a
+   * grid it meant thirteen cards on an unprovisioned server each repeating
+   * "Install a database engine" under a sentence they also each repeated, and
+   * the picker grew taller than the whole form beneath it. Eight cards blocked
+   * on one missing engine have one answer between them, so the links are
+   * deduplicated BY DESTINATION and shown once for the grid.
+   */
+  assert.match(picker, /byHref\.has\(fix\.href\)/, "one link per destination, not per card");
+  assert.match(picker, /href=\{fix\.href\}/, "and it is rendered");
+
+  // An unchoosable card cannot be a disabled button: it still holds text a
+  // screen reader has to reach, and Playwright refuses to read inside one.
+  assert.match(picker, /const Card = choosable \? "button" : "div"/);
+  assert.doesNotMatch(picker, /"aria-disabled": true/, "it takes the nested text down with it");
+
+  /*
+   * A blocked card can be CHOSEN, but only where something is ready to act on
+   * the choice.
+   *
+   * On a server with no engine and no Node every card that needs one is dead,
+   * so the screen offering to install them is unreachable — you would have to
+   * pick the application the server cannot host to get to it. `allowBlocked`
+   * opens that, and defaults to false so the real form keeps refusing: a card
+   * leading to a create the API rejects is worse than one that says no now.
+   */
+  assert.match(picker, /blockersAreFixable\(type\)/);
+  // Submit is what stops a blocked type, now that the grid does not.
+  const form = fs.readFileSync("components/applications/create-application-form.jsx", "utf8");
+  assert.match(form, /form\.submitNeedsServices/, "a blocked type could be submitted");
+
+  // The choice fades — mark, name, tagline — never the reason, which is the
+  // one part of a blocked card worth reading.
+  assert.doesNotMatch(
+    picker,
+    /disabled && "opacity-60 hover:bg-transparent/,
+    "fade the choice, not the reason",
+  );
+
+  // Two blockers, two errands: the line joins them and the footer links both.
+  assert.match(picker, /t\("form\.needs", \{ items:/, "the card names every blocker, not one");
+  assert.match(picker, /blockerFixes\(type\)/, "the footer collects every way out");
+
+  for (const locale of LOCALES) {
+    const messages = JSON.parse(fs.readFileSync(`messages/${locale}.json`, "utf8")).applications;
+    assert.ok(messages.form.installPhpVersion, `${locale} missing installPhpVersion`);
+    assert.ok(messages.form.installNodeVersion, `${locale} missing installNodeVersion`);
+    assert.ok(messages.form.needs, `${locale} missing the combined line`);
+
+    /*
+     * The sentence names a VERSION, and the link's generic "Install a PHP
+     * version" is no longer the only instruction.
+     *
+     * That split was deliberate once and it is what the reporter hit: the
+     * card printed n8n's range, the link said "install a Node version", and
+     * between them nobody said WHICH — so they went after 20.19, the bottom
+     * of the range, which this panel refuses to install because the line is
+     * dead.
+     */
+    for (const runtime of ["php", "node"]) {
+      assert.match(
+        messages.unavailableRuntime[runtime].install,
+        /\{suggest\}/,
+        `${locale} ${runtime} reason does not name the version to install`,
+      );
+      assert.doesNotMatch(
+        messages.unavailableRuntime[runtime].none,
+        /\{suggest\}/,
+        `${locale} ${runtime} promises a version it has just said does not exist`,
+      );
+    }
+  }
+});
+
+// Every active locale, from the routing file, so a new language cannot be
+// added with this screen left in English.
+const LOCALES = fs
+  .readFileSync("i18n/routing.js", "utf8")
+  .match(/export const locales = \[([^\]]+)\]/)[1]
+  .split(",")
+  .map((code) => code.trim().replace(/['"]/g, ""))
+  .filter(Boolean);
+
+test("only a blocker with an install button behind it makes a card choosable", async () => {
+  const { blockersAreFixable } = await import("../lib/applications/blockers.js");
+
+  assert.equal(
+    blockersAreFixable({ blockers: [{ kind: "runtime" }, { kind: "database" }] }),
+    true,
+    "both have an install endpoint and a screen",
+  );
+  assert.equal(
+    blockersAreFixable({ blockers: [{ kind: "web_server" }] }),
+    false,
+    "nothing installable fixes a web server that will not serve the type",
+  );
+  assert.equal(
+    blockersAreFixable({ blockers: [{ kind: "runtime" }, { kind: "web_server" }] }),
+    false,
+    "one unfixable blocker is enough — choosing it would lead nowhere",
+  );
+  // An available type is not "blocked but fixable"; it is simply available.
+  assert.equal(blockersAreFixable({ blockers: [] }), false);
+  assert.equal(blockersAreFixable({}), false);
+});
+
+test("the irreversible engine choice says so, keyed on the field not the engine", async () => {
+  const fs = await import("node:fs");
+  const form = fs.readFileSync("components/applications/create-application-form.jsx", "utf8");
+
+  assert.match(form, /config\.name === "database_engine"/, "the API names the field; we do not name engines");
+  assert.match(form, /form\.databaseEnginePermanent/);
+
+  for (const locale of ["en", "es", "hi"]) {
+    const messages = JSON.parse(fs.readFileSync(`messages/${locale}.json`, "utf8"));
+    assert.ok(messages.applications.form.databaseEnginePermanent, `${locale} missing the warning`);
+  }
+});
+
+test("a failed PostgreSQL install lands on the databases page like the others", async () => {
+  const { installHome } = await import("../lib/services/install-home.js");
+  for (const key of ["mysql", "mariadb", "mongodb", "postgresql"]) {
+    assert.equal(installHome(key)?.href, "/databases", `${key} has a screen that handles its failure`);
+  }
+});
+
+test("the version offered to install is one the language still supports", async () => {
+  /*
+   * Found on the live create form: choosing PrestaShop announced
+   *
+   *     PHP 7.2 — PrestaShop needs PHP 7.2 – 8.1 — this is what we will install
+   *
+   * PHP 7.2 has been unsupported since November 2020. The old rule took the
+   * lowest version in range from the OFFERED list, on the documented
+   * assumption that the offered list hides end-of-life lines. Node's does.
+   * PHP's does not — it offers 5.6 upward and labels every one of them, so
+   * the lifecycle was in the same payload the whole time.
+   */
+  const { installTarget } = await import("../lib/runtime/version-range.js");
+  const php = [
+    { version: "8.3", lifecycle: { status: "security" } },
+    { version: "8.2", lifecycle: { status: "security" } },
+    { version: "8.1", lifecycle: { status: "eol" } },
+    { version: "8.0", lifecycle: { status: "eol" } },
+    { version: "7.4", lifecycle: { status: "eol" } },
+    { version: "7.2", lifecycle: { status: "eol" } },
+  ];
+
+  // PrestaShop: every version in its window is dead, so the NEWEST of them —
+  // which is also the one PrestaShop's own requirements recommend.
+  assert.deepEqual(installTarget(php, { min: "7.2", max: "8.1" }), { version: "8.1", eol: true });
+
+  // Craft: a supported version exists in range, so the lowest supported one.
+  assert.deepEqual(installTarget(php, { min: "8.2", max: null }), { version: "8.2", eol: false });
+
+  // n8n, unchanged: lowest that satisfies `>=24`, not the newest on offer.
+  // Krishna: "the requirement should be based on n8n's actual runtime
+  // requirement, not simply whether the default/latest is installed."
+  const node = [
+    { version: "24.20.0", lifecycle: { status: "active" } },
+    { version: "26.9.0", lifecycle: { status: "current" } },
+  ];
+  assert.deepEqual(installTarget(node, { min: "24", max: null }), { version: "24.20.0", eol: false });
+
+  // Nothing on offer fits: null, so the caller shows no install button rather
+  // than one that cannot work.
+  assert.equal(installTarget(php, { min: "9.0", max: null }), null);
+
+  // A list with no lifecycle at all must not be treated as all-dead.
+  assert.deepEqual(
+    installTarget([{ version: "8.4" }, { version: "8.3" }], { min: "8.3", max: null }),
+    { version: "8.3", eol: false },
+  );
+});
+
+test("the readiness blocker carries the lifecycle, not just the number", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync("lib/applications/runtime-readiness.js", "utf8");
+  assert.match(src, /installTarget\(available\[runtime\.installableField\], range\)/);
+  assert.match(src, /suggestEol: target\?\.eol \?\? false/);
+  assert.doesNotMatch(src, /lowestInRange/, "the unsupported-blind rule is gone from here");
+});

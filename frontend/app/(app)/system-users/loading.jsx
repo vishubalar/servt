@@ -1,0 +1,24 @@
+import { Skeleton } from "@/components/ui/skeleton";
+import { SkHeader } from "@/components/ui/skeleton-kit";
+import { TableSkeleton } from "@/components/data-table/table-skeleton";
+
+const TOOLBAR = (
+  <div className="flex items-center justify-between gap-3">
+          <div className="flex gap-2">
+            <Skeleton className="h-9 w-64" />
+          </div>
+          <div className="flex gap-2">
+            <Skeleton className="h-9 size-9" />
+            <Skeleton className="h-9 w-28" />
+          </div>
+        </div>
+);
+
+export default function Loading() {
+  return (
+    <div className="space-y-6" aria-busy="true">
+      <SkHeader />
+      <TableSkeleton rows={7} columns={7} toolbar={TOOLBAR} />
+    </div>
+  );
+}

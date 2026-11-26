@@ -1,0 +1,385 @@
+<?php
+
+namespace App\Services\Panel;
+
+use App\Models\PanelUpdate;
+
+/**
+ * The update, as a script, for an installation using release directories.
+ *
+ * Replaces {@see UpdateScript}, which checks out a new version **over the running one**, for
+ * servers migrated to release directories. The runner picks by {@see PanelLayout::isReleased()};
+ * rendering this for a legacy install would build a layout beside a working one.
+ *
+ * **The ordering is the design.** Everything that can fail happens before anything that
+ * changes what is live:
+ *
+ *   preflight · backup · create · link · composer · build   ← free to fail
+ *   maintenance · migrate                                    ← irreversible
+ *   swap · restart · verify                                  ← reversible by flip
+ *   maintenance off · prune
+ *
+ * The first steps build a release beside the running panel, so a failure there removes a
+ * directory and nothing else; the old version keeps serving.
+ *
+ * Migration is the hinge, as late as possible but before the swap: after it, rollback restores
+ * the code but not the schema. The database backup covers that, and the failure message says so.
+ */
+class ReleaseUpdateScript
+{
+    /** Ordered steps. The runner echoes each one into the state file. */
+    public const STEPS = [
+        'preflight',
+        'backup_database',
+        'create_release',
+        'link_shared',
+        'composer_install',
+        'frontend_build',
+        'sync_privileges',
+        'configure_queue_worker',
+        'maintenance_on',
+        'migrate',
+        'swap',
+        'restart_services',
+        'verify',
+        'maintenance_off',
+        'prune',
+    ];
+
+    /**
+     * The last step at which nothing live has changed yet.
+     *
+     * Everything through this point fails by deleting a directory. A step added after it gives
+     * up the property the design exists for; the test asserts against this constant.
+     */
+    public const LAST_SAFE_STEP = 'frontend_build';
+
+    public function __construct(
+        private PanelLayout $layout,
+        private PanelReleases $releases,
+        private PanelPhpBinary $phpBinary,
+    ) {}
+
+    public function render(PanelUpdate $update, string $version, bool $dryRun = false): string
+    {
+        $tag = 'v'.ltrim($version, 'vV');
+        $stamp = now()->format('Ymd-His');
+
+        $root = $this->layout->root();
+        $repository = $this->layout->sharedPath().'/repo';
+        $release = $this->layout->newReleasePath($stamp);
+        $state = rtrim((string) config('panel_update.state_dir'), '/').'/update-'.$update->getKey().'.json';
+
+        $php = $this->phpBinary->path();
+        $user = (string) config('panel_update.app_user');
+        $node = (string) config('panel_update.node_bin_dir');
+        $git = sprintf(
+            'git -c %s -C %s',
+            escapeshellarg('safe.directory='.$repository),
+            escapeshellarg($repository),
+        );
+
+        // The *currently live* release, read before anything moves: it is what rollback
+        // returns to, and after the swap the symlink no longer records it.
+        $previous = '$(readlink -f '.escapeshellarg($this->layout->currentLink()).')';
+
+        // Backend commands run against the NEW release from `migrate` onward; before that,
+        // artisan is still the old release's.
+        $newBackend = $release.'/backend';
+        $liveBackend = $this->layout->currentLink().'/backend';
+
+        $run = $dryRun ? 'echo DRY-RUN: ' : '';
+        $forwardOnly = ForwardOnlyGuard::script($git, $tag, (string) $update->from_commit);
+        $asUser = $dryRun ? 'echo DRY-RUN: ' : "sudo -u {$user} -H ";
+
+        $health = rtrim((string) config('app.url'), '/');
+
+        return <<<BASH
+        #!/usr/bin/env bash
+        # Generated for panel update #{$update->getKey()}. Do not edit: this file
+        # is a disposable copy, rewritten on every update.
+        set -uo pipefail
+
+        STATE="{$state}"
+        STEP=""
+        SWAPPED=0
+        MIGRATED=0
+        PREVIOUS=""
+        QUEUE_DRAIN_VERIFIED=0
+        QUEUE_STOP_FAILED=0
+
+        note() {
+            STEP="\$1"
+            printf '{"step":"%s","status":"running","at":"%s"}\\n' "\$1" "\$(date -u +%FT%TZ)" > "\$STATE"
+        }
+
+        finish() {
+            printf '{"step":"%s","status":"%s","reason":"%s","rolled_back":%s,"release":"%s","at":"%s"}\\n' \\
+                "\$STEP" "\$1" "\${2:-}" "\${3:-false}" "{$release}" "\$(date -u +%FT%TZ)" > "\$STATE"
+        }
+
+        # Undo as much as was done, in the reverse order it was done.
+        #
+        # The symlink goes back first: while it points at a half-working release
+        # every request is served by it, so that is the most urgent thing to
+        # correct. Only then the services, then maintenance mode, and the new
+        # release directory last — it is inert once nothing points at it.
+        #
+        # The migration is NOT undone, because it cannot be. If one ran, the
+        # reason carries that so the panel can say the code is back and the
+        # schema is not, and where the backup is.
+        rollback() {
+            local failed_step="\$STEP"
+            note "rollback"
+
+            # Refusal/failed initial drain must not fall through to a queue
+            # restart. For later failures, drain BEFORE flipping/removing code.
+            if [ "\$QUEUE_DRAIN_VERIFIED" = "1" ] && [ "\$QUEUE_STOP_FAILED" != "1" ]; then
+                if ! {$run}sudo systemctl stop {$this->service('queue')}; then
+                    finish failed "\$failed_step" false
+                    exit 1
+                fi
+            fi
+
+            if [ "\$SWAPPED" = "1" ] && [ -n "\$PREVIOUS" ]; then
+                {$run}ln -sfn "\$PREVIOUS" {$root}/.current.pending
+                {$run}mv -T {$root}/.current.pending {$this->layout->currentLink()}
+                {$run}sudo systemctl restart {$this->service('php_fpm')}
+                {$run}sudo systemctl restart {$this->service('frontend')}
+            fi
+            if [ "\$QUEUE_DRAIN_VERIFIED" = "1" ] && [ "\$QUEUE_STOP_FAILED" != "1" ]; then
+                {$run}sudo systemctl restart {$this->service('queue')}
+            fi
+
+            {$asUser}{$php} {$liveBackend}/artisan up
+            {$run}rm -rf {$release}
+
+            if [ "\$MIGRATED" = "1" ]; then
+                finish failed "\$failed_step:migrated" true
+            else
+                finish failed "\$failed_step" true
+            fi
+            exit 1
+        }
+
+        trap rollback ERR
+        set -e
+
+        # ---- Nothing below here touches the running panel, until maintenance_on.
+
+        note preflight
+        # Real in both modes. A dry run exists to answer "would this work", and
+        # one that echoes every command cannot answer it.
+        # Repair ownership inside .git before anything writes to it.
+        #
+        # install.sh hands the tree to the app user and then runs git as root,
+        # leaving root-owned files in .git; a later fetch as the app user dies
+        # with "cannot open '.git/FETCH_HEAD': Permission denied". install.sh is
+        # fixed, but that reaches fresh installs only — the repair belongs here,
+        # where it runs on the boxes that already have the problem.
+        #
+        # `safe.directory` does not help: it forgives git's ownership check, not
+        # the filesystem's permissions.
+        chown -R {$user}:{$user} {$repository}/.git
+        git -c safe.directory={$repository} -C {$repository} rev-parse HEAD > /dev/null
+        # And a write, not just a read: `rev-parse` passed on exactly the boxes
+        # where the fetch was about to fail.
+        {$asUser}test -w {$repository}/.git
+        test -f {$this->layout->sharedPath()}/.env
+        # An APP_KEY that is absent means a release would generate its own, and
+        # every encrypted column — storage secrets, git tokens, database
+        # passwords — becomes unreadable. Refuse rather than find out later.
+        grep -q '^APP_KEY=.\\+' {$this->layout->sharedPath()}/.env
+        PREVIOUS={$previous}
+
+        note backup_database
+        {$asUser}{$php} {$liveBackend}/artisan panel:backup-database
+
+        note create_release
+        {$forwardOnly}
+        {$this->releases->create($repository, $tag, $release)}
+
+        note link_shared
+        {$this->renderLinks($release, $dryRun)}
+
+        note composer_install
+        {$asUser}composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader -d {$newBackend}
+
+        # Built as the panel's own user, exactly as install.sh does. A build run
+        # as root leaves node_modules and .next owned by root under a service
+        # that is not, and Next.js cannot write its cache at runtime.
+        #
+        # BUILD_HEAP_MB caps V8's old space and is kept in step with
+        # install.sh's build_frontend(). It is not what keeps a small box
+        # alive: Next 16 builds with Turbopack, whose working set is a Rust
+        # heap NODE_OPTIONS cannot bound. Swap and the build-worker cap in
+        # frontend/next.config.mjs do that, and UpdatePreflight refuses the
+        # update before this runs if the box cannot clear the measured floor.
+        note frontend_build
+        BUILD_RAM_MB=\$(awk '/MemTotal/ {printf "%d", \$2/1024}' /proc/meminfo)
+        if [ "\$BUILD_RAM_MB" -ge 7500 ]; then BUILD_HEAP_MB=4096
+        elif [ "\$BUILD_RAM_MB" -ge 3500 ]; then BUILD_HEAP_MB=3072
+        else BUILD_HEAP_MB=2048; fi
+        {$asUser}env "PATH={$node}:/usr/local/bin:/usr/bin:/bin" npm --prefix {$release}/frontend ci --no-audit --no-fund
+        # A build the kernel killed for memory is named as such, so the panel can
+        # say "out of memory" rather than "could not be built". Only the reason
+        # changes: the rollback below is the same either way. npm exits 1, not
+        # 137, when its child is killed, so the proof is this cgroup's OOM
+        # count: memory.events counts kills by either OOM killer (the kernel's
+        # or a cgroup limit), anyone may read it, and it needs no pipe into grep,
+        # which a dry run would feed echoed text into.
+        BUILD_CGROUP=/sys/fs/cgroup\$(awk -F: '\$1 == "0" {print \$3}' /proc/self/cgroup 2>/dev/null)
+        oom_kills() { awk '\$1 == "oom_kill" {print \$2; found=1} END {if (!found) print 0}' "\$BUILD_CGROUP/memory.events" 2>/dev/null || echo 0; }
+        BUILD_OOM_BEFORE=\$(oom_kills)
+        {$asUser}env "PATH={$node}:/usr/local/bin:/usr/bin:/bin" "NODE_OPTIONS=--max-old-space-size=\${BUILD_HEAP_MB}" npm --prefix {$release}/frontend run build || {
+            BUILD_RC=\$?
+            if [ "\$BUILD_RC" = 137 ] || [ "\$(oom_kills)" -gt "\$BUILD_OOM_BEFORE" ]; then
+                STEP=frontend_build_out_of_memory
+            fi
+            false
+        }
+
+        # The first step that changes anything outside the release directory,
+        # and so the first one after LAST_SAFE_STEP. It is deliberately not
+        # allowed to fail the update: an otherwise-good update refused over a
+        # privilege grant makes the update itself the outage, and the grant
+        # that is already there still works for the code that is already
+        # running. A failure leaves the existing file untouched -- see
+        # PanelSudoers -- and panel:doctor's PrivilegeCheck reports the drift
+        # by name afterwards, which is the surface an operator already reads.
+        note sync_privileges
+        {$run}{$php} {$newBackend}/artisan panel:sudoers || echo "WARNING: sudoers not synced; run 'artisan panel:sudoers' as root"
+        # The interface unit, for the same reason and with the same rule: the
+        # legacy flow has its own step for it (configure_frontend_unit) and this
+        # one had none, so a released server never got the loopback line (bug
+        # #15) or NoNewPrivileges (review finding S1). Applies at the restart
+        # below; never fatal.
+        {$run}{$php} {$newBackend}/artisan panel:frontend-unit || echo "WARNING: frontend unit not updated; run 'artisan panel:frontend-unit' as root"
+        # OpenLiteSpeed's WebAdmin console onto loopback (review finding S5),
+        # as configure_ols_webadmin does in the legacy flow. Never fatal.
+        {$run}{$php} {$newBackend}/artisan panel:ols-webadmin || echo "WARNING: WebAdmin console still listens on every address; run 'artisan panel:ols-webadmin' as root"
+
+        # ---- Past here, failures are visible to users.
+
+        # Reconcile only after the build-only safe region, against the live
+        # code. A refusal is fatal and grants no rollback queue actions.
+        note configure_queue_worker
+        {$run}{$php} {$liveBackend}/artisan panel:queue-worker
+        QUEUE_DRAIN_VERIFIED=1
+
+        note maintenance_on
+        {$asUser}{$php} {$liveBackend}/artisan down --retry=60
+        if ! {$run}sudo systemctl stop {$this->service('queue')}; then
+            QUEUE_STOP_FAILED=1
+            STEP=configure_queue_worker
+            false
+        fi
+
+        # The hinge. Run against the NEW release, because the migrations belong
+        # to the version being installed. Nothing after this is undone by the
+        # rollback except the code.
+        note migrate
+        {$asUser}{$php} {$newBackend}/artisan migrate --force
+        MIGRATED=1
+        {$asUser}{$php} {$newBackend}/artisan db:seed --class=PermissionSeeder --force
+
+        note swap
+        {$this->releases->activate($release)}
+        SWAPPED=1
+
+        note restart_services
+        {$asUser}{$php} {$liveBackend}/artisan optimize:clear
+        {$asUser}{$php} {$liveBackend}/artisan optimize
+        # A graceful reload can preserve workers and shared OPcache entries for
+        # the stable /current/backend path after the symlink moves. Restart so
+        # the first health probe can only execute code from the new release.
+        {$run}sudo systemctl restart {$this->service('php_fpm')}
+        {$run}sudo systemctl restart {$this->service('frontend')}
+        {$run}sudo systemctl restart {$this->service('queue')}
+
+        note verify
+        {$this->verify($health, $version, $dryRun)}
+
+        note maintenance_off
+        {$asUser}{$php} {$liveBackend}/artisan up
+
+        # Last, and its failure is not the update's failure: disk left
+        # uncollected is untidy; an update reported as failed over it is a lie.
+        note prune
+        {$this->releases->prune()} || true
+
+        finish succeeded
+        BASH;
+    }
+
+    /**
+     * The release path is passed in, never recomputed: a second `now()` could drift and point
+     * the links at a missing directory, so the release would get no `.env` and a fresh APP_KEY.
+     */
+    private function renderLinks(string $release, bool $dryRun): string
+    {
+        $prefix = $dryRun ? 'echo DRY-RUN: ' : '';
+
+        return implode("\n        ", array_map(
+            fn (string $command): string => $prefix.$command,
+            $this->releases->linkShared($release),
+        ));
+    }
+
+    /**
+     * The gates that decide whether the new version stays.
+     *
+     * Both are retried: `systemctl restart` returns when a unit has *started*, not when it is
+     * *ready*, and Next.js takes seconds to answer. The frontend is checked too, so a client
+     * is not told the update succeeded while the frontend is still booting.
+     */
+    private function verify(string $baseUrl, string $version, bool $dryRun): string
+    {
+        if ($dryRun) {
+            return "echo 'DRY-RUN: verification skipped'";
+        }
+
+        $healthUrl = escapeshellarg($baseUrl.'/api/health');
+        $frontendUrl = escapeshellarg($baseUrl.'/');
+        $expected = ltrim($version, 'vV'); // bare "1.0.7" — used as fixed string, not regex
+        $queue = escapeshellarg($this->service('queue'));
+
+        return <<<BASH
+        HEALTH_URL={$healthUrl}
+        EXPECTED_VERSION='{$expected}'
+        HEALTH_OK=0
+        for attempt in \$(seq 1 30); do
+            response="\$(curl -sS --max-time 5 "\$HEALTH_URL" 2>&1)" && curl_status=0 || curl_status=\$?
+            if [ "\$curl_status" = "0" ] && printf '%s' "\$response" | grep -qF "version\":\"\$EXPECTED_VERSION\""; then
+                echo "Backend health check passed on attempt \$attempt/30."
+                HEALTH_OK=1
+                break
+            fi
+            echo "Backend health attempt \$attempt/30 failed (curl exit \$curl_status); expected version \$EXPECTED_VERSION."
+            printf 'Health response: %.1000s\\n' "\$response"
+            sleep 1
+        done
+        test "\$HEALTH_OK" = "1"
+
+        FRONTEND_URL={$frontendUrl}
+        FRONTEND_OK=0
+        for attempt in \$(seq 1 30); do
+            if status="\$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "\$FRONTEND_URL")" && [ "\$status" -ge 200 ] && [ "\$status" -lt 400 ]; then
+                echo "Frontend health check passed on attempt \$attempt/30 with HTTP \$status."
+                FRONTEND_OK=1
+                break
+            fi
+            echo "Frontend health attempt \$attempt/30 failed with HTTP \${status:-000}."
+            sleep 1
+        done
+        test "\$FRONTEND_OK" = "1"
+
+        sudo systemctl is-active --quiet {$queue}
+        BASH;
+    }
+
+    private function service(string $key): string
+    {
+        return (string) config('panel_update.services.'.$key);
+    }
+}

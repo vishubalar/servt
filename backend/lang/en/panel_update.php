@@ -1,0 +1,129 @@
+<?php
+
+/*
+ * Copy for the panel self-update screen. `steps` mirrors UpdateScript::STEPS
+ * one-for-one — the runner writes the step key into its state file and the
+ * screen translates it, so a step added there needs a line added here.
+ */
+
+return [
+    'status' => [
+        'pending' => 'Starting',
+        'running' => 'Updating',
+        'succeeded' => 'Up to date',
+        'failed' => 'Update failed',
+    ],
+
+    'steps' => [
+        'record_firewall_defaults' => 'Recording the firewall defaults',
+        'resync_fail2ban' => 'Resyncing the fail2ban configuration',
+        'restrict_postgres_databases' => 'Restricting PostgreSQL databases to their own users',
+        'refresh_npm_catalogue' => 'Refreshing the npm catalogue',
+        'refresh_lifecycle_catalogue' => 'Refreshing the runtime lifecycle catalogue',
+        'repair_node_runtime' => 'Repairing the Node runtime',
+        'repair_redis_policy' => 'Switching the installer’s Redis eviction policy to volatile-lru',
+        'preflight_git' => 'Checking the panel repository',
+        'preflight' => 'Checking the server is ready',
+        'create_release' => 'Building the new release',
+        'link_shared' => 'Linking shared files',
+        'swap' => 'Switching to the new release',
+        'verify' => 'Verifying the new release',
+        'prune' => 'Removing old releases',
+        'maintenance_on' => 'Putting the panel into maintenance mode',
+        'backup_database' => 'Backing up the database',
+        'fetch_release' => 'Downloading the release',
+        'checkout_release' => 'Switching to the new version',
+        'composer_install' => 'Installing PHP dependencies',
+        'migrate' => 'Updating the database schema',
+        'seed_permissions' => 'Syncing permissions',
+        'resync_site_configs' => 'Refreshing application configs',
+        'configure_services' => 'Tuning services',
+        'optimize' => 'Rebuilding caches',
+        'frontend_build' => 'Building the interface (this is the slow part)',
+        'sync_privileges' => 'Updating the panel’s privileges',
+        'configure_app_shell' => 'Setting up container login for Docker apps',
+        'configure_queue_worker' => 'Configuring the queue worker',
+        'configure_frontend_unit' => 'Making the web interface listen locally only',
+        'configure_ols_webadmin' => 'Making OpenLiteSpeed\'s WebAdmin console listen locally only',
+        'restart_services' => 'Restarting services',
+        'maintenance_off' => 'Leaving maintenance mode',
+        'health_check' => 'Verifying the new version',
+        'rollback' => 'Restoring the previous version',
+    ],
+
+    /*
+     * A failure reason is the step that failed, so the message says what was
+     * being attempted rather than quoting an error the user cannot act on.
+     * The panel is always rolled back to the previous version first.
+     */
+    'reasons' => [
+        'preflight' => 'The server did not pass its pre-update checks, so nothing was changed.',
+        'create_release' => 'The new release could not be built.',
+        'link_shared' => 'The shared files could not be linked into the new release.',
+        'swap' => 'Switching to the new release failed, so the previous one is still serving.',
+        'verify' => 'The updated panel did not answer correctly, so the previous release was restored.',
+        'prune' => 'The old releases could not be removed.',
+        'sync_privileges' => 'The panel’s privileges could not be updated.',
+        'configure_app_shell' => 'Container login for Docker apps could not be set up.',
+        'configure_queue_worker' => 'The queue worker could not be configured.',
+        'configure_frontend_unit' => 'The web interface could not be set to listen locally only.',
+        'configure_ols_webadmin' => 'OpenLiteSpeed\'s WebAdmin console could not be set to listen locally only.',
+        'record_firewall_defaults' => 'The firewall defaults could not be recorded.',
+        'resync_fail2ban' => 'The fail2ban configuration could not be resynced.',
+        'restrict_postgres_databases' => 'The PostgreSQL databases could not be restricted to their own users.',
+        'refresh_npm_catalogue' => 'The npm catalogue could not be refreshed.',
+        'refresh_lifecycle_catalogue' => 'The runtime lifecycle catalogue could not be refreshed.',
+        'repair_node_runtime' => 'The Node runtime could not be repaired.',
+        'repair_redis_policy' => 'The installer’s Redis eviction policy could not be switched to volatile-lru.',
+        'launch' => 'The update could not be started.',
+        'preflight_git' => 'The panel repository could not be read.',
+        'maintenance_on' => 'The panel could not be put into maintenance mode.',
+        'backup_database' => 'The database backup failed, so the update stopped before changing anything.',
+        'fetch_release' => 'The release could not be downloaded. Check the server can reach the internet.',
+        'checkout_release' => 'The new version could not be applied to the installation directory.',
+        'composer_install' => 'PHP dependencies could not be installed.',
+        'migrate' => 'The database schema update failed. The database backup taken beforehand is in storage/app/panel-backups.',
+        'seed_permissions' => 'Permissions could not be synced.',
+        'resync_site_configs' => 'Application configs could not be refreshed.',
+        'configure_services' => 'Services could not be tuned.',
+        'optimize' => 'Caches could not be rebuilt.',
+        'frontend_build' => 'The interface could not be built. This usually means the server ran out of memory or disk space.',
+        'frontend_build_out_of_memory' => 'The interface build ran out of memory and the system stopped it. Add swap or memory (it needs about 4 GB of RAM and swap together), then try the update again. The previous version is still running.',
+        'restart_services' => 'Services could not be restarted.',
+        'maintenance_off' => 'The panel could not be taken out of maintenance mode.',
+        'health_check' => 'The updated panel did not answer correctly, so the previous version was restored.',
+        'target_not_newer' => 'The selected release is already contained in this panel build, so the downgrade was refused.',
+        'unknown' => 'The update failed for an unknown reason.',
+    ],
+
+    /*
+     * Appended to a reason when the rollback could not undo the migration.
+     * A separate sentence rather than nine duplicated ones: any step after
+     * `migrate` can carry the `:migrated` suffix.
+     */
+    'reason_migrated' => 'The database changes had already been applied and cannot be undone: the code is back on the previous version but the schema is not. The backup taken beforehand is in storage/app/panel-backups.',
+    'reason_db_restored' => 'The database was put back to how it was before the update. Its state at the failure is kept in storage/app/panel-backups (the file ending in -failed.sqlite).',
+    'reason_db_not_restored' => 'The database may have been changed by the update and was NOT restored automatically. The backup taken beforehand is in storage/app/panel-backups; restore it before trying again.',
+
+    'errors' => [
+        'in_progress' => 'An update is already running.',
+        'no_update' => 'The panel is already on the newest version.',
+        'bad_version' => 'The published version could not be read.',
+        'preflight_failed' => 'The server is not ready to update. Check the preflight results.',
+    ],
+    'migration' => [
+        'already_migrated' => 'This panel already uses the release layout.',
+        'not_a_checkout' => 'No backend/ and frontend/ directories were found, so this is not a panel checkout.',
+        'no_repository' => 'No git repository was found, and the update needs one to build releases.',
+        'no_env' => 'No backend/.env was found. Migrating without it would generate a new APP_KEY and make every stored credential unreadable.',
+        'sqlite_not_found' => 'The configured SQLite database file does not exist.',
+        'root_not_writable' => 'The panel directory is not writable; run this as root.',
+    ],
+
+    // OLD-19: preflight figures as sentences, in the viewer's language.
+    'preflight_detail' => [
+        'free_disk' => ':free free, :required needed.',
+        'free_memory' => ':available memory available plus :swap swap, :required needed.',
+        'unknown' => 'Could not be measured.',
+    ],
+];

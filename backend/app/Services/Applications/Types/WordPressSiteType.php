@@ -1,0 +1,133 @@
+<?php
+
+namespace App\Services\Applications\Types;
+
+use App\Contracts\CloneStrategy;
+use App\Contracts\StagingStrategy;
+use App\Services\Server\Applications\Cloning\WordPressCloneStrategy;
+use App\Services\Server\Applications\Staging\WordPressStagingStrategy;
+use App\Support\FieldOptions;
+use Illuminate\Validation\Rule;
+
+/**
+ * WordPress, the reference one-click type and the one with the most type-specific fields.
+ */
+class WordPressSiteType extends AbstractSiteType
+{
+    public function name(): string
+    {
+        return 'wordpress';
+    }
+
+    public function method(): string
+    {
+        return 'one_click';
+    }
+
+    public function servingProfile(): string
+    {
+        return 'php';
+    }
+
+    public function category(): string
+    {
+        return 'cms';
+    }
+
+    public function icon(): string
+    {
+        return 'wordpress';
+    }
+
+    public function popular(): bool
+    {
+        return true;
+    }
+
+    public function needsDatabase(): bool
+    {
+        return true;
+    }
+
+    public function fields(): array
+    {
+        return array_merge($this->commonFields(), [
+            $this->field('site_title', 'text', required: true, extra: ['placeholder' => __('application.placeholders.site_title')]),
+            $this->field('admin_user', 'text', required: true, extra: ['default' => 'admin']),
+            $this->field('admin_email', 'email', required: true, extra: ['placeholder' => __('application.placeholders.admin_email')]),
+            // Pre-filled with a strong value so the simple path never invites a weak password.
+            $this->field('admin_password', 'password', required: true, extra: ['generate' => true]),
+            $this->field('site_language', 'select', advanced: true, extra: [
+                'default' => 'en_US',
+                'options' => FieldOptions::localeOptions(FieldOptions::wordpressLocales()),
+            ]),
+            $this->field('timezone', 'text', advanced: true, extra: [
+                'help' => __('application.help.timezone'),
+                'placeholder' => __('application.placeholders.timezone'),
+            ]),
+            $this->field('table_prefix', 'text', advanced: true, extra: ['default' => 'wp_']),
+        ], $this->phpFields());
+    }
+
+    public function rules(): array
+    {
+        return [
+            'site_title' => ['required', 'string', 'max:255'],
+            'admin_user' => ['required', 'string', 'max:60', 'regex:/^[A-Za-z0-9._@-]+$/'],
+            'admin_email' => ['required', 'email', 'max:255'],
+            'admin_password' => ['required', 'string', 'min:10'],
+            'site_language' => ['nullable', 'string', Rule::in(FieldOptions::wordpressLocales())],
+            // Accepts any valid PHP timezone string. wp option update validates it.
+            'timezone' => ['nullable', 'string', 'max:64'],
+            // Goes into SQL identifiers, so keep it strictly boring.
+            'table_prefix' => ['nullable', 'string', 'max:20', 'regex:/^[A-Za-z0-9_]+$/'],
+        ];
+    }
+
+    /**
+     * WordPress runs scheduled work by requesting its own `wp-cron.php` over HTTP. With Password
+     * Protection on, that request gets a 401 and nothing scheduled runs.
+     *
+     * @return array<int, string>
+     */
+    public function serverOnlyPaths(): array
+    {
+        return ['/wp-cron.php'];
+    }
+
+    /**
+     * Staging is a per-type recipe (URL rewriting inside serialised data, wp-cron disabled,
+     * outbound mail trapped), and only WordPress has one.
+     *
+     * No `app_environment`: wp-config.php is the application's file, not an env file the panel
+     * owns, and edits there would be overwritten by the next WordPress update.
+     */
+    public function features(): array
+    {
+        // `app_clone` is re-added: the base list withholds it from database-backed types, as
+        // copying only the files leaves the clone on the original's database. WordPress has a
+        // `cloneStrategy()`.
+        // `app_magic_login` is WordPress's alone (it needs a loader location and an administrator
+        // to sign in as), so the routes 404 elsewhere without a site-type check.
+        return [...parent::features(), 'app_clone', 'app_staging', 'app_magic_login'];
+    }
+
+    public function stagingStrategy(): ?StagingStrategy
+    {
+        return app(WordPressStagingStrategy::class);
+    }
+
+    public function cloneStrategy(): ?CloneStrategy
+    {
+        return app(WordPressCloneStrategy::class);
+    }
+
+    /**
+     * The floor is `$required_php_version` in `wp-includes/version.php`, which WordPress enforces.
+     * No ceiling: WordPress declares no upper bound, so a maximum would refuse working versions.
+     */
+    public function supportedPhpRange(): ?array
+    {
+        return ['min' => '7.4', 'max' => null];
+    }
+}

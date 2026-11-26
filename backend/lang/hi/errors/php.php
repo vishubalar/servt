@@ -1,0 +1,46 @@
+<?php
+
+/*
+ * PHP feature errors. Split from errors/runtime.php when PHP became its own
+ * feature: the shared keys carried a :runtime placeholder so Node and PHP
+ * could share a sentence, which is a coupling neither needed.
+ */
+
+return [
+    'not_installed' => 'PHP :version स्थापित नहीं है।',
+
+    // Version lookup, the ini editor and its rollback.
+    'unknown_version' => 'PHP :version इस सर्वर पर इंस्टॉल नहीं है।',
+    'unreadable' => 'PHP :version की कॉन्फ़िगरेशन पढ़ी नहीं जा सकी।',
+    'invalid_ini' => 'PHP ने वह कॉन्फ़िगरेशन अस्वीकार कर दी, इसलिए पिछली बहाल कर दी गई। कुछ भी रीलोड नहीं हुआ।',
+    'ini_extension_outside_dir' => 'एक्सटेंशन केवल PHP के अपने एक्सटेंशन फ़ोल्डर (:directory) से लोड किए जा सकते हैं। यह लाइन हटाएँ या बदलें: :line',
+    'reload_failed' => 'बदलाव कर दिया गया, लेकिन PHP :version रीलोड नहीं हो सका, इसलिए यह अभी सक्रिय नहीं है। सपोर्ट को रेफ़रेंस बताएं।',
+    'operation_failed' => 'PHP :version की कॉन्फ़िगरेशन अपडेट नहीं हो सकी।',
+    'version_in_use' => 'PHP :version का उपयोग :apps कर रहे हैं। पहले उन एप्लिकेशनों को बदलें।',
+    'version_used_by_cronjobs' => 'PHP :version इन क्रॉन जॉब्स द्वारा उपयोग किया जा रहा है: :cronjobs। पहले इन्हें किसी दूसरे वर्शन पर बदलें या हटाएँ।',
+    'version_is_default' => 'यह डिफ़ॉल्ट संस्करण है। पहले कोई अन्य चुनें।',
+    'version_runs_panel' => 'PHP :version हटाने से पैनल बंद हो जाएगा — पैनल स्वयं इसी संस्करण पर चलता है।',
+    'extension_builtin' => ':extension PHP में अंतर्निहित है। इसे बंद नहीं किया जा सकता।',
+    'extension_runs_panel' => ':extension बंद करने से पैनल बंद हो जाएगा — इसे :modules चाहिए।',
+
+    // LSPHP has no phpenmod equivalent. Refusing beats a control that
+    // reports success and changes nothing.
+    'unsupported_on_stack' => ':stack PHP स्टैक पर यह समर्थित नहीं है।',
+    'extension_not_disabled' => 'PHP :version का :extension एक्सटेंशन बंद नहीं किया जा सका: यह अभी भी लोड है, इसलिए कुछ नहीं बदला गया।',
+    'extension_not_enabled' => 'PHP :version का :extension एक्सटेंशन चालू नहीं किया जा सका: यह अभी भी लोड नहीं है, इसलिए कुछ नहीं बदला गया।',
+
+    'ioncube_unsupported_version' => 'ionCube, PHP :version के लिए Loader प्रकाशित नहीं करता।',
+    'ioncube_unsupported_architecture' => 'ionCube इस सर्वर की आर्किटेक्चर (:architecture) के लिए Loader प्रकाशित नहीं करता।',
+    'ioncube_external' => 'PHP :version के लिए ionCube पैनल के बाहर (पैनल के पुराने वर्ज़न या सिस्टम पैकेज से) इंस्टॉल किया गया था, इसलिए पैनल इसे नहीं बदलेगा। यह PHP :version के साथ ही हटाया जाता है।',
+    'ioncube_v7' => 'PHP :version के लिए ionCube Control Panel v7 ने इंस्टॉल किया था। पहले इसे यहाँ से हटाएँ, फिर दोबारा इंस्टॉल करें।',
+    'ioncube_download_failed' => 'ionCube Loader डाउनलोड नहीं हो सका। सर्वर की इंटरनेट पहुँच जाँचें और पुनः प्रयास करें।',
+    'ioncube_invalid_loader' => 'डाउनलोड की गई फ़ाइल इस सर्वर के लिए वैध ionCube Loader नहीं है। कुछ भी इंस्टॉल नहीं किया गया।',
+    'ioncube_install_failed' => 'ionCube Loader इंस्टॉल नहीं हो सका।',
+    'ioncube_discovery_failed' => 'ionCube Loader की खोज आपके PHP इंस्टॉलेशन को सुरक्षित रूप से निर्धारित नहीं कर सकी, इसलिए कुछ भी नहीं बदला गया।',
+    'ioncube_extraction_failed' => 'ionCube संग्रह को निकाला नहीं जा सका।',
+    'ioncube_removal_failed' => 'पहले से इंस्टॉल किया गया ionCube Loader हटाया नहीं जा सका। विवरण के लिए रेफ़रेंस देखें।',
+    'ioncube_reload_failed' => 'PHP को पुनः लोड नहीं किया जा सका। परिवर्तन अभी सक्रिय नहीं हो सकते हैं। सभी रिकवरी प्रतियाँ सुरक्षित रखी गई हैं।',
+    'ioncube_rollback_failed' => 'वापसी (रोलबैक) विफल हुई; सभी रिकवरी प्रतियाँ सुरक्षित रखी गई हैं। मैन्युअल रिकवरी आवश्यक है।',
+    'ioncube_config_test_failed' => 'PHP कॉन्फ़िगरेशन सत्यापन विफल हुआ। पिछली कॉन्फ़िगरेशन फ़ाइलें बहाल कर दी गई हैं और PHP को पुनः लोड नहीं किया गया।',
+    'not_a_php_server' => 'यह सर्वर कंटेनर होस्ट करता है, इसलिए यह कोई PHP एप्लिकेशन सर्व नहीं करता और प्रबंधित करने के लिए कोई PHP संस्करण नहीं है। पैनल के लिए PHP अभी भी इंस्टॉल है, और उसकी सेवा को Services से रीस्टार्ट किया जा सकता है।',
+];

@@ -1,0 +1,27 @@
+<?php
+
+return [
+    'not_a_docker_server' => 'Ce serveur n\'héberge pas de conteneurs : il n\'a donc ni réseaux ni volumes Docker.',
+    'invalid_name' => 'Un nom peut contenir lettres, chiffres, points, tirets et tirets bas, et doit commencer par une lettre ou un chiffre.',
+    'network_exists' => 'Un réseau nommé :name existe déjà.',
+    'volume_exists' => 'Un volume nommé :name existe déjà.',
+    'network_built_in' => ':name est l\'un des réseaux propres à Docker. Docker le recrée au redémarrage, et le supprimer casserait tous les conteneurs de ce serveur.',
+    'network_in_use' => 'Le réseau :name a encore des conteneurs connectés : :containers. Arrêtez-les ou détachez-les d\'abord.',
+    'network_used_by_sites' => 'Ces applications sont configurées pour rejoindre le réseau :name : :sites. Changez d\'abord leur réseau — le supprimer maintenant les empêcherait de démarrer.',
+    'volume_in_use' => 'Le volume :name est encore utilisé par des conteneurs (:count). Arrêtez-les d\'abord : supprimer un volume en cours d\'utilisation efface des données qu\'un processus écrit encore.',
+    'volume_in_use_by' => 'Le volume :name est encore utilisé par :containers. Arrêtez-les d\'abord — supprimer un volume en cours d\'utilisation efface des données en train d\'être écrites.',
+    'volume_used_by_sites' => 'Ces applications montent le volume :name : :sites. Retirez d\'abord le montage — le supprimer maintenant détruit les données qu\'elles y conservent.',
+    'network_create_failed' => 'Le réseau n\'a pas pu être créé. Référence :reference.',
+    'network_remove_failed' => 'Le réseau n\'a pas pu être supprimé. Référence :reference.',
+    'volume_create_failed' => 'Le volume n\'a pas pu être créé. Référence :reference.',
+    'volume_remove_failed' => 'Le volume n\'a pas pu être supprimé. Référence :reference.',
+    'registry_deleted' => 'L’identifiant de registre a été supprimé. Les applications qui l’utilisaient récupéreront désormais les images de façon anonyme.',
+    'registry_credential_unwritable' => 'L’identifiant de registre n’a pas pu être écrit sur le disque, Docker n’a donc jamais été interrogé. Référence :reference.',
+    'database_start_failed' => 'La base de données n’a pas pu démarrer (:step). Rien n’a été laissé derrière : aucune entrée, aucun conteneur, aucun port réservé.',
+    'database_version_unknown' => 'Ce moteur n’a pas de version :version. Choisissez-en une proposée par le panneau pour :engine.',
+    'database_deleted' => 'La base de données a été supprimée.',
+    'database_delete_failed' => 'La base de données n’a pas pu être entièrement supprimée (:step) ; elle reste donc dans la liste. Vérifiez que Docker fonctionne et réessayez.',
+    'network_docker_own' => ':name est l\'un des réseaux propres à Docker et ne peut pas servir pour une application. host la placerait directement sur le réseau du serveur, et avec les autres elle ne pourrait plus joindre ses autres conteneurs. Choisissez un réseau créé depuis l\'écran Docker, ou laissez l\'application sur son propre réseau.',
+    'network_other_application' => ':name est le réseau privé d\'une autre application. Le rejoindre donnerait accès aux conteneurs de cette application, base de données comprise. Pour relier les deux, créez un réseau partagé depuis l\'écran Docker et placez-les toutes les deux dessus.',
+    'network_name_reserved' => 'Le nom :name est réservé : le panneau garde les noms des réseaux propres à Docker et ceux qui commencent par sv-app- pour les réseaux qu\'il crée pour chaque application. Choisissez un autre nom.',
+];

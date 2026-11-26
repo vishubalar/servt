@@ -1,0 +1,154 @@
+"use client";
+
+import Link from "@/components/ui/app-link";
+import { Plus, SearchX, Shield } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { SearchInput } from "@/components/data-table/search-input";
+import { ListCard } from "@/components/data-table/list-card";
+import { DataTablePagination } from "@/components/data-table/data-table-pagination";
+import { NavTransitionProvider } from "@/components/data-table/nav-transition";
+import { useSetQuery } from "@/hooks/use-set-query";
+import { useSearchParams } from "next/navigation";
+import { RefreshButton } from "@/components/data-table/refresh-button";
+import { SyncPermissionsButton } from "@/components/admin/roles/sync-permissions-button";
+import { RoleRowActions } from "@/components/admin/roles/role-row-actions";
+import { RolesCards } from "@/components/admin/roles/roles-cards";
+import { accessCounts } from "@/lib/roles/granted-count";
+import { roleName, roleDescription } from "@/lib/roles/role-label";
+
+// Cells at module level: inline cells remount and lose dialog state.
+
+function NameCell({ row }) {
+  const t = useTranslations("roles");
+  return (
+    <div className="flex items-center gap-2">
+      <span className="font-medium">{roleName(row.original, t)}</span>
+      {row.original.is_system && (
+        <Badge variant="warning" className="font-normal">
+          {t("system")}
+        </Badge>
+      )}
+    </div>
+  );
+}
+
+function DescriptionCell({ row }) {
+  const t = useTranslations("roles");
+  return (
+    <span className="line-clamp-2 block max-w-64 whitespace-normal text-muted-foreground">
+      {roleDescription(row.original, t) || "—"}
+    </span>
+  );
+}
+
+function PermissionsCell({ row }) {
+  const t = useTranslations("roles");
+  return (
+    <Badge variant="secondary" className="h-auto max-w-40 whitespace-normal">
+      {t("accessCount", accessCounts(row.original))}
+    </Badge>
+  );
+}
+
+function CreatedCell({ row }) {
+  return <span className="text-muted-foreground">{row.original.created_at_human}</span>;
+}
+
+function RowActionsCell({ row }) {
+  return <RoleRowActions role={row.original} />;
+}
+
+export function RolesTable(props) {
+  return (
+    <NavTransitionProvider>
+      <RolesList {...props} />
+    </NavTransitionProvider>
+  );
+}
+
+function RolesList({ data, meta }) {
+  const t = useTranslations("roles");
+  const searchParams = useSearchParams();
+  const setQuery = useSetQuery();
+
+  const filtered = data;
+
+  const columns = [
+    { accessorKey: "name", header: t("columns.name"), cell: NameCell },
+    { accessorKey: "description", header: t("columns.description"), cell: DescriptionCell },
+    { id: "permissions", header: t("columns.permissions"), cell: PermissionsCell },
+    { accessorKey: "created_at_human", header: t("columns.created"), cell: CreatedCell },
+    {
+      id: "actions",
+      header: () => <span className="sr-only">{t("actions.label")}</span>,
+      cell: RowActionsCell,
+    },
+  ];
+
+  const isFiltered = Boolean(searchParams.get("search"));
+
+  const toolbar = (
+    <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+      <SearchInput placeholder={t("searchPlaceholder")} />
+      <div className="flex flex-wrap items-center gap-2">
+        <RefreshButton />
+        <SyncPermissionsButton />
+        <Button asChild>
+          <Link href="/admin/roles/new" data-roles-add>
+            <Plus className="size-4" />
+            {t("addRole")}
+          </Link>
+        </Button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      {filtered.length === 0 ? (
+        <ListCard toolbar={toolbar}>
+          {isFiltered ? (
+            <EmptyState
+              icon={SearchX}
+              subject={Shield}
+              title={t("empty.filteredTitle")}
+              description={t("empty.filteredDesc")}
+              action={
+                <Button variant="outline" onClick={() => setQuery({ search: undefined }, { resetPage: true })}>
+                  {t("empty.clear")}
+                </Button>
+              }
+            />
+          ) : (
+            <EmptyState
+              icon={Shield}
+              title={t("empty.title")}
+              description={t("empty.desc")}
+              action={
+                <Button asChild>
+                  <Link href="/admin/roles/new">
+                    <Plus className="size-4" />
+                    {t("addRole")}
+                  </Link>
+                </Button>
+              }
+            />
+          )}
+        </ListCard>
+      ) : (
+        <ListCard from="c900" toolbar={toolbar} footer={<DataTablePagination meta={meta} />}>
+          <div className="@min-[900px]/page:hidden">
+            <RolesCards roles={filtered} />
+          </div>
+          <div className="hidden @min-[900px]/page:block">
+            <DataTable bare roomy columns={columns} data={filtered} />
+          </div>
+        </ListCard>
+      )}
+    </div>
+  );
+}

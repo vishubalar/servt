@@ -1,0 +1,426 @@
+<?php
+
+use App\Actions\Server\Application\AutoIssueCertificate;
+use App\Enums\DomainType;
+use App\Jobs\IssueCertificate;
+use App\Models\Application;
+use App\Models\Certificate;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Applications\DnsVerifier;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    $this->home = sys_get_temp_dir().'/sv-oss-precheck-'.getmypid();
+    config([
+        'server.web_server' => 'nginx',
+        'server.web_server_drivers.nginx.sites_dir' => $this->home.'/sites',
+        'server.certificates.challenge_root' => $this->home.'/acme',
+    ]);
+
+    $systemUser = SystemUser::create([
+        'username' => 'preuser', 'home_path' => $this->home, 'shell' => '/bin/bash', 'sudo' => false,
+    ]);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Shop',
+        'slug' => 'shop',
+        'domain' => 'shop.example.com',
+        'site_type' => 'wordpress',
+        'serving_profile' => 'php',
+        'php_version' => '8.4',
+        'web_root' => '/',
+        'status' => 'active',
+    ]);
+
+    // Deliberately *not* verified: the stored flag is written when a domain is added, usually
+    // before the user touches their registrar, so relying on it keeps the button disabled long
+    // after the problem is fixed. The dry run decides.
+    $this->primary = $this->application->domains()->create([
+        'domain' => 'shop.example.com',
+        'type' => DomainType::Primary,
+    ]);
+
+    $this->serverIp = '203.0.113.10';
+    Cache::put('server.public_ip', $this->serverIp, now()->addHour());
+
+    Process::fake(fn ($process) => Process::result(exitCode: certPathProbe($process) ? 1 : 0));
+    Queue::fake();
+});
+
+/**
+ * Point every domain at this server, and have the challenge path answer with what the caller
+ * asks for.
+ */
+function fakeDns(string $ip): void
+{
+    test()->mock(DnsVerifier::class, function ($mock) use ($ip) {
+        $mock->shouldReceive('verify')->andReturnUsing(function ($domain) use ($ip) {
+            $domain->update([
+                'dns_resolved_ip' => $ip,
+                'behind_proxy' => false,
+                'dns_verified_at' => $ip === test()->serverIp ? now() : null,
+            ]);
+
+            return $domain;
+        });
+        $mock->shouldReceive('serverIp')->andReturn(test()->serverIp);
+    });
+}
+
+it('issues when the challenge path actually answers, even though DNS was never verified', function () {
+    fakeDns($this->serverIp);
+
+    // The token comes back exactly: the only proof Let's Encrypt will succeed.
+    Http::fake(function ($request) {
+        $token = basename(parse_url($request->url(), PHP_URL_PATH));
+
+        return Http::response($token."\n", 200);
+    });
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(202);
+
+    Queue::assertPushed(IssueCertificate::class);
+});
+
+it('refuses and blames the rewrite rules when the site answers with the wrong body', function () {
+    fakeDns($this->serverIp);
+
+    // A WordPress 404 page returned with HTTP 200: the body is compared, not just the status.
+    Http::fake(fn () => Http::response('<html>Not found</html>', 200));
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('domain');
+
+    expect(Certificate::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('refuses when nothing answers on port 80', function () {
+    fakeDns($this->serverIp);
+
+    Http::fake(fn () => throw new ConnectionException('connection refused'));
+
+    $response = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(422);
+
+    expect($response->json('errors.domain.0'))->toContain('port 80');
+});
+
+it('names the address rather than fetching a stranger when DNS points elsewhere', function () {
+    fakeDns('198.51.100.5');
+
+    Http::fake();
+
+    $response = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(422);
+
+    expect($response->json('errors.domain.0'))->toContain('198.51.100.5');
+
+    // Never fetched: the check only talks to this server's own address, so a domain pointed at
+    // somebody else cannot make the panel call them.
+    Http::assertNothingSent();
+});
+
+it('refuses a domain resolving to loopback or the metadata range', function (string $ip) {
+    fakeDns($ip);
+
+    Http::fake();
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(422);
+
+    Http::assertNothingSent();
+})->with(['127.0.0.1', '169.254.169.254']);
+
+it('issues for the domains that pass and leaves the ones that do not', function () {
+    $this->application->domains()->create([
+        'domain' => 'www.shop.example.com',
+        'type' => DomainType::Alias,
+    ]);
+
+    $this->mock(DnsVerifier::class, function ($mock) {
+        $mock->shouldReceive('verify')->andReturnUsing(function ($domain) {
+            // The apex is pointed; the www record has not propagated yet.
+            $domain->update([
+                'dns_resolved_ip' => $domain->domain === 'shop.example.com' ? $this->serverIp : null,
+                'behind_proxy' => false,
+            ]);
+
+            return $domain;
+        });
+        $mock->shouldReceive('serverIp')->andReturn($this->serverIp);
+    });
+
+    Http::fake(function ($request) {
+        return Http::response(basename(parse_url($request->url(), PHP_URL_PATH))."\n", 200);
+    });
+
+    // Blocking the request over the slower of two DNS records helps nobody: the site gets HTTPS
+    // now and `missing_domains` says what is left.
+    $response = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(202);
+
+    expect($response->json('certificate.domains'))->toBe(['shop.example.com']);
+});
+
+it('tells the user to pause Cloudflare rather than reporting a generic failure', function () {
+    $this->mock(DnsVerifier::class, function ($mock) {
+        $mock->shouldReceive('verify')->andReturnUsing(function ($domain) {
+            $domain->update(['dns_resolved_ip' => '104.16.0.1', 'behind_proxy' => true]);
+
+            return $domain;
+        });
+        $mock->shouldReceive('serverIp')->andReturn($this->serverIp);
+    });
+
+    Http::fake();
+
+    $response = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(422);
+
+    expect($response->json('errors.domain.0'))->toContain('Cloudflare');
+});
+
+it('lets the user override the dry run for a server behind NAT', function () {
+    fakeDns($this->serverIp);
+
+    // The dry run fails because the box cannot reach its own public address, while the real
+    // challenge from outside would succeed: refusing would make the feature unusable there.
+    Http::fake(fn () => throw new ConnectionException('connection refused'));
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", [
+            'type' => 'letsencrypt',
+            'force' => true,
+        ])
+        ->assertStatus(202);
+
+    Queue::assertPushed(IssueCertificate::class);
+});
+
+describe('test hostnames', function () {
+    beforeEach(function () {
+        // A wildcard-DNS hostname, flagged automatically by looksTemporary().
+        $this->primary->update(['domain' => 'shop.203.0.113.10.nip.io', 'is_test' => true]);
+        $this->application->forceFill(['domain' => 'shop.203.0.113.10.nip.io'])->save();
+    });
+
+    it('is treated like any other domain, not refused for its suffix', function () {
+        fakeDns($this->serverIp);
+        Http::fake(function ($request) {
+            $token = basename(parse_url($request->url(), PHP_URL_PATH));
+
+            return Http::response($token."\n", 200);
+        });
+
+        // Not refused outright: the dry run decides, and a wildcard-DNS name passes it because
+        // it resolves here by construction.
+        $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(202);
+
+        Queue::assertPushed(IssueCertificate::class);
+
+        expect(Certificate::firstOrFail()->domains)->toContain('shop.203.0.113.10.nip.io');
+    });
+
+    it('is issued automatically, like any other domain that points here', function () {
+        fakeDns($this->serverIp);
+        Http::fake(function ($request) {
+            $token = basename(parse_url($request->url(), PHP_URL_PATH));
+
+            return Http::response($token."\n", 200);
+        });
+
+        app(AutoIssueCertificate::class)
+            ->attempt($this->application->fresh(['domains', 'certificate']));
+
+        expect(Certificate::count())->toBe(1);
+    });
+
+    it('still refuses when the challenge does not actually answer', function () {
+        fakeDns($this->serverIp);
+        Http::fake(fn () => Http::response('<html>Not found</html>', 200));
+
+        // What decides is whether Let's Encrypt could really validate the name, not the suffix.
+        $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(422);
+
+        expect(Certificate::count())->toBe(0);
+    });
+});
+
+it('does not run the dry run for a self-signed certificate', function () {
+    Http::fake();
+
+    // Unresolvable names are the point of self-signing: an internal or staging hostname Let's
+    // Encrypt could never validate.
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'self_signed'])
+        ->assertStatus(202);
+
+    Http::assertNothingSent();
+});
+
+it('cleans up the token it wrote', function () {
+    fakeDns($this->serverIp);
+
+    Http::fake(fn ($request) => Http::response(basename(parse_url($request->url(), PHP_URL_PATH))."\n", 200));
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+        ->assertStatus(202);
+
+    // Leftovers would fill the challenge directory with one file per click.
+    Process::assertRan(fn ($process) => in_array('rm', $process->command, true)
+        && collect($process->command)->contains(fn ($part) => str_contains((string) $part, 'acme-challenge/')));
+});
+
+describe('a server behind NAT', function () {
+    /** DNS points at the public address; the box only knows a private one. */
+    function fakeNatDns(string $publicIp): void
+    {
+        test()->mock(DnsVerifier::class, function ($mock) use ($publicIp) {
+            $mock->shouldReceive('verify')->andReturnUsing(function ($domain) use ($publicIp) {
+                $domain->update([
+                    'dns_resolved_ip' => $publicIp,
+                    'behind_proxy' => false,
+                    'dns_verified_at' => null,
+                ]);
+
+                return $domain;
+            });
+
+            // `ip route get` reports the interface address, which behind NAT is private.
+            $mock->shouldReceive('serverIp')->andReturnNull();
+        });
+    }
+
+    it('issues when the token comes back, even though the public IP is unknowable', function () {
+        fakeNatDns('203.0.113.10');
+
+        // The token returning proves this is the right server, whatever the interface address.
+        Http::fake(fn ($request) => Http::response(
+            basename(parse_url($request->url(), PHP_URL_PATH))."\n",
+            200,
+        ));
+
+        $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(202);
+
+        Queue::assertPushed(IssueCertificate::class);
+    });
+
+    it('blames NAT rather than DNS when nothing answers', function () {
+        fakeNatDns('203.0.113.10');
+
+        // No hairpin NAT: the server cannot reach its own public address, but
+        // the real challenge arrives from outside and would succeed.
+        Http::fake(fn () => throw new ConnectionException('Connection timed out'));
+
+        $response = $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(422);
+
+        // The user must be pointed at Issue, not sent to check a fine firewall or DNS.
+        expect(implode(' ', $response->json('errors.domain')))
+            ->toContain('NAT')
+            ->not->toContain('port 80');
+    });
+
+    it('still refuses a domain that points somewhere else when the IP is known', function () {
+        fakeDns('198.51.100.7');
+
+        $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('domain');
+    });
+
+    it('refuses a domain resolving into a private network', function () {
+        fakeDns('10.0.0.5');
+
+        // Nothing public can hold a certificate for it, and fetching would make the panel reach
+        // into the internal network.
+        $response = $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(422);
+
+        expect(implode(' ', $response->json('errors.domain')))->toContain('not a public address');
+        Http::assertNothingSent();
+    });
+});
+
+describe('test hostnames behind NAT', function () {
+    /*
+     * On a box whose interface address is private (AWS, GCP, Azure, LXD), `serverIp()` is
+     * null: a nip.io name must not be answered "does not resolve at all".
+     */
+    beforeEach(function () {
+        $this->primary->update(['domain' => 'shop.203-0-113-10.nip.io', 'is_test' => true]);
+        $this->application->forceFill(['domain' => 'shop.203-0-113-10.nip.io'])->save();
+        Cache::forget('server.public_ip');
+        Cache::forget('server.public_ip.resolved');
+
+        Process::fake(fn ($process) => array_slice($process->command, -5) === ['ip', '-4', 'route', 'get', '1.1.1.1']
+            ? Process::result(output: "1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0\n")
+            : Process::result(exitCode: certPathProbe($process) ? 1 : 0));
+    });
+
+    it('takes the address from the name, and the certificate goes ahead', function () {
+        Http::fake(fn ($request) => Http::response(basename(parse_url($request->url(), PHP_URL_PATH))."\n", 200));
+
+        $this->actingAs($this->admin)
+            ->postJson("/api/applications/{$this->application->id}/certificate", ['type' => 'letsencrypt'])
+            ->assertStatus(202);
+
+        Queue::assertPushed(IssueCertificate::class);
+        expect($this->primary->fresh()->dns_resolved_ip)->toBe('203.0.113.10');
+    });
+
+    it('falls back to the public address the metadata service gives, for a name with none in it', function () {
+        $this->primary->update(['domain' => 'shop.nip.io']);
+        Http::fake(['169.254.169.254/latest/meta-data/public-ipv4' => Http::response('198.51.100.7')]);
+
+        app(DnsVerifier::class)->verify($this->primary->fresh());
+
+        expect($this->primary->fresh()->dns_resolved_ip)->toBe('198.51.100.7')
+            ->and($this->primary->fresh()->dns_verified_at)->not->toBeNull();
+    });
+});
+
+it('reads the address a wildcard-DNS name encodes', function (string $domain, ?string $ip) {
+    expect(DnsVerifier::encodedIp($domain))->toBe($ip);
+})->with([
+    'dashes, as the panel issues them' => ['shop.203-0-113-10.nip.io', '203.0.113.10'],
+    'dots' => ['shop.203.0.113.10.nip.io', '203.0.113.10'],
+    'joined to the label by a dash' => ['shop-203-0-113-10.nip.io', '203.0.113.10'],
+    'the address alone' => ['203-0-113-10.nip.io', '203.0.113.10'],
+    'deeper names' => ['a.b.198.51.100.7.sslip.io', '198.51.100.7'],
+    'any case, trailing dot' => ['SHOP.203-0-113-10.NIP.IO.', '203.0.113.10'],
+    'not an address' => ['shop.999-0-113-10.nip.io', null],
+    'no address at all' => ['shop.nip.io', null],
+    'digits that are only part of the label' => ['shop2024.nip.io', null],
+    'not a wildcard-DNS service' => ['shop.203-0-113-10.example.com', null],
+]);

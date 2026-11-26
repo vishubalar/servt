@@ -1,0 +1,323 @@
+import { useMemo, useState } from "react";
+import { ChevronRight, EyeOff, Loader2, SearchX, Undo2 } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { SYNC_RESOURCE_TYPES } from "@/lib/schemas/sync";
+import { ignoreKey } from "@/lib/server/sync-selection";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { LocalSearchInput } from "@/components/data-table/local-search-input";
+import { SyncEvidence } from "@/components/sync/sync-evidence";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { FILTER_TOGGLE_ITEM } from "@/lib/theme/filter-toggle";
+import { ListCard } from "@/components/data-table/list-card";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
+
+const ACTION_VARIANTS = {
+  adopted: "success",
+  skipped: "muted",
+  failed: "destructive",
+  found: "default",
+};
+
+const ACTION_CLASSES = { found: "h-6 rounded-4xl px-2.5" };
+
+const PENDING_NAME_WIDTHS = ["w-[45%]", "w-[60%]", "w-[38%]", "w-[52%]"];
+
+function ResultsHeader() {
+  const t = useTranslations("sync");
+  return (
+    <TableHeader>
+      <TableRow className="bg-muted/40 hover:bg-muted/40">
+        <TableHead className="w-10 px-1 sm:px-2" />
+        <TableHead className="hidden w-[16%] sm:table-cell">{t("results.columns.type")}</TableHead>
+        <TableHead>{t("results.columns.name")}</TableHead>
+        <TableHead className="w-[19%]">{t("results.columns.outcome")}</TableHead>
+        <TableHead className="w-10 px-1 sm:px-2" />
+      </TableRow>
+    </TableHeader>
+  );
+}
+
+export function SyncResultsPending({ message }) {
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground" role="status">
+        {message}
+      </p>
+      <div className="overflow-x-auto rounded-xl border" aria-hidden>
+        <Table>
+          <ResultsHeader />
+          <TableBody>
+            {PENDING_NAME_WIDTHS.map((width) => (
+              <TableRow key={width} className="hover:bg-transparent">
+                <TableCell className="px-1 sm:px-2">
+                  <Skeleton className="mx-auto size-5 rounded-md" />
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <Skeleton className="h-4 w-20" />
+                </TableCell>
+                <TableCell>
+                  <Skeleton className={cn("h-4", width)} />
+                  <Skeleton className="mt-1.5 h-3 w-16 sm:hidden" />
+                </TableCell>
+                <TableCell>
+                  <Skeleton className="h-5 w-14 rounded-full" />
+                </TableCell>
+                <TableCell className="px-1 sm:px-2" />
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </div>
+  );
+}
+
+export function SyncResults({
+  items,
+  ignoredKeys,
+  canManage,
+  onIgnore,
+  onUnignore,
+  pendingKeys = [],
+}) {
+  const t = useTranslations("sync");
+  const tc = useTranslations("common");
+  const [search, setSearch] = useState("");
+  const [types, setTypes] = useState([]);
+  const [expanded, setExpanded] = useState(() => new Set());
+
+  const countsByType = useMemo(() => {
+    const counts = new Map();
+    for (const item of items) {
+      counts.set(item.resource_type, (counts.get(item.resource_type) ?? 0) + 1);
+    }
+    return counts;
+  }, [items]);
+
+  const presentTypes = useMemo(
+    () => SYNC_RESOURCE_TYPES.filter((type) => countsByType.has(type)),
+    [countsByType],
+  );
+
+  const visible = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return items.filter((item) => {
+      if (types.length && !types.includes(item.resource_type)) return false;
+      if (!needle) return true;
+      return (
+        item.resource_key.toLowerCase().includes(needle) ||
+        (item.reason ?? "").toLowerCase().includes(needle)
+      );
+    });
+  }, [items, search, types]);
+
+  function toggleExpanded(id) {
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  return (
+    <ListCard
+      toolbar={
+        <div className="flex flex-wrap items-center gap-3">
+          <LocalSearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder={t("results.searchPlaceholder")}
+          />
+
+          {presentTypes.length > 1 ? (
+            <ToggleGroup
+              type="multiple"
+              value={types}
+              onValueChange={setTypes}
+              variant="outline"
+              size="sm"
+              className="flex flex-wrap justify-start gap-2"
+            >
+              {presentTypes.map((type) => (
+                <ToggleGroupItem key={type} value={type} className={cn(FILTER_TOGGLE_ITEM, "gap-1.5")}>
+                  {t(`types.${type}`)}
+                  <span className="text-xs text-muted-foreground">{countsByType.get(type)}</span>
+                </ToggleGroupItem>
+              ))}
+            </ToggleGroup>
+          ) : null}
+
+          {visible.length !== items.length ? (
+            <p className="text-sm text-muted-foreground sm:ms-auto">
+              {t("results.showing", { shown: visible.length, total: items.length })}
+            </p>
+          ) : null}
+        </div>
+      }
+    >
+      {visible.length === 0 ? (
+        <EmptyState
+          icon={SearchX}
+          title={t("results.noMatches")}
+          description={t("results.noMatchesHint")}
+          action={
+            search || types.length ? (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setSearch("");
+                  setTypes([]);
+                }}
+              >
+                {tc("clearFilters")}
+              </Button>
+            ) : null
+          }
+        />
+      ) : (
+        <div className="overflow-x-auto border-t">
+          <Table>
+            <ResultsHeader />
+            <TableBody>
+              {visible.map((item) => {
+                const key = ignoreKey(item);
+                const ignored = ignoredKeys.has(key);
+                const wholeType = item.action === "skipped" && item.resource_key === item.resource_type;
+                const isOpen = expanded.has(item.id);
+
+                return [
+                  <TableRow
+                    key={item.id}
+                    className={cn(ignored && "opacity-55")}
+                  >
+                    <TableCell className="px-1 align-top sm:px-2">
+                      {wholeType ? null : (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="-my-1 size-7"
+                              aria-expanded={isOpen}
+                              aria-label={t("results.toggleDetails", { name: item.resource_key })}
+                              onClick={() => toggleExpanded(item.id)}
+                            >
+                              <ChevronRight
+                                className={cn("size-4 transition-transform", isOpen && "rotate-90")}
+                                aria-hidden
+                              />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {isOpen ? t("results.hideDetailsShort") : t("results.showDetailsShort")}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                    </TableCell>
+                    <TableCell className="hidden align-top text-sm text-muted-foreground sm:table-cell">
+                      {t(`types.${item.resource_type}`)}
+                    </TableCell>
+                    <TableCell className="align-top whitespace-normal">
+                      {wholeType ? (
+                        <span className="text-sm">{t("results.wholeType")}</span>
+                      ) : (
+                        <span className={cn("font-mono text-sm break-all", ignored && "line-through")}>
+                          {item.resource_key}
+                        </span>
+                      )}
+                      <p className="text-xs text-muted-foreground sm:hidden">
+                        {t(`types.${item.resource_type}`)}
+                      </p>
+                      {item.reason ? (
+                        <p className={cn("mt-0.5 text-xs text-muted-foreground", wholeType ? "max-w-xl" : "line-clamp-2 break-words")}>
+                          {item.reason}
+                        </p>
+                      ) : null}
+                      {ignored ? (
+                        <p className="mt-0.5 text-xs font-medium text-muted-foreground">
+                          {t("results.ignoredNote")}
+                        </p>
+                      ) : null}
+                    </TableCell>
+                    <TableCell className="align-top">
+                      <Badge
+                        variant={ACTION_VARIANTS[item.action] ?? "outline"}
+                        className={ACTION_CLASSES[item.action]}
+                      >
+                        {t(`outcomes.${item.action}`)}
+                      </Badge>
+                      {t.has(`outcomeHints.${item.action}`) ? (
+                        <p className="mt-1 hidden text-xs whitespace-normal text-muted-foreground sm:block">
+                          {t(`outcomeHints.${item.action}`)}
+                        </p>
+                      ) : null}
+                    </TableCell>
+                    <TableCell className="px-1 align-top sm:px-2">
+                      {canManage && !wholeType ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="-my-1 size-7"
+                                disabled={pendingKeys.includes(key)}
+                                aria-label={
+                                  ignored
+                                    ? t("results.restore", { name: item.resource_key })
+                                    : t("results.ignore", { name: item.resource_key })
+                                }
+                                onClick={() => (ignored ? onUnignore(item) : onIgnore(item))}
+                              >
+                                {pendingKeys.includes(key) ? (
+                                  <Loader2 className="size-4 animate-spin" aria-hidden />
+                                ) : ignored ? (
+                                  <Undo2 className="size-4" aria-hidden />
+                                ) : (
+                                  <EyeOff className="size-4" aria-hidden />
+                                )}
+                              </Button>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {pendingKeys.includes(key)
+                              ? t("results.working")
+                              : ignored
+                                ? t("results.restoreShort")
+                                : t("results.ignoreShort")}
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>,
+                  isOpen ? (
+                    <TableRow key={`${item.id}-details`} className="hover:bg-transparent">
+                      <TableCell colSpan={5} className="p-0">
+                        <SyncEvidence item={item} />
+                      </TableCell>
+                    </TableRow>
+                  ) : null,
+                ];
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </ListCard>
+  );
+}

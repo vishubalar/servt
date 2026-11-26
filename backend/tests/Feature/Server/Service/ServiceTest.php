@@ -1,0 +1,627 @@
+<?php
+
+use App\Actions\Server\Service\RunServiceAction;
+use App\Models\ActivityLog;
+use App\Models\ServerCapability;
+use App\Models\User;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+    // Point php-fpm detection at an empty temp dir so tests are deterministic.
+    $this->phpDir = sys_get_temp_dir().'/sv-oss-php-'.uniqid();
+    File::ensureDirectoryExists($this->phpDir);
+    config(['server.php_dir' => $this->phpDir]);
+});
+
+afterEach(function () {
+    File::deleteDirectory($this->phpDir);
+});
+
+/**
+ * Fake systemctl: `show` reports each unit's state from $units (default:
+ * not-found → excluded); all other systemctl commands succeed.
+ *
+ * @param  array<string, array{load: string, active: string, file: string, id?: string, reload?: bool}>  $units
+ */
+function fakeServices(array $units): void
+{
+    Process::fake(function ($process) use ($units) {
+        if (($process->command[1] ?? null) === 'show') {
+            return Process::result(output: systemctlShowOutput($process->command, $units));
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+it('lists only installed services with live status, protection and actions', function () {
+    fakeServices([
+        'nginx' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'reload' => true],
+        'mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled'],
+    ]);
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')->assertOk();
+
+    $keys = collect($response->json('services'))->pluck('key');
+    expect($keys)->toContain('nginx', 'mariadb');
+    // not-installed units are excluded
+    expect($keys)->not->toContain('apache', 'mysql', 'redis');
+
+    $nginx = collect($response->json('services'))->firstWhere('key', 'nginx');
+    expect($nginx['protected'])->toBeTrue();               // default protected
+    expect($nginx['actions'])->toBe(['restart', 'reload', 'enable']);
+    expect($nginx['status'])->toBe('active');
+
+    $mariadb = collect($response->json('services'))->firstWhere('key', 'mariadb');
+    expect($mariadb['protected'])->toBeFalse();
+    expect($mariadb['actions'])
+        ->toContain('start', 'stop', 'restart', 'disable')
+        ->not->toContain('reload');
+});
+
+it('shows only the canonical service when systemd exposes an alias', function () {
+    fakeServices([
+        'mysql' => [
+            'load' => 'loaded',
+            'active' => 'active',
+            'file' => 'enabled',
+            'id' => 'mariadb.service',
+        ],
+        'mariadb' => [
+            'load' => 'loaded',
+            'active' => 'active',
+            'file' => 'enabled',
+            'id' => 'mariadb.service',
+        ],
+    ]);
+
+    $services = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')
+        ->assertOk()
+        ->json('services');
+
+    $sqlServices = collect($services)->whereIn('key', ['mysql', 'mariadb']);
+
+    expect($sqlServices)->toHaveCount(1)
+        ->and($sqlServices->first()['key'])->toBe('mariadb')
+        ->and($sqlServices->first()['label'])->toBe('MariaDB');
+});
+
+it('auto-detects installed php-fpm versions from php_dir', function () {
+    File::ensureDirectoryExists($this->phpDir.'/8.4/fpm');
+    fakeServices([
+        'php8.4-fpm' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled'],
+    ]);
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')->assertOk();
+
+    $php = collect($response->json('services'))->firstWhere('key', 'php8.4-fpm');
+    expect($php)->not->toBeNull();
+    expect($php['label'])->toBe('PHP 8.4 FPM');
+    expect($php['protected'])->toBeTrue(); // php8.4-fpm is in the default protected set
+});
+
+it('protects Apache when it is the recorded web server', function () {
+    ServerCapability::create([
+        'stack' => 'lamp',
+        'web_server' => 'apache',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer',
+    ]);
+    fakeServices(['apache2' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'reload' => true]]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')
+        ->assertOk()
+        ->assertJsonPath('services.0.protected', true)
+        ->assertJsonPath('services.0.actions', ['restart', 'reload', 'enable']);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/apache', ['action' => 'stop'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('action');
+});
+
+it('protects OpenLiteSpeed when it is the recorded web server', function () {
+    ServerCapability::create([
+        'stack' => 'ols',
+        'web_server' => 'openlitespeed',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer',
+    ]);
+    fakeServices(['lshttpd' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/openlitespeed', ['action' => 'disable'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('action');
+
+    Process::assertNotRan(fn ($p) => $p->command === ['systemctl', 'disable', 'lshttpd']);
+});
+
+it('protects Redis because the panel depends on it', function () {
+    fakeServices(['redis-server' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'reload' => true]]);
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')
+        ->assertOk();
+
+    $redis = collect($response->json('services'))->firstWhere('key', 'redis');
+    expect($redis['protected'])->toBeTrue()
+        ->and($redis['actions'])->toBe(['restart', 'reload', 'enable']);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/redis', ['action' => 'stop'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('action');
+
+    Process::assertNotRan(fn ($p) => $p->command === ['systemctl', 'stop', 'redis-server']);
+});
+
+it('restarts a service via systemctl', function () {
+    fakeServices(['mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/mariadb', ['action' => 'restart'])
+        ->assertOk()
+        ->assertJsonPath('service.key', 'mariadb');
+
+    Process::assertRan(fn ($p) => $p->command === ['systemctl', 'restart', 'mariadb']);
+});
+
+it('offers and runs reload when systemd says the service can reload', function () {
+    fakeServices([
+        'nginx' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'reload' => true],
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')
+        ->assertOk()
+        ->assertJsonPath('services.0.actions', ['restart', 'reload', 'enable']);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/nginx', ['action' => 'reload'])
+        // The panel's own web server: run after the answer.
+        ->assertStatus(202);
+
+    Process::assertRan(fn ($p) => $p->command === ['systemctl', 'reload', 'nginx']);
+});
+
+it('does not offer or run reload when systemd says the service cannot reload', function (string $key, string $unit) {
+    fakeServices([$unit => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+
+    $services = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/services')
+        ->assertOk()
+        ->json('services');
+
+    $database = collect($services)->firstWhere('key', $key);
+    expect($database)->not->toBeNull()
+        ->and($database['actions'])->not->toContain('reload');
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/services/{$key}", ['action' => 'reload'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('action');
+
+    Process::assertNotRan(fn ($p) => $p->command === ['systemctl', 'reload', $unit]);
+})->with([
+    'MySQL' => ['mysql', 'mysql'],
+    'MariaDB' => ['mariadb', 'mariadb'],
+    'MongoDB' => ['mongodb', 'mongod'],
+    'Supervisor' => ['supervisor', 'supervisor'],
+]);
+
+it('blocks stopping a protected service', function () {
+    fakeServices(['nginx' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/nginx', ['action' => 'stop'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('action');
+
+    Process::assertNotRan(fn ($p) => $p->command === ['systemctl', 'stop', 'nginx']);
+});
+
+it('returns 404 for a service that is not installed', function () {
+    fakeServices([]); // nothing installed
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/apache', ['action' => 'restart'])
+        ->assertNotFound();
+});
+
+it('returns 404 for an unknown service key', function () {
+    fakeServices([]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/not-a-service', ['action' => 'restart'])
+        ->assertNotFound();
+});
+
+it('returns a translated error with reference when the action fails', function () {
+    Process::fake(function ($process) {
+        if (($process->command[1] ?? null) === 'show') {
+            return Process::result(output: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n");
+        }
+
+        return Process::result(output: '', errorOutput: 'boom', exitCode: 1);
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/mariadb', ['action' => 'restart'])
+        ->assertStatus(500)
+        ->assertJsonStructure(['message', 'reference']);
+});
+
+it('rejects an invalid action', function () {
+    fakeServices(['mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/mariadb', ['action' => 'frobnicate'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('action');
+});
+
+it('denies a viewer without manage from running an action', function () {
+    fakeServices(['mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'service', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson('/api/services/mariadb', ['action' => 'restart'])
+        ->assertForbidden();
+});
+
+/**
+ * PostgreSQL is the one service whose status cannot come from systemd.
+ *
+ * `postgresql.service` is a meta unit (`Type=oneshot`, `ExecStart=/bin/true`,
+ * `RemainAfterExit=on`), so `ActiveState` is `active` whatever the clusters are doing; and
+ * `postgresql@.service` prefixes its ExecStart with `-`, so systemd ignores a cluster that failed
+ * to start.
+ *
+ * Every fake here has systemd reporting `active`, as a real box does even with the database down.
+ *
+ * @param  array<string, array{load: string, active: string, file: string}>  $units
+ */
+function fakeServicesWithPostgres(array $units, bool $postgresAnswers): void
+{
+    Process::fake(function ($process) use ($units, $postgresAnswers) {
+        $binary = $process->command[0] ?? '';
+
+        if ($binary === 'pg_isready') {
+            return $postgresAnswers
+                ? Process::result(output: '127.0.0.1:5432 - accepting connections')
+                : Process::result(exitCode: 2, errorOutput: 'no response');
+        }
+
+        if (($process->command[1] ?? null) === 'show') {
+            return Process::result(output: systemctlShowOutput($process->command, $units));
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function postgresServiceRow(): ?array
+{
+    return collect(
+        test()->withHeader('Authorization', 'Bearer '.test()->token)
+            ->getJson('/api/services')->assertOk()->json('services')
+    )->firstWhere('key', 'postgresql');
+}
+
+it('lists PostgreSQL among the services once it is installed', function () {
+    // PostgreSQL needs start/stop/restart here like MySQL and MongoDB, so a database installed from
+    // the panel can be restarted from the screen that restarts databases.
+    fakeServicesWithPostgres(['postgresql' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']], true);
+
+    expect(postgresServiceRow())->not->toBeNull()
+        ->and(postgresServiceRow()['label'])->toBe('PostgreSQL')
+        ->and(postgresServiceRow()['status'])->toBe('active');
+});
+
+it('reports PostgreSQL as down when the cluster does not answer, however cheerful systemd is', function () {
+    // The reason this feature is more than a config line. systemd says active —
+    // it always does — and the cluster is dead. Reporting "Running" here would
+    // contradict the Databases screen, which asks pg_isready and gets the truth.
+    fakeServicesWithPostgres(['postgresql' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']], false);
+
+    expect(postgresServiceRow()['status'])->toBe('inactive')
+        // Still installed and still enabled: systemd answers those correctly,
+        // and only the one field it cannot answer is overridden.
+        ->and(postgresServiceRow()['state'])->toBe('installed')
+        ->and(postgresServiceRow()['enabled'])->toBeTrue();
+});
+
+it('does not probe a service that has no health command', function () {
+    $probed = [];
+
+    Process::fake(function ($process) use (&$probed) {
+        $probed[] = $process->command[0] ?? '';
+
+        if (($process->command[1] ?? null) === 'show') {
+            $unit = $process->command[2] ?? '';
+
+            // Only nginx is on this box: a fake that installs everything cannot show that something
+            // was skipped.
+            $load = $unit === 'nginx' ? 'loaded' : 'not-found';
+
+            return Process::result(output: "Id={$unit}.service\nLoadState={$load}\nActiveState=active\nUnitFileState=enabled\nCanReload=yes\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")->getJson('/api/services')->assertOk();
+
+    // Every other service still costs exactly what it did — the override runs
+    // only where the catalog asks for it.
+    expect($probed)->not->toContain('pg_isready');
+});
+
+/*
+ * Acting on an alias.
+ *
+ * `list()` folds `mysql.service` into the MariaDB row, and a test above pins that. The
+ * single-entry path must agree: otherwise the screen shows no MySQL row while
+ * `PUT /services/mysql` returns 200 and restarts MariaDB, logging "Restarted the MySQL service".
+ */
+it('refuses to act on a service key that is only an alias of another entry', function () {
+    fakeServices([
+        'mysql' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'id' => 'mariadb.service'],
+        'mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'id' => 'mariadb.service'],
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/mysql', ['action' => 'restart'])
+        ->assertNotFound();
+});
+
+it('still acts on the entry that owns the unit the alias points at', function () {
+    fakeServices([
+        'mysql' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'id' => 'mariadb.service'],
+        'mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'id' => 'mariadb.service'],
+    ]);
+
+    // The refusal must be aimed at the alias alone. Refusing both would trade
+    // a wrong action for a service nobody can restart.
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/mariadb', ['action' => 'restart'])
+        ->assertOk()
+        ->assertJsonPath('service.key', 'mariadb');
+});
+
+it('keeps acting on a service whose unit is merely named differently', function () {
+    // `redis` -> `redis-server` is a rename, not an alias: the unit resolves to itself. A fix that
+    // confused the two would break a service that works.
+    fakeServices([
+        'redis-server' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'id' => 'redis-server.service'],
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/redis', ['action' => 'restart'])
+        ->assertOk()
+        ->assertJsonPath('service.key', 'redis');
+});
+
+it('acts on an aliased unit when no configured entry owns it', function () {
+    // Nobody better to answer: refusing here would drop a service the panel
+    // legitimately manages, which is why ownership is the test rather than
+    // "the id differs". Mirrors list(), which keeps the first alias.
+    fakeServices([
+        'supervisor' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'id' => 'supervisord.service'],
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/supervisor', ['action' => 'restart'])
+        ->assertOk()
+        ->assertJsonPath('service.key', 'supervisor');
+});
+
+/*
+ * What the services page is allowed to cost.
+ *
+ * Every row used to be its own `systemctl show`; one call for all is much faster, on a route the
+ * frontend polls every three seconds.
+ *
+ * A regression here is invisible — the screen stays correct and merely gets slower — so counting
+ * the calls is the only thing that would notice.
+ */
+it('inspects the whole catalog in a single systemctl call', function () {
+    fakeServices([
+        'lshttpd' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled'],
+        'mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled'],
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")->getJson('/api/services')->assertOk();
+
+    Process::assertRanTimes(fn ($p) => ($p->command[1] ?? null) === 'show', 1);
+
+    // …and that one call asked about everything, rather than reaching a count
+    // of one by quietly inspecting less.
+    Process::assertRan(fn ($p) => ($p->command[1] ?? null) === 'show'
+        && ! array_diff(['mariadb', 'lshttpd', 'postgresql', 'redis-server'], $p->command));
+});
+
+/*
+ * Blocks are matched to units by position, never by Id.
+ *
+ * Id is the canonical unit, so an alias reports its target's: ask for `mysql`
+ * and `mariadb` on a MariaDB box and both blocks read `Id=mariadb.service`.
+ * Keying by it would give one of them the other's state — the same alias
+ * confusion that let `PUT /services/mysql` restart MariaDB.
+ */
+it('gives each unit its own block even when one in the middle does not exist', function () {
+    // apache sits between lshttpd and mariadb in the catalog and is absent, so
+    // an off-by-one would hand MariaDB the not-found block, or Apache's row
+    // MariaDB's state. Both are silent failures that still render a page.
+    fakeServices([
+        'lshttpd' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled'],
+        'mariadb' => ['load' => 'loaded', 'active' => 'failed', 'file' => 'enabled'],
+        'redis-server' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled'],
+    ]);
+
+    $services = collect(
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/services')->assertOk()->json('services')
+    )->keyBy('key');
+
+    expect($services->keys()->all())->not->toContain('apache')
+        ->and($services['mariadb']['status'])->toBe('failed')
+        ->and($services['openlitespeed']['status'])->toBe('active')
+        ->and($services['redis']['status'])->toBe('active');
+});
+
+/*
+ * PostgreSQL boots through its clusters (`postgresql@18-main`), each enabled on its own. "Start on
+ * boot" off must disable them too, not only the `postgresql` meta unit, or the cluster starts
+ * after the next reboot anyway.
+ */
+it('switches start-on-boot for every PostgreSQL cluster, not just the meta unit', function (string $action) {
+    Process::fake(function ($process) {
+        $command = (array) $process->command;
+
+        if (($command[1] ?? null) === 'show') {
+            return Process::result(output: systemctlShowOutput($command, ['postgresql' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]));
+        }
+
+        if (($command[1] ?? null) === 'list-units') {
+            return Process::result(output: "postgresql@18-main.service loaded active running PostgreSQL Cluster 18-main\npostgresql@16-main.service loaded inactive dead PostgreSQL Cluster 16-main\n");
+        }
+
+        return Process::result();
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/postgresql', ['action' => $action])
+        ->assertOk();
+
+    foreach (['postgresql', 'postgresql@18-main.service', 'postgresql@16-main.service'] as $unit) {
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', $action, $unit]);
+    }
+})->with(['disable', 'enable']);
+
+it('leaves the clusters alone for start, stop and restart, which reach them already', function () {
+    Process::fake(function ($process) {
+        $command = (array) $process->command;
+
+        return ($command[1] ?? null) === 'show'
+            ? Process::result(output: systemctlShowOutput($command, ['postgresql' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]))
+            : Process::result();
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/services/postgresql', ['action' => 'restart'])->assertOk();
+
+    // No action on a cluster unit. Listing them is a read, which the reply does to report their
+    // memory.
+    Process::assertNotRan(fn ($p) => in_array($p->command[1] ?? null, ['start', 'stop', 'restart', 'enable', 'disable'], true)
+        && str_starts_with((string) ($p->command[2] ?? ''), 'postgresql@'));
+});
+
+it('reports PostgreSQL\'s memory from its clusters, not the empty meta unit (bug #13)', function () {
+    // `postgresql` is a oneshot wrapper: systemd tracks no memory for it, so the row would read "—"
+    // forever while the cluster uses memory.
+    $memory = [
+        'postgresql' => '[not set]',
+        'postgresql@18-main.service' => '52355072',
+        'postgresql@16-main.service' => '[not set]',
+    ];
+
+    Process::fake(function ($process) use ($memory) {
+        $command = $process->command;
+
+        if (($command[0] ?? '') === 'pg_isready') {
+            return Process::result(output: '127.0.0.1:5432 - accepting connections');
+        }
+
+        if (($command[1] ?? null) === 'list-units') {
+            return Process::result(output: "postgresql@18-main.service loaded active running PostgreSQL Cluster 18-main\npostgresql@16-main.service loaded inactive dead PostgreSQL Cluster 16-main\n");
+        }
+
+        if (($command[1] ?? null) === 'show') {
+            $asked = array_values(array_filter(array_slice($command, 2), fn (string $a) => ! str_starts_with($a, '--')));
+
+            return Process::result(output: implode("\n\n", array_map(fn (string $unit) => implode("\n", [
+                'Id='.(str_ends_with($unit, '.service') ? $unit : "{$unit}.service"),
+                'LoadState='.(array_key_exists($unit, $memory) ? 'loaded' : 'not-found'),
+                'ActiveState='.(array_key_exists($unit, $memory) ? 'active' : 'inactive'),
+                'UnitFileState=enabled',
+                'CanReload=no',
+                'MemoryCurrent='.($memory[$unit] ?? '[not set]'),
+                'CPUUsageNSec=[not set]',
+                'TasksCurrent='.($unit === 'postgresql@18-main.service' ? '7' : '[not set]'),
+            ]), $asked))."\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $usage = postgresServiceRow()['usage'];
+
+    // The running cluster's figures; the stopped one adds nothing.
+    expect($usage['memory_bytes'])->toBe(52355072)
+        ->and($usage['memory_human'])->toBe('49.9 MB')
+        ->and($usage['tasks'])->toBe(7);
+});
+
+/*
+ * Restarting the web server or PHP-FPM the panel runs on, inside the request, cuts the connection
+ * carrying that request, so Central got an error for a restart that worked. The answer goes first
+ * and the restart runs once the response has been sent.
+ */
+describe('restarting what the panel itself runs on', function () {
+    it('answers before it restarts the panel\'s own web server', function (string $action) {
+        fakeServices(['nginx' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled', 'reload' => true]]);
+
+        $result = app(RunServiceAction::class)->execute('nginx', $action);
+
+        // The answer is ready and nothing has been restarted yet.
+        expect($result['scheduled'])->toBe($action);
+        Process::assertNotRan(fn ($p) => $p->command === ['systemctl', $action, 'nginx']);
+
+        // Runs once the response has gone out.
+        app()->terminate();
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', $action, 'nginx']);
+        expect(ActivityLog::query()->where('action', $action === 'restart' ? 'restarted' : 'reloaded')->exists())->toBeTrue();
+    })->with(['restart', 'reload']);
+
+    it('still restarts anything else inside the request, and says so with a 200', function () {
+        fakeServices(['mariadb' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/services/mariadb', ['action' => 'restart'])
+            ->assertOk()
+            ->assertJsonMissingPath('service.scheduled');
+
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'restart', 'mariadb']);
+    });
+
+    it('never schedules a restart over a configuration that fails its test', function () {
+        Process::fake(function ($process) {
+            if (($process->command[1] ?? null) === 'show') {
+                return Process::result(output: systemctlShowOutput($process->command, ['nginx' => ['load' => 'loaded', 'active' => 'active', 'file' => 'enabled']]));
+            }
+
+            return in_array('-t', $process->command, true)
+                ? Process::result(errorOutput: 'nginx: [emerg] unexpected end of file', exitCode: 1)
+                : Process::result(exitCode: 0);
+        });
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/services/nginx', ['action' => 'restart'])
+            ->assertUnprocessable();
+
+        Process::assertNotRan(fn ($p) => $p->command === ['systemctl', 'restart', 'nginx']);
+    });
+});

@@ -1,0 +1,265 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\User;
+
+it('shows a user only their own activity, not other users\' activity', function () {
+    $userA = User::factory()->create(['username' => 'alice', 'password' => bcrypt('Password123')]);
+    $userB = User::factory()->create(['username' => 'bob', 'password' => bcrypt('Password123')]);
+
+    $this->postJson('/api/auth/login', ['username' => 'alice', 'password' => 'Password123']);
+    $this->postJson('/api/auth/login', ['username' => 'bob', 'password' => 'Password123']);
+
+    $tokenA = $userA->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$tokenA}")
+        ->getJson('/api/activity-log');
+
+    $response->assertOk();
+    $expectedCount = ActivityLog::where('user_id', $userA->id)->count();
+    expect($expectedCount)->toBeGreaterThan(0);
+    $response->assertJsonCount($expectedCount, 'activity_log');
+});
+
+it('omits the redundant user field from own-activity entries', function () {
+    $user = User::factory()->admin()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/admin/users', userPayload(['username' => 'newuser']));
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log');
+
+    $response->assertOk();
+    expect($response->json('activity_log'))->not->toBeEmpty();
+    foreach ($response->json('activity_log') as $entry) {
+        expect($entry)->not->toHaveKey('user');
+    }
+});
+
+/** A user with a known spread of own-history rows. */
+function userWithActivity(): array
+{
+    $user = User::factory()->create();
+    $other = User::factory()->create();
+
+    ActivityLog::create(['user_id' => $user->id, 'type' => 'user', 'action' => 'logged_in', 'properties' => []]);
+    ActivityLog::create(['user_id' => $user->id, 'type' => 'user', 'action' => 'password_changed', 'properties' => []]);
+    ActivityLog::create(['user_id' => $user->id, 'type' => 'cronjob', 'action' => 'created', 'properties' => ['name' => 'x']]);
+    // Another user's row, which must never appear or influence the filters.
+    ActivityLog::create(['user_id' => $other->id, 'type' => 'database', 'action' => 'deleted', 'properties' => []]);
+
+    return [$user, $user->createToken('test')->plainTextToken];
+}
+
+it('filters own activity by type', function () {
+    [, $token] = userWithActivity();
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?filter[type]=user');
+
+    $response->assertOk()->assertJsonCount(2, 'activity_log');
+    foreach ($response->json('activity_log') as $entry) {
+        expect($entry['type'])->toBe('user');
+    }
+});
+
+it('filters own activity by action', function () {
+    [, $token] = userWithActivity();
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?filter[action]=created');
+
+    $response->assertOk()->assertJsonCount(1, 'activity_log');
+    $response->assertJsonPath('activity_log.0.type', 'cronjob');
+    $response->assertJsonPath('activity_log.0.action', 'created');
+});
+
+it('searches own activity across type and action', function () {
+    [, $token] = userWithActivity();
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?search=PASSWORD');
+
+    $response->assertOk()->assertJsonCount(1, 'activity_log');
+    $response->assertJsonPath('activity_log.0.action', 'password_changed');
+});
+
+it('never leaks another user\'s rows through a filter', function () {
+    [, $token] = userWithActivity();
+
+    // `database` rows exist, but belong to somebody else.
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?filter[type]=database');
+
+    $response->assertOk()->assertJsonCount(0, 'activity_log');
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?search=database');
+
+    $response->assertOk()->assertJsonCount(0, 'activity_log');
+});
+
+it('reports pagination meta alongside a filter', function () {
+    [, $token] = userWithActivity();
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?filter[type]=user&per_page=10');
+
+    $response->assertOk();
+    $response->assertJsonPath('meta.total', 2);
+    $response->assertJsonPath('meta.per_page', 10);
+    $response->assertJsonPath('meta.current_page', 1);
+});
+
+it('returns filter options built from the caller\'s own rows only', function () {
+    [, $token] = userWithActivity();
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log/filters');
+
+    $response->assertOk();
+    // `database` belongs to the other user — it must not be offered.
+    expect($response->json('types'))->toBe(['cronjob', 'user']);
+    expect($response->json('actions.all'))->toBe(['created', 'logged_in', 'password_changed']);
+    expect($response->json('actions.user'))->toBe(['logged_in', 'password_changed']);
+    expect($response->json('actions.cronjob'))->toBe(['created']);
+});
+
+it('returns empty filter options for a user with no activity', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log/filters');
+
+    $response->assertOk();
+    expect($response->json('types'))->toBe([]);
+    expect($response->json('actions.all'))->toBe([]);
+});
+
+it('rejects an unsupported per_page on the own-activity log', function () {
+    [, $token] = userWithActivity();
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log?per_page=7')
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('per_page');
+});
+
+it('does not require admin access to view own activity filters', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log/filters')
+        ->assertOk();
+});
+
+it('requires authentication to view own activity filters', function () {
+    $this->getJson('/api/activity-log/filters')->assertUnauthorized();
+});
+
+it('requires authentication to view own activity log', function () {
+    $this->getJson('/api/activity-log')->assertUnauthorized();
+});
+
+it('does not require admin access to view own activity log', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/activity-log')
+        ->assertOk();
+});
+
+/*
+ * A property the sentence cannot substitute must not take the screen down.
+ *
+ * `Translator::makeReplacements()` calls `ucfirst()` on every value, so a row whose properties
+ * hold an ARRAY is a `TypeError` that fails the whole response, not just the row. Docker events
+ * `container_secrets_viewed` and `docker_resources_removed` record arrays.
+ */
+
+it('renders a row whose properties hold an array, instead of failing the whole log', function () {
+    $user = User::factory()->create(['username' => 'arrayprops', 'password' => bcrypt('Password123')]);
+
+    ActivityLog::create([
+        'user_id' => $user->id,
+        'type' => 'application',
+        'action' => 'container_secrets_viewed',
+        'properties' => ['name' => 'Shop', 'keys' => ['ADMIN_PASSWORD', 'DB_PASSWORD']],
+    ]);
+
+    $response = $this->withHeader('Authorization', 'Bearer '.$user->createToken('t')->plainTextToken)
+        ->getJson('/api/activity-log')
+        ->assertOk();
+
+    $row = collect($response->json('activity_log'))->firstWhere('action', 'container_secrets_viewed');
+
+    // The sentence does not name the keys, so the assertion is that the row RENDERS. The array
+    // still reaches `__()` as a replacement whether the sentence uses it or not.
+    expect($row['description'])->toBe('Viewed the container credentials for Shop')
+        ->and($row['description'])->not->toContain('Array');
+});
+
+it('reads out a list the sentence does name', function () {
+    // Where a sentence uses the array, it is joined, not counted.
+    $user = User::factory()->create(['username' => 'listprops', 'password' => bcrypt('Password123')]);
+
+    ActivityLog::create([
+        'user_id' => $user->id,
+        'type' => 'application',
+        'action' => 'docker_resources_removed',
+        'properties' => ['name' => 'Shop', 'removed' => ['sv-app-7_data', 'sv-app-7_db'], 'kept' => []],
+    ]);
+
+    $row = collect($this->withHeader('Authorization', 'Bearer '.$user->createToken('t')->plainTextToken)
+        ->getJson('/api/activity-log')->assertOk()->json('activity_log'))
+        ->firstWhere('action', 'docker_resources_removed');
+
+    expect($row['description'])->not->toContain('Array');
+
+    // The joined value is what a sentence using `:removed` would substitute.
+    expect(__('activity.application.docker_resources_removed', [
+        'name' => 'Shop', 'removed' => 'sv-app-7_data, sv-app-7_db',
+    ]))->not->toContain('Array');
+});
+
+it('says so in words when the list is empty', function () {
+    // An empty `:removed` would leave a hole in the sentence ("Removed  from Shop").
+    $user = User::factory()->create(['username' => 'emptyprops', 'password' => bcrypt('Password123')]);
+
+    ActivityLog::create([
+        'user_id' => $user->id,
+        'type' => 'application',
+        'action' => 'container_secrets_viewed',
+        'properties' => ['name' => 'Shop', 'keys' => []],
+    ]);
+
+    $row = collect($this->withHeader('Authorization', 'Bearer '.$user->createToken('t')->plainTextToken)
+        ->getJson('/api/activity-log')->assertOk()->json('activity_log'))
+        ->firstWhere('action', 'container_secrets_viewed');
+
+    // The sentence does not name the list; an empty array must be as survivable as a full one.
+    expect($row['description'])->toBe('Viewed the container credentials for Shop');
+});
+
+it('renders a false boolean as a word rather than a gap', function () {
+    // PHP casts `false` to `''`, which would leave a hole mid-sentence.
+    $user = User::factory()->create(['username' => 'boolprops', 'password' => bcrypt('Password123')]);
+
+    ActivityLog::create([
+        'user_id' => $user->id,
+        'type' => 'application',
+        'action' => 'compose_updated',
+        'properties' => ['name' => 'Shop', 'rolled_back' => false, 'applied' => true],
+    ]);
+
+    $row = collect($this->withHeader('Authorization', 'Bearer '.$user->createToken('t')->plainTextToken)
+        ->getJson('/api/activity-log')->assertOk()->json('activity_log'))
+        ->firstWhere('action', 'compose_updated');
+
+    expect($row['description'])->not->toBeEmpty();
+});

@@ -1,0 +1,104 @@
+<?php
+
+return [
+
+    /*
+    | Why an install failed, keyed by the `reason` code stored on the
+    | install row. Built at read time in the *viewer's* locale — the
+    | raw apt or fnm output is never shown, only referenced.
+    */
+
+    'install_failed' => [
+        'timed_out' => 'Die Installation hat das Zeitlimit überschritten — meist hat ein Paketspiegel nicht geantwortet. Versuchen Sie es erneut; passiert es wieder, prüfen Sie, ob der Server seine Paketquellen erreicht.',
+        'package_not_found' => 'In den Paketquellen dieses Servers gibt es kein Paket für :version.',
+        'apt_lock' => 'Es läuft bereits ein anderer Paketvorgang. Versuchen Sie es gleich noch einmal.',
+        // ServerOps already knew: the grant is older than the panel.
+        // Naming the repair beats "contact support" for a failure with
+        // a one-command fix.
+        'sudo_denied' => 'Die sudo-Berechtigung dieses Servers ist älter als das darauf laufende Panel, deshalb wurde die Installation abgelehnt, bevor sie begann. Es wurde nichts geändert, und ein erneuter Versuch hilft nicht. Führen Sie auf dem Server `sudo php artisan panel:sudoers` aus, um die Berechtigung aus der Liste des Panels neu zu schreiben, und versuchen Sie es dann erneut.',
+        'network' => 'Das Paket-Repository war nicht erreichbar. Prüfen Sie die Netzwerkverbindung des Servers.',
+        'no_space' => 'Auf dem Server ist kein Speicherplatz mehr frei.',
+        'worker' => 'Die Installation wurde unerwartet beendet. Möglicherweise ein Timeout — versuchen Sie es erneut.',
+        'unknown' => 'Die Installation ist fehlgeschlagen. Nenne dem Support die untenstehende Referenz.',
+        'dpkg_broken' => 'Die Paketdatenbank dieses Servers muss repariert werden, bevor etwas anderes installiert werden kann.',
+        'port_in_use_by_mysql' => 'MySQL ist bereits installiert und belegt diesen Port. Entfernen Sie es zuerst, oder nutzen Sie es weiter.',
+        'port_in_use_by_mariadb' => 'MariaDB ist bereits installiert und belegt diesen Port. Entfernen Sie es zuerst, oder nutzen Sie es weiter.',
+        'root_unreachable' => 'Es ist installiert, aber das Panel konnte sich nicht anmelden. Der Administrator-Zugang wurde gegenüber dem Standard geändert; das Panel benötigt diese Daten, um fortzufahren.',
+        'cluster_missing' => 'PostgreSQL ist installiert, aber auf diesem Server existiert kein Cluster. Möglicherweise wurde er entfernt oder seine Einrichtung wurde nicht abgeschlossen.',
+        'grant_failed' => 'Es ist installiert, aber das Panel konnte kein eigenes Konto darin anlegen.',
+        'repository_failed' => 'Das MongoDB-Paketrepository konnte nicht hinzugefügt werden. Prüfen Sie, ob der Server repo.mongodb.org erreicht.',
+        'unreachable' => 'Es wurde installiert, antwortet aber nicht. Geben Sie die untenstehende Referenz beim Support an.',
+        'auth_required' => 'MongoDB ist hier bereits installiert und verlangt eine Anmeldung, die dem Panel fehlt. Hinterlegen Sie die Zugangsdaten in den Verbindungseinstellungen und versuchen Sie es erneut.',
+        'auth_config_present' => 'MongoDB ist installiert und seine Konfiguration enthält bereits einen security-Abschnitt. Das Panel hat ihn unangetastet gelassen — aktivieren Sie authorization dort selbst und versuchen Sie es erneut.',
+        'auth_failed' => 'Es wurde installiert, aber die Authentifizierung ließ sich nicht aktivieren. Geben Sie die untenstehende Referenz beim Support an.',
+    ],
+
+    'uninstall_failed' => [
+        'timed_out' => 'Das Entfernen von PHP :version hat das Zeitlimit überschritten. Versuchen Sie es erneut.',
+        'failed' => 'PHP :version konnte nicht entfernt werden. Nenne dem Support die untenstehende Referenz.',
+        'worker' => 'Das Entfernen von PHP :version wurde unerwartet beendet. Möglicherweise ein Timeout — versuchen Sie es erneut.',
+        'unknown' => 'PHP :version konnte nicht entfernt werden. Nenne dem Support die untenstehende Referenz.',
+    ],
+
+    'extension_install_failed' => [
+        'timed_out' => 'Die Installation von :extension hat das Zeitlimit überschritten — meist hat ein Paketspiegel nicht geantwortet. Versuchen Sie es erneut.',
+        'package_not_found' => 'Kein Paket für :extension unter PHP :version. Für diese Version existiert es möglicherweise nicht.',
+        'apt_lock' => 'Es läuft bereits ein anderer Paketvorgang. Versuchen Sie es gleich noch einmal.',
+        // ServerOps already knew: the grant is older than the panel.
+        // Naming the repair beats "contact support" for a failure with
+        // a one-command fix.
+        'sudo_denied' => 'Die sudo-Berechtigung dieses Servers ist älter als das darauf laufende Panel, deshalb wurde die Installation abgelehnt, bevor sie begann. Es wurde nichts geändert, und ein erneuter Versuch hilft nicht. Führen Sie auf dem Server `sudo php artisan panel:sudoers` aus, um die Berechtigung aus der Liste des Panels neu zu schreiben, und versuchen Sie es dann erneut.',
+        'network' => 'Das Paket-Repository war nicht erreichbar. Prüfen Sie die Netzwerkverbindung des Servers.',
+        'no_space' => 'Auf dem Server ist kein Speicherplatz mehr frei.',
+        'worker' => 'Die Installation von :extension wurde unerwartet beendet. Möglicherweise ein Timeout — versuchen Sie es erneut.',
+        'unknown' => 'Die Installation von :extension ist fehlgeschlagen. Nenne dem Support die untenstehende Referenz.',
+        'reload_failed' => ':extension wurde installiert, aber PHP konnte nicht neu geladen werden und ist daher noch nicht aktiv. Nennen Sie dem Support die Referenz unten.',
+        'enable_failed' => ':extension wurde installiert, konnte aber nicht aktiviert werden. Betätigen Sie den Schalter erneut.',
+    ],
+
+    'fail2ban_install_failed' => [
+        'package_not_found' => 'Es ist kein fail2ban-Paket verfügbar. Prüfen Sie, ob die Paketquellen des Servers konfiguriert und erreichbar sind.',
+        'apt_lock' => 'Es läuft bereits ein anderer Paketvorgang. Versuchen Sie es gleich noch einmal.',
+        'network' => 'Das Paket-Repository war nicht erreichbar. Prüfen Sie die Netzwerkverbindung des Servers.',
+        'no_space' => 'Auf dem Server ist kein Speicherplatz mehr frei.',
+        'worker' => 'Die Installation wurde unerwartet beendet. Möglicherweise ein Timeout — bitte erneut versuchen.',
+        'unknown' => 'Die Installation von fail2ban ist fehlgeschlagen. Nennen Sie dem Support die Referenz unten.',
+    ],
+
+    /*
+    | Per-runtime overrides, consulted before the shared groups above.
+    |
+    | `install_failed` is shared by PHP, Node, database engines and
+    | fail2ban. It used to be worded for PHP alone, so a failed MongoDB
+    | install told the user to check the PHP repository. Only the reasons
+    | that genuinely differ per runtime belong here; everything else
+    | still falls through.
+    */
+
+    'php_install_failed' => [
+        'package_not_found' => 'Kein Paket für :version. Prüfen Sie, ob das PHP-Repository konfiguriert und erreichbar ist.',
+    ],
+
+    'node_install_failed' => [
+        'package_not_found' => 'Node :version wurde nicht gefunden. Prüfen Sie die Versionsnummer oder wählen Sie eine aus der Liste.',
+    ],
+
+    'wp_cli_install_failed' => [
+        'network' => 'GitHub, von wo WP-CLI geladen wird, war nicht erreichbar. Prüfen Sie den Netzwerkzugang des Servers und versuchen Sie es erneut.',
+        'incomplete' => 'WP-CLI wurde heruntergeladen, lässt sich auf diesem Server aber nicht ausführen. Es braucht `php` im PATH des Servers.',
+    ],
+
+    'database_install_failed' => [
+        'apt_lock' => 'Auf dem Server läuft eine andere Paketinstallation, und sie lief noch, nachdem das Panel darauf gewartet hat. Versuchen Sie es in ein paar Minuten erneut.',
+        'package_not_found' => 'Für :version gibt es auf diesem Server kein Paket. Prüfen Sie, ob dessen Paket-Repository konfiguriert und erreichbar ist.',
+        // The repository was added and its index fetched successfully;
+        // the engine simply has no build for this Ubuntu release.
+        'os_unsupported' => ':version veröffentlicht noch keine Pakete für :os. Mit diesem Server ist alles in Ordnung — das Panel unterstützt :os, aber :version hat dafür noch keinen Build veröffentlicht. Nutzen Sie eine andere Datenbank-Engine oder versuchen Sie es später erneut.',
+    ],
+
+    // Used for :os when /etc/os-release cannot be read.
+    'this_server' => 'dem Betriebssystem dieses Servers',
+
+    // FS-C18/FS-C19: apt's own error line, quoted after a generic failure.
+    'package_manager_said' => 'Die Paketverwaltung meldete: „:line“',
+];

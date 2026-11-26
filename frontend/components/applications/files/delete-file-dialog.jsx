@@ -1,0 +1,61 @@
+import { useState } from "react";
+import { toast } from "sonner";
+import { useTranslations } from "next-intl";
+import { Trash2 } from "lucide-react";
+import { deleteFile } from "@/lib/api/files";
+import { apiMessage } from "@/lib/api/error-message";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { PermanentDeleteField } from "@/components/applications/files/permanent-delete-field";
+import { useRefresh } from "@/hooks/use-refresh";
+
+export function DeleteFileDialog({ appId, file, open, onOpenChange }) {
+  const t = useTranslations("applications.files");
+  const { pending: refreshing, refreshThen } = useRefresh();
+  const [pending, setPending] = useState(false);
+  // Reset on open: opening from a row's own menu never fires onOpenChange(false).
+  const [permanent, setPermanent] = useState(true);
+
+  async function onConfirm() {
+    setPending(true);
+    try {
+      await deleteFile(appId, file.path, { permanent });
+      const done = permanent ? t("delete.doneForever", { name: file.name }) : t("delete.done", { name: file.name });
+      refreshThen(() => {
+        toast.success(done);
+        onOpenChange?.(false);
+      });
+    } catch (error) {
+      toast.error(apiMessage(error, t("delete.failed")));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  if (!file) return null;
+
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={(next) => {
+        if (next) setPermanent(true);
+        onOpenChange?.(next);
+      }}
+      icon={Trash2}
+      tone="destructive"
+      title={t("delete.title", { name: file.name })}
+      description={
+        permanent
+          ? t("delete.descriptionPermanent")
+          : file.type === "dir"
+            ? t("delete.descriptionDir")
+            : t("delete.description")
+      }
+      cancelLabel={t("cancel")}
+      confirmLabel={permanent ? t("delete.confirmForever") : t("delete.confirm")}
+      pending={pending || refreshing}
+      onConfirm={onConfirm}
+    >
+      <PermanentDeleteField checked={permanent} onChange={setPermanent} disabled={pending || refreshing} />
+    </ConfirmDialog>
+  );
+}

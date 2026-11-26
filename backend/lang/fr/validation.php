@@ -1,0 +1,291 @@
+<?php
+
+return [
+
+    'accepted' => 'Le champ :attribute doit être accepté.',
+    'accepted_if' => 'Le champ :attribute doit être accepté quand :other est :value.',
+    'active_url' => 'Le champ :attribute doit être une URL valide.',
+    'after' => 'Le champ :attribute doit être une date postérieure à :date.',
+    'after_or_equal' => 'Le champ :attribute doit être une date postérieure ou égale à :date.',
+    'alpha' => 'Le champ :attribute ne doit contenir que des lettres.',
+    'alpha_dash' => 'Le champ :attribute ne doit contenir que des lettres, des chiffres, des tirets et des traits de soulignement.',
+    'alpha_num' => 'Le champ :attribute ne doit contenir que des lettres et des chiffres.',
+    'array' => 'Le champ :attribute doit être un tableau.',
+    'ascii' => 'Le champ :attribute ne doit contenir que des caractères alphanumériques et des symboles d’un seul octet.',
+    'before' => 'Le champ :attribute doit être une date antérieure à :date.',
+    'before_or_equal' => 'Le champ :attribute doit être une date antérieure ou égale à :date.',
+    'between' => [
+        'array' => 'Le champ :attribute doit contenir entre :min et :max éléments.',
+        'file' => 'Le champ :attribute doit peser entre :min et :max kilo-octets.',
+        'numeric' => 'Le champ :attribute doit être compris entre :min et :max.',
+        'string' => 'Le champ :attribute doit contenir entre :min et :max caractères.',
+    ],
+    'boolean' => 'Le champ :attribute doit être vrai ou faux.',
+    'can' => 'Le champ :attribute contient une valeur non autorisée.',
+    'confirmed' => 'La confirmation de :attribute ne correspond pas.',
+    'current_password' => 'Le mot de passe est incorrect.',
+    'date' => 'Le champ :attribute doit être une date valide.',
+    'date_equals' => 'Le champ :attribute doit être une date égale à :date.',
+    'date_format' => 'Le champ :attribute doit correspondre au format :format.',
+    'decimal' => 'Le champ :attribute doit avoir :decimal décimales.',
+    'declined' => 'Le champ :attribute doit être refusé.',
+    'declined_if' => 'Le champ :attribute doit être refusé quand :other est :value.',
+    'different' => 'Les champs :attribute et :other doivent être différents.',
+    'digits' => 'Le champ :attribute doit contenir :digits chiffres.',
+    'digits_between' => 'Le champ :attribute doit contenir entre :min et :max chiffres.',
+    'dimensions' => 'Le champ :attribute a des dimensions d’image non valides.',
+    'distinct' => 'Le champ :attribute a une valeur en double.',
+    'doesnt_end_with' => 'Le champ :attribute ne doit pas se terminer par l’un des éléments suivants : :values.',
+    'doesnt_start_with' => 'Le champ :attribute ne doit pas commencer par l’un des éléments suivants : :values.',
+    'email' => 'Le champ :attribute doit être une adresse e-mail valide.',
+    'ends_with' => 'Le champ :attribute doit se terminer par l’un des éléments suivants : :values.',
+    'enum' => 'La valeur sélectionnée pour :attribute est invalide.',
+    'exists' => 'La valeur sélectionnée pour :attribute est invalide.',
+    'extensions' => 'Le champ :attribute doit avoir l’une des extensions suivantes : :values.',
+    'file' => 'Le champ :attribute doit être un fichier.',
+    'filled' => 'Le champ :attribute doit avoir une valeur.',
+    'gt' => [
+        'array' => 'Le champ :attribute doit contenir plus de :value éléments.',
+        'file' => 'Le champ :attribute doit peser plus de :value kilo-octets.',
+        'numeric' => 'Le champ :attribute doit être supérieur à :value.',
+        'string' => 'Le champ :attribute doit contenir plus de :value caractères.',
+    ],
+    'gte' => [
+        'array' => 'Le champ :attribute doit contenir :value éléments ou plus.',
+        'file' => 'Le champ :attribute doit peser :value kilo-octets ou plus.',
+        'numeric' => 'Le champ :attribute doit être supérieur ou égal à :value.',
+        'string' => 'Le champ :attribute doit contenir au moins :value caractères.',
+    ],
+    'hex_color' => 'Le champ :attribute doit être une couleur hexadécimale valide.',
+    'image' => 'Le champ :attribute doit être une image.',
+    'in' => 'La valeur sélectionnée pour :attribute est invalide.',
+    'in_array' => 'Le champ :attribute doit exister dans :other.',
+    'integer' => 'Le champ :attribute doit être un entier.',
+    'ip' => 'Le champ :attribute doit être une adresse IP valide.',
+    'ipv4' => 'Le champ :attribute doit être une adresse IPv4 valide.',
+    'ipv6' => 'Le champ :attribute doit être une adresse IPv6 valide.',
+    'json' => 'Le champ :attribute doit être une chaîne JSON valide.',
+    'lowercase' => 'Le champ :attribute doit être en minuscules.',
+    'lt' => [
+        'array' => 'Le champ :attribute doit contenir moins de :value éléments.',
+        'file' => 'Le champ :attribute doit peser moins de :value kilo-octets.',
+        'numeric' => 'Le champ :attribute doit être inférieur à :value.',
+        'string' => 'Le champ :attribute doit contenir moins de :value caractères.',
+    ],
+    'lte' => [
+        'array' => 'Le champ :attribute ne doit pas contenir plus de :value éléments.',
+        'file' => 'Le champ :attribute doit peser :value kilo-octets ou moins.',
+        'numeric' => 'Le champ :attribute doit être inférieur ou égal à :value.',
+        'string' => 'Le champ :attribute doit contenir au plus :value caractères.',
+    ],
+    'mac_address' => 'Le champ :attribute doit être une adresse MAC valide.',
+    'max' => [
+        'array' => 'Le champ :attribute ne doit pas contenir plus de :max éléments.',
+        'file' => 'Le champ :attribute ne doit pas peser plus de :max kilo-octets.',
+        'numeric' => 'Le champ :attribute ne doit pas être supérieur à :max.',
+        'string' => 'Le champ :attribute ne doit pas contenir plus de :max caractères.',
+    ],
+    'max_digits' => 'Le champ :attribute ne doit pas contenir plus de :max chiffres.',
+    'mimes' => 'Le champ :attribute doit être un fichier de type : :values.',
+    'mimetypes' => 'Le champ :attribute doit être un fichier de type : :values.',
+    'min' => [
+        'array' => 'Le champ :attribute doit contenir au moins :min éléments.',
+        'file' => 'Le champ :attribute doit peser au moins :min kilo-octets.',
+        'numeric' => 'Le champ :attribute doit être au moins :min.',
+        'string' => 'Le champ :attribute doit contenir au moins :min caractères.',
+    ],
+    'min_digits' => 'Le champ :attribute doit contenir au moins :min chiffres.',
+    'missing' => 'Le champ :attribute doit être absent.',
+    'missing_if' => 'Le champ :attribute doit être absent quand :other est :value.',
+    'missing_unless' => 'Le champ :attribute doit être absent sauf si :other est :value.',
+    'missing_with' => 'Le champ :attribute doit être absent quand :values est présent.',
+    'missing_with_all' => 'Le champ :attribute doit être absent quand :values sont présents.',
+    'multiple_of' => 'Le champ :attribute doit être un multiple de :value.',
+    'not_in' => 'La valeur sélectionnée pour :attribute est invalide.',
+    'not_regex' => 'Le format du champ :attribute est invalide.',
+    'numeric' => 'Le champ :attribute doit être un nombre.',
+    'password' => [
+        'letters' => 'Le champ :attribute doit contenir au moins une lettre.',
+        'mixed' => 'Le champ :attribute doit contenir au moins une majuscule et une minuscule.',
+        'numbers' => 'Le champ :attribute doit contenir au moins un chiffre.',
+        'symbols' => 'Le champ :attribute doit contenir au moins un symbole.',
+        'uncompromised' => 'Le :attribute fourni est apparu dans une fuite de données. Veuillez choisir un autre :attribute.',
+    ],
+    'present' => 'Le champ :attribute doit être présent.',
+    'present_if' => 'Le champ :attribute doit être présent quand :other est :value.',
+    'present_unless' => 'Le champ :attribute doit être présent sauf si :other est :value.',
+    'present_with' => 'Le champ :attribute doit être présent quand :values est présent.',
+    'present_with_all' => 'Le champ :attribute doit être présent quand :values sont présents.',
+    'prohibited' => 'Le champ :attribute est interdit.',
+    'prohibited_if' => 'Le champ :attribute est interdit quand :other est :value.',
+    'prohibited_unless' => 'Le champ :attribute est interdit sauf si :other est :values.',
+    'prohibits' => 'Le champ :attribute interdit que :other soit présent.',
+    'regex' => 'Le format du champ :attribute est invalide.',
+    'required' => 'Le champ :attribute est obligatoire.',
+    'required_array_keys' => 'Le champ :attribute doit contenir des entrées pour : :values.',
+    'required_if' => 'Le champ :attribute est obligatoire quand :other est :value.',
+    'required_if_accepted' => 'Le champ :attribute est obligatoire quand :other est accepté.',
+    'required_unless' => 'Le champ :attribute est obligatoire sauf si :other est dans :values.',
+    'required_with' => 'Le champ :attribute est obligatoire quand :values est présent.',
+    'required_with_all' => 'Le champ :attribute est obligatoire quand :values sont présents.',
+    'required_without' => 'Le champ :attribute est obligatoire quand :values n’est pas présent.',
+    'required_without_all' => 'Le champ :attribute est obligatoire quand aucun de :values n’est présent.',
+    'same' => 'Les champs :attribute et :other doivent correspondre.',
+    'size' => [
+        'array' => 'Le champ :attribute doit contenir :size éléments.',
+        'file' => 'Le champ :attribute doit peser :size kilo-octets.',
+        'numeric' => 'Le champ :attribute doit être :size.',
+        'string' => 'Le champ :attribute doit contenir :size caractères.',
+    ],
+    'starts_with' => 'Le champ :attribute doit commencer par l’un des éléments suivants : :values.',
+    'string' => 'Le champ :attribute doit être une chaîne de caractères.',
+    'timezone' => 'Le champ :attribute doit être un fuseau horaire valide.',
+    'unique' => 'La valeur du champ :attribute est déjà utilisée. Veuillez en choisir une autre.',
+    'uploaded' => 'Le champ :attribute n’a pas pu être téléchargé.',
+    'uppercase' => 'Le champ :attribute doit être en majuscules.',
+    'url' => 'Le champ :attribute doit être une URL valide.',
+    'ulid' => 'Le champ :attribute doit être un ULID valide.',
+    'uuid' => 'Le champ :attribute doit être un UUID valide.',
+
+    'any_of' => 'Le champ :attribute est invalide.',
+    'base64' => 'Le champ :attribute doit être une chaîne Base64 valide.',
+    'contains' => 'Il manque une valeur requise au champ :attribute.',
+    'doesnt_contain' => 'Le champ :attribute ne doit contenir aucun des éléments suivants : :values.',
+    'encoding' => 'Le champ :attribute doit être encodé en :encoding.',
+    'in_array_keys' => 'Le champ :attribute doit contenir au moins une des clés suivantes : :values.',
+    'list' => 'Le champ :attribute doit être une liste.',
+    'prohibited_if_accepted' => 'Le champ :attribute est interdit quand :other est accepté.',
+    'prohibited_if_declined' => 'Le champ :attribute est interdit quand :other est refusé.',
+    'required_if_declined' => 'Le champ :attribute est obligatoire quand :other est refusé.',
+
+    'custom' => [
+
+        // Docker accepts a CPU quota larger than the machine and silently
+        // clamps it, so the refusal has to come from here — and it names what
+        // the server actually has rather than saying "invalid".
+        'cpu_limit' => [
+            'format' => 'Indiquez un nombre de CPU, avec au plus deux décimales — 1, 1.5, 0.5.',
+            'positive' => 'La plus petite limite de CPU acceptée par Docker est :minimum. Laissez le champ vide pour aucune limite.',
+            'too_many' => 'Ce serveur a :cores CPU, et Docker refuse de démarrer un conteneur qui en demande plus. Choisissez :cores ou moins.',
+        ],
+
+        'memory_limit' => [
+            'format' => 'Indiquez une taille avec une unité — 512m ou 2g. Un nombre seul signifie des octets pour Docker, pas des mégaoctets.',
+            'too_small' => 'Docker ne démarrera pas un conteneur avec moins de 6m de mémoire.',
+        ],
+
+        // A registry address Docker cannot interpret is silently IGNORED at
+        // pull time — the credential simply never applies and the error is
+        // identical to having none. So these are refusals at the form, and each
+        // one names the specific mistake rather than saying "invalid".
+        'registry' => [
+            'empty' => 'Saisissez l’adresse du registre — `docker.io` pour Docker Hub, `ghcr.io`, ou votre propre hôte.',
+            'path' => 'Cela ressemble à un espace de noms ou à un dépôt, pas à un registre. Saisissez l’hôte seul — `ghcr.io`, pas `ghcr.io/votre-org`.',
+            'credentials' => 'Ne mettez pas de nom d’utilisateur ni de mot de passe dans l’adresse. Saisissez l’hôte seul ; les identifiants vont dans les champs ci-dessous.',
+            'host' => 'Ce n’est pas une adresse de registre. Saisissez un nom d’hôte, éventuellement avec un port — `registry.example.com` ou `registry.example.com:5000`.',
+            'port' => 'Le port doit être compris entre 1 et 65535.',
+        ],
+        'attribute-name' => [
+            'rule-name' => 'custom-message',
+        ],
+
+        // Laravel's default reads "The docker network new field prohibits docker
+        // network from being present" — raw attribute names at a user.
+        'docker_network_new' => [
+            'prohibits' => 'Choisissez un réseau dans la liste ou nommez-en un nouveau, mais pas les deux : ce sont deux réponses à la même question.',
+        ],
+
+        'volume_path' => [
+            'required_with' => 'Indiquez le chemin dans le conteneur où ce volume doit apparaître, par exemple /var/lib/mysql.',
+        ],
+
+        'volume_new' => [
+            'required_with' => 'Donnez un nom au volume à créer, ou effacez le chemin si vous n\'en voulez pas.',
+        ],
+    ],
+
+    // i18n-v: the web firewall's own words for what it refuses.
+    'waf_exception_characters' => 'Une exception est une partie de chemin, comme /wp-json/. Elle ne peut contenir ni « .. », ni « ? », ni saut de ligne.',
+    'waf_rule_characters' => 'Une règle personnalisée doit tenir sur une ligne, sans caractère de contrôle.',
+
+    // FS-B6: an application admin password's policy, named.
+    'admin_password_strength' => 'Le mot de passe doit contenir une minuscule, une majuscule, un chiffre et un symbole.',
+    'admin_password_strength_no_symbol' => 'Le mot de passe doit contenir une minuscule, une majuscule et un chiffre.',
+
+    'attributes' => [
+        'system_user.username' => 'nom d’utilisateur',
+        'system_user.password' => 'mot de passe',
+        'name' => 'nom',
+        'username' => 'nom d’utilisateur',
+        'password' => 'mot de passe',
+        'current_password' => 'mot de passe actuel',
+        'role' => 'rôle',
+        'label' => 'libellé',
+        'exceptions.*' => 'exception',
+        'custom_rules.*' => 'règle personnalisée',
+        'create_user.username' => 'nom de l’utilisateur de la base de données',
+        'create_user.password' => 'mot de passe de l’utilisateur de la base de données',
+        'create_user.host' => 'adresse distante',
+        'create_user.connection_preference' => 'type de connexion',
+    ],
+
+    'start_command_shell' => 'La commande de démarrage ne peut pas contenir « :token » : elle est exécutée directement, pas via un shell.',
+    'process_instances_entrypoint' => 'Pour exécuter plusieurs processus, la commande de démarrage doit nommer un script — par exemple « node server.js ». PM2 crée le cluster en forkant ce fichier ; avec autre chose, il exécute silencieusement un seul processus.',
+    'start_command_wrapper' => 'Démarrez l\'app avec son fichier d\'entrée, par exemple « node server.js », pas avec :binary. Un gestionnaire de paquets fork le vrai processus, donc les signaux ne l\'atteignent jamais.',
+
+    'port_in_use_by_app' => 'Le port :port est déjà utilisé par une autre application sur ce serveur.',
+
+    // A network the panel created, named by a site that will join it.
+    'docker_network_invalid' => 'Commencez le nom du réseau par une lettre ou un chiffre, puis utilisez des lettres, des chiffres, des points, des tirets ou des tirets bas.',
+    'docker_network_missing' => 'Il n\'existe aucun réseau Docker nommé \':name\' sur ce serveur. Il a peut-être été supprimé depuis le chargement de cette page.',
+
+    // Mounting a panel-created volume into a container site.
+    'docker_volume_invalid' => 'Commencez le nom du volume par une lettre ou un chiffre, puis utilisez des lettres, des chiffres, des points, des tirets ou des tirets bas.',
+    'docker_volume_missing' => 'Il n\'existe aucun volume Docker nommé \':name\' sur ce serveur. Il a peut-être été supprimé depuis le chargement de cette page.',
+    'docker_mount_duplicate' => 'Deux volumes ne peuvent pas être montés sur :path. Docker n\'en garderait qu\'un, sans dire lequel.',
+    'docker_mount_root' => 'Choisissez un chemin à l\'intérieur du conteneur, par exemple /var/lib/mysql.',
+    'docker_mount_site_root' => 'C\'est à ce chemin que les fichiers de l’application sont montés (:path). Un volume ici les masque au conteneur : les fichiers restent sur le serveur, mais l’application sert un volume vide.',
+    'docker_mount_reserved' => ':path fait partie de l\'image avec laquelle le conteneur démarre. Un volume vide par-dessus donne un conteneur incapable de démarrer.',
+    'docker_mount_characters' => 'Utilisez uniquement des lettres, des chiffres, des points, des tirets, des tirets bas et des barres obliques, en commençant par /, par exemple /var/lib/mysql.',
+
+    // A name the panel is about to create, so the inverse rule: not taken.
+    'docker_network_taken' => 'Un réseau nommé \':name\' existe déjà sur ce serveur. Sélectionnez-le dans la liste ci-dessus plutôt que d\'en créer un second.',
+    'docker_volume_taken' => 'Un volume nommé \':name\' existe déjà sur ce serveur. Montez l\'existant depuis la carte Conteneur de l’application plutôt que d\'en créer un second.',
+    'node_version_unsupported' => 'L\'application :type fonctionne avec Node :range. Choisissez une version dans cette plage : en dehors, l\'application refuse de démarrer et ne sert rien.',
+    'php_version_unsupported' => 'L\'application :type fonctionne avec PHP :range. Choisissez une version dans cette plage : en dehors, l\'installation échoue à mi-parcours, dans le code de l\'application elle-même, et laisse une application à moitié installée à nettoyer.',
+    'php_version_default_unsupported' => 'L\'application :type fonctionne avec PHP :range. Laisser ce champ vide utilise la valeur par défaut du serveur (:default), qui est hors de cette plage — choisissez plutôt une version dans la plage.',
+    'web_root_fixed' => ':type est servi depuis :web_root et s\'installe autour de ce chemin : la racine web ne peut donc pas être modifiée ici. Toute autre valeur rend l’application inaccessible et publie son code source.',
+    'web_root_missing' => 'Le dossier :path n\'existe pas : l’application n\'aurait rien à servir. Créez-le ou envoyez-y d\'abord vos fichiers, puis définissez-le comme racine web.',
+    'web_root_symlink' => 'Une partie de ce chemin, :path, est un lien symbolique : l’application pourrait donc servir des fichiers d\'ailleurs. Utilisez un vrai dossier à l\'intérieur de l’application.',
+    'port_in_use' => 'Quelque chose écoute déjà sur le port :port de ce serveur. Choisissez-en un autre ou arrêtez ce qui l\'occupe.',
+
+    'port_registered' => 'Le port :port est normalement utilisé par :service. Vous pouvez quand même l\'utiliser si rien sur ce serveur ne le fait.',
+    'application_name_immutable' => 'Le nom d\'une application est fixé dès sa création : il nomme ses fichiers de configuration sur le serveur. Créez une nouvelle application s\'il vous faut un autre nom.',
+    'application_domain_use_endpoint' => 'Modifiez le domaine depuis la page Domaines (/applications/{id}/domains), qui met aussi à jour la configuration du serveur web et le certificat.',
+    'site_name_taken_pool' => 'Ce serveur a déjà un fichier de pool PHP nommé « :name.conf » qui n\'a pas été créé par le panneau. Choisissez un autre nom.',
+    'site_name_taken_vhost' => 'Ce serveur a déjà une configuration de serveur web nommée « :name » qui n\'a pas été créée par le panneau — celle du panneau en fait partie. Choisissez un autre nom.',
+    'site_name_taken_vhost_order' => 'Sur ce serveur, un site nommé « :name » serait classé avant le site par défaut d\'Apache et répondrait à tous les domaines inconnus. Choisissez un nom qui commence par une lettre ou par un chiffre autre que 0.',
+
+    'webhook_secret_min' => 'Le secret du webhook doit contenir au moins 16 caractères.',
+
+    // Per-app fail2ban thresholds
+    'fail2ban.validation.maxretry_min' => 'Doit bannir après au moins 1 tentative échouée.',
+    'fail2ban.validation.maxretry_max' => 'Ne peut pas bannir après plus de 100 tentatives échouées.',
+    'fail2ban.validation.findtime_min' => 'La fenêtre de comptage doit être d\'au moins 60 secondes.',
+    'fail2ban.validation.findtime_max' => 'La fenêtre de comptage ne peut pas dépasser 24 heures (86400 secondes).',
+    'fail2ban.validation.bantime_min' => 'La durée de bannissement doit être d\'au moins 0 seconde (bannissement permanent autorisé).',
+    'fail2ban.validation.bantime_max' => 'La durée de bannissement ne peut pas dépasser 7 jours (604800 secondes).',
+    'ip_or_cidr' => 'Doit être une adresse IP valide (par ex. 1.2.3.4) ou une notation CIDR (par ex. 10.0.0.0/8).',
+
+    'jail_content_required' => 'La configuration de la prison est obligatoire.',
+    'jail_content_string' => 'La configuration de la prison doit être du texte.',
+    'jail_content_max' => 'La configuration de la prison est trop volumineuse (max. 65535 caractères).',
+    'filter_content_required' => 'La configuration du filtre est obligatoire.',
+    'filter_content_string' => 'La configuration du filtre doit être du texte.',
+    'filter_content_max' => 'La configuration du filtre est trop volumineuse (max. 65535 caractères).',
+    'basic_auth_conflicts' => 'La protection par mot de passe ne peut pas être utilisée avec :type. Son interface s\'authentifie via l\'en-tête Authorization, que HTTP n\'autorise qu\'une fois par requête — l\'authentification Basic le consommerait et rendrait l\'application inaccessible. :type exige déjà ses propres identifiants.',
+    'basic_auth_username' => 'Le nom d’utilisateur ne peut contenir que des lettres latines non accentuées, des chiffres et des symboles, sans espace ni deux-points (:). Les navigateurs ne peuvent pas envoyer d’autres caractères de façon fiable.',
+    'git_repository_unreachable' => 'Le dépôt est inaccessible. Vérifiez l’adresse et que le compte (ou le dépôt, s’il est public) autorise l’accès.',
+    'git_host_unreachable' => 'Le serveur n’a pas pu joindre l’hébergeur git. Vérifiez sa connexion réseau et réessayez.',
+    'git_branch_missing' => 'La branche ":branch" n’existe pas dans ce dépôt.',
+];

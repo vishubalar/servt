@@ -1,0 +1,134 @@
+import { History } from "lucide-react";
+import { getFormatter, getTranslations } from "next-intl/server";
+import { Badge } from "@/components/ui/badge";
+import {
+  Card,
+  CardAction,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { RefreshButton } from "@/components/data-table/refresh-button";
+import { DataTablePagination } from "@/components/data-table/data-table-pagination";
+import { parseApiWallClock } from "@/lib/format/api-date";
+import { formatBytes } from "@/lib/format/bytes";
+import { SizeText } from "@/components/ui/size-text";
+
+function failed(status) {
+  return Boolean(status) && !["success", "completed", "ok", "done"].includes(status);
+}
+
+export async function RunsCard({ runs, meta, categories, keepSupported = true }) {
+  if (!runs?.length) return null;
+  const [t, format] = await Promise.all([getTranslations("diskCleaner"), getFormatter()]);
+  const labelFor = (key) => categories.find((c) => c.key === key)?.label ?? key;
+  const triggerOf = (run) => (t.has(`runs.trigger.${run.trigger}`) ? t(`runs.trigger.${run.trigger}`) : run.trigger);
+  const keepOf = (run) =>
+    !keepSupported ? null : run.keep_days == null ? t("keep.defaultAsBefore") : run.keep_days === 0 ? t("keep.deleteAll") : t("keep.days", { count: run.keep_days });
+  const when = (at) => format.dateTime(at, { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" });
+
+  // freed is [] from PHP when empty.
+  function Cleaned({ run }) {
+    const freed = run.freed && !Array.isArray(run.freed) ? run.freed : {};
+    return (
+      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-sm">
+        {(run.categories ?? []).map((key) => (
+          <li key={key} className="inline-flex items-baseline gap-1.5">
+            <span>{labelFor(key)}</span>
+            {freed[key] != null ? (
+              <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(freed[key], format)}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  return (
+    <Card className="gap-0 overflow-hidden pb-0">
+      <CardHeader className="items-center pb-4">
+        <CardTitle icon={History}>{t("runs.title")}</CardTitle>
+        <CardAction className="row-span-1 self-center">
+          <RefreshButton />
+        </CardAction>
+      </CardHeader>
+
+      <div className="@container">
+      <ul className="divide-y border-t @min-[900px]/page:hidden">
+        {runs.map((run) => {
+          const at = parseApiWallClock(run.created_at);
+          return (
+            <li key={run.id} className="space-y-1.5 px-4 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm">{run.created_at_human ?? run.created_at}</p>
+                  {at ? <p className="text-xs text-muted-foreground">{when(at)}</p> : null}
+                </div>
+                <span className="inline-flex shrink-0 items-center gap-2">
+                  {failed(run.status) ? <Badge variant="destructive" className="font-normal">{t("runs.failed")}</Badge> : null}
+                  <Badge variant="outline" className="font-normal">{triggerOf(run)}</Badge>
+                  {keepOf(run) ? <span className="text-xs text-muted-foreground">{keepOf(run)}</span> : null}
+                  <span className="text-sm font-medium tabular-nums"><SizeText value={run.freed_total_human} fallback="0 B" /></span>
+                </span>
+              </div>
+              <Cleaned run={run} />
+            </li>
+          );
+        })}
+      </ul>
+
+      <div className="hidden border-t @min-[900px]/page:block">
+        <Table>
+          <TableHeader>
+            <TableRow className="bg-muted/40 hover:bg-muted/40">
+              <TableHead>{t("runs.colWhen")}</TableHead>
+              <TableHead>{t("runs.colWhat")}</TableHead>
+              <TableHead className="hidden md:table-cell">{t("runs.colHow")}</TableHead>
+              <TableHead className="hidden lg:table-cell">{t("runs.colDiskAfter")}</TableHead>
+              <TableHead className="text-right">{t("runs.colFreed")}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {runs.map((run) => {
+              const at = parseApiWallClock(run.created_at);
+              const trigger = triggerOf(run);
+              return (
+                <TableRow key={run.id}>
+                  <TableCell className="align-top">
+                    <p>{run.created_at_human ?? run.created_at}</p>
+                    {at ? <p className="text-xs text-muted-foreground">{when(at)}</p> : null}
+                  </TableCell>
+                  <TableCell className="align-top whitespace-normal">
+                    <Cleaned run={run} />
+                  </TableCell>
+                  <TableCell className="hidden align-top md:table-cell">
+                    <Badge variant="outline" className="font-normal">{trigger}</Badge>
+                    {keepOf(run) ? <p className="mt-1 text-xs text-muted-foreground">{keepOf(run)}</p> : null}
+                  </TableCell>
+                  <TableCell className="hidden align-top tabular-nums text-muted-foreground lg:table-cell">
+                    {run.disk_percent != null ? t("summary.percentUsed", { percent: Math.round(run.disk_percent) }) : "—"}
+                  </TableCell>
+                  <TableCell className="align-top text-right">
+                    <span className="inline-flex items-center justify-end gap-2">
+                      {failed(run.status) ? (
+                        <Badge variant="destructive" className="font-normal">{t("runs.failed")}</Badge>
+                      ) : null}
+                      <span className="font-medium tabular-nums"><SizeText value={run.freed_total_human} fallback="0 B" /></span>
+                    </span>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </div>
+      </div>
+
+      {meta && meta.last_page > 1 ? (
+        <div className="border-t px-4 py-3">
+          <DataTablePagination meta={meta} />
+        </div>
+      ) : null}
+    </Card>
+  );
+}

@@ -1,0 +1,68 @@
+import { useState } from "react";
+import { Search, X } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { isReference } from "@/lib/schemas/error-log";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+
+export function ReferenceLookup({ value, onSubmit, onClear, autoFocus = false }) {
+  const t = useTranslations("errorLogs");
+  const [draft, setDraft] = useState(value ?? "");
+
+  const trimmed = draft.trim();
+  const valid = isReference(trimmed);
+  const dirty = trimmed.length > 0;
+
+  return (
+    <form noValidate
+      className="flex w-full items-start gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (valid) onSubmit(trimmed);
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="relative">
+          <Search
+            className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden
+          />
+          <Input
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder={t("referencePlaceholder")}
+            aria-label={t("referenceLabel")}
+            aria-invalid={dirty && !valid ? true : undefined}
+            autoFocus={autoFocus}
+            className="px-8 font-mono text-xs"
+          />
+          {dirty ? (
+            <button
+              type="button"
+              onClick={() => {
+                setDraft("");
+                onClear();
+              }}
+              aria-label={t("referenceClear")}
+              className="absolute right-2 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:text-foreground"
+            >
+              <X className="size-4" aria-hidden />
+            </button>
+          ) : null}
+        </div>
+        {dirty && !valid ? (
+          <p className="mt-1 text-xs text-destructive">{t("referenceInvalid")}</p>
+        ) : null}
+      </div>
+
+      <Button
+        type="submit"
+        variant="secondary"
+        disabled={!valid}
+        disabledReason={dirty ? t("referenceInvalid") : t("referenceEmpty")}
+      >
+        {t("referenceSubmit")}
+      </Button>
+    </form>
+  );
+}

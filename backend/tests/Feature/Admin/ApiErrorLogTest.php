@@ -1,0 +1,560 @@
+<?php
+
+use App\Exceptions\Server\Fail2ban\Fail2banException;
+use App\Exceptions\Server\Setting\SettingOperationException;
+use App\Models\User;
+use App\Services\Admin\ApiErrorLogWriter;
+use Illuminate\Console\Events\ScheduledTaskFinished;
+use Illuminate\Console\Scheduling\Event;
+use Illuminate\Console\Scheduling\EventMutex;
+use Illuminate\Http\Request;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Jobs\SyncJob;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+/** A throwable whose trace starts in this file rather than in the framework. */
+function throwFromHelper(): RuntimeException
+{
+    return new RuntimeException('boom');
+}
+
+beforeEach(function () {
+    $this->logDir = storage_path('logs/server-ops-tests-'.getmypid());
+    File::deleteDirectory($this->logDir);
+    File::makeDirectory($this->logDir, 0755, true);
+    config(['logging.channels.server-ops.path' => $this->logDir.'/server-ops.log']);
+    Log::forgetChannel('server-ops');
+});
+
+afterEach(fn () => File::deleteDirectory($this->logDir));
+
+it('returns safe API errors to an administrator', function () {
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'api.error',
+        'context' => [
+            'reference' => 'af04688c-9176-4d96-9d6a-9d15e649bc8a',
+            'status' => 500,
+            'method' => 'POST',
+            'route' => 'api/test/{secret}',
+            'exception' => RuntimeException::class,
+            'message' => 'Unexpected API error.',
+            'user_id' => null,
+        ],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-08-14T12:00:00+00:00',
+    ]).PHP_EOL);
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs')
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.status', 500)
+        ->assertJsonPath('error_logs.0.method', 'POST')
+        ->assertJsonPath('error_logs.0.message', 'Unexpected API error.')
+        ->assertJsonMissing(['password=secret']);
+});
+
+it('records API failures through the server operations channel', function () {
+    // The message is the exception's own, but still redacted: it carries whatever was in scope
+    // when thrown, such as a connection string.
+    $logger = Mockery::mock();
+    $logger->shouldReceive('error')
+        ->once()
+        ->with('api.error', Mockery::on(function (array $context): bool {
+            expect($context['status'])->toBe(500)
+                ->and($context['message'])->toContain('password=')
+                ->and($context['message'])->not->toContain('hunter2')
+                // Enough to open the file without publishing the deploy path.
+                ->and($context['file'])->toStartWith('tests/Feature/Admin/ApiErrorLogTest.php:');
+
+            return true;
+        }));
+    Log::shouldReceive('channel')->once()->with('server-ops')->andReturn($logger);
+
+    app(ApiErrorLogWriter::class)->record(
+        new RuntimeException('password=hunter2'),
+        Request::create('/api/test/{secret}', 'POST'),
+    );
+});
+
+it('records where the exception came from, in application frames only', function () {
+    // The top of a Laravel stack is the same handler chain every time; the first application
+    // frames identify the failure.
+    $captured = null;
+
+    $logger = Mockery::mock();
+    $logger->shouldReceive('error')->once()->with('api.error', Mockery::on(function (array $context) use (&$captured): bool {
+        $captured = $context;
+
+        return true;
+    }));
+    Log::shouldReceive('channel')->once()->with('server-ops')->andReturn($logger);
+
+    app(ApiErrorLogWriter::class)->record(
+        throwFromHelper(),
+        Request::create('/api/test', 'GET'),
+    );
+
+    expect($captured['trace'])->not->toBeEmpty()
+        ->and(collect($captured['trace'])->every(fn (string $f): bool => ! str_contains($f, '/vendor/')))->toBeTrue()
+        ->and($captured['trace'][0])->toContain('ApiErrorLogTest.php');
+});
+
+it('shows failed server operations and filters them by reference', function () {
+    $firstReference = '2d44e941-0f2f-4d6a-a4fb-5f2c13ac99f5';
+    $secondReference = '3f734d8d-ae5c-4ae2-815d-a7822eaa2b97';
+    File::put($this->logDir.'/server-ops.log', implode(PHP_EOL, [
+        json_encode([
+            'message' => 'server operation',
+            'context' => [
+                'reference' => $firstReference,
+                'feature' => 'firewall',
+                'op' => 'apply',
+                'exit_code' => 1,
+                'stderr' => 'ufw: password=secret-value denied',
+                'actor_id' => 7,
+            ],
+            'level_name' => 'ERROR',
+            'datetime' => '2026-08-14T12:00:00+00:00',
+        ]),
+        json_encode([
+            'message' => 'server operation',
+            'context' => ['reference' => $secondReference, 'feature' => 'cronjob', 'actor_id' => 8],
+            'level_name' => 'ERROR',
+            'datetime' => '2026-08-14T12:01:00+00:00',
+        ]),
+        '',
+    ]));
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson("/api/admin/error-logs?reference={$firstReference}")
+        ->assertOk()
+        ->assertJsonCount(1, 'error_logs')
+        ->assertJsonPath('error_logs.0.reference', $firstReference)
+        ->assertJsonPath('error_logs.0.message', 'Server operation failed.')
+        ->assertJsonPath('error_logs.0.feature', 'firewall')
+        ->assertJsonPath('error_logs.0.operation', 'apply')
+        ->assertJsonPath('error_logs.0.exit_code', 1)
+        ->assertJsonPath('error_logs.0.error', 'ufw: password=*** denied')
+        ->assertJsonPath('error_logs.0.user_id', 7);
+});
+
+it('falls back to redacted stdout when a server operation has no stderr', function () {
+    $stdoutReference = '5c3cc1bb-3f01-4c2c-8c3c-9fe15b675b63';
+    $stderrReference = '9c01c412-493a-453c-8d91-70c6fa8f82e4';
+    $emptyReference = '13e01e85-4e82-40a5-9976-791d31486762';
+
+    File::put($this->logDir.'/server-ops.log', implode(PHP_EOL, [
+        json_encode([
+            'message' => 'server operation',
+            'context' => [
+                'reference' => $stdoutReference,
+                'feature' => 'application',
+                'op' => 'installer.install_app',
+                'exit_code' => 1,
+                'stderr' => '',
+                'stdout' => 'Moodle failed: password=secret-value token=abc123',
+            ],
+            'level_name' => 'ERROR',
+            'datetime' => '2026-08-27T13:00:00+00:00',
+        ]),
+        json_encode([
+            'message' => 'server operation',
+            'context' => [
+                'reference' => $stderrReference,
+                'feature' => 'application',
+                'op' => 'installer.install_app',
+                'exit_code' => 1,
+                'stderr' => 'The stderr reason',
+                'stdout' => 'The less specific stdout output',
+            ],
+            'level_name' => 'ERROR',
+            'datetime' => '2026-08-27T13:01:00+00:00',
+        ]),
+        json_encode([
+            'message' => 'server operation',
+            'context' => [
+                'reference' => $emptyReference,
+                'feature' => 'application',
+                'op' => 'installer.install_app',
+                'exit_code' => 1,
+                'stderr' => ' ',
+                'stdout' => '',
+            ],
+            'level_name' => 'ERROR',
+            'datetime' => '2026-08-27T13:02:00+00:00',
+        ]),
+        '',
+    ]));
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+    $headers = ['Authorization' => "Bearer {$token}"];
+
+    $this->withHeaders($headers)
+        ->getJson("/api/admin/error-logs?reference={$stdoutReference}")
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.error', 'Moodle failed: password=*** token=***');
+
+    $this->withHeaders($headers)
+        ->getJson("/api/admin/error-logs?reference={$stderrReference}")
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.error', 'The stderr reason');
+
+    $this->withHeaders($headers)
+        ->getJson("/api/admin/error-logs?reference={$emptyReference}")
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.error', null);
+});
+
+it('sends the command that failed, with how long it ran and how often it was tried', function () {
+    // ServerOps puts every command line through CommandRedactor before logging, so this is the
+    // text an operator would read on the box.
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'server operation',
+        'context' => [
+            'reference' => 'c0ffee00-0000-4000-8000-000000000001',
+            'feature' => 'application',
+            'op' => 'create_database',
+            'command' => 'mysql --user=root --password=[REDACTED] -e CREATE DATABASE shop',
+            'exit_code' => 1,
+            'stderr' => 'ERROR 2002 (HY000): Can\'t connect to local MySQL server',
+            'duration_ms' => 12043,
+            'attempts' => 3,
+        ],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-08-31T07:00:00+00:00',
+    ]).PHP_EOL);
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $entry = collect($this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs')->assertOk()->json('error_logs'))
+        ->firstWhere('reference', 'c0ffee00-0000-4000-8000-000000000001');
+
+    expect($entry)->not->toBeNull()
+        ->and($entry['command'])->toContain('CREATE DATABASE shop')
+        // Redacted at the point it was written, and still redacted here.
+        ->and($entry['command'])->not->toContain('hunter2')
+        ->and($entry['duration_ms'])->toBe(12043)
+        // Three attempts in twelve seconds is a lock being retried; timestamps alone cannot tell.
+        ->and($entry['attempts'])->toBe(3);
+});
+
+it('rejects an invalid reference filter', function () {
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs?reference=not-a-reference')
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('reference');
+});
+
+it('does not record expected API client errors', function () {
+    $request = Request::create('/api/test', 'GET');
+    app(ApiErrorLogWriter::class)->record(new NotFoundHttpException, $request);
+
+    expect(glob($this->logDir.'/*') ?: [])->toBe([]);
+});
+
+it('denies non-admins', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs')
+        ->assertForbidden();
+});
+
+it('keeps the end of a noisy stderr, where the reason is', function () {
+    // `npm install` writes thousands of peer-dependency warnings and puts the cause last; head
+    // truncation would keep the warnings and drop the cause.
+    $reference = '4f2b8c71-0d3a-4e55-9b21-7c6e5a1d2f80';
+    $noise = str_repeat("npm warn ERESOLVE overriding peer dependency\n", 400);
+    $cause = 'gyp ERR! stack Error: not found: make';
+
+    // THE TRAILING NOISE IS THE TEST. npm prints about 2 KB of timers and upgrade notices after
+    // the error: the last 1000 characters miss the cause, the last 4000 hold it. Without this
+    // tail the cause is last and the fixture passes at any limit.
+    $trailing = str_repeat("npm silly unfinished npm timer reify 1789040712600\n", 40);
+
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'api.error',
+        'context' => [
+            'reference' => $reference,
+            'status' => 500,
+            'stderr' => $noise.$cause."\n".$trailing,
+        ],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-09-10T11:31:44+00:00',
+    ]).PHP_EOL);
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $error = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson("/api/admin/error-logs?reference={$reference}")
+        ->assertOk()
+        ->json('error_logs.0.error');
+
+    expect($error)->toContain($cause);
+
+    // Still bounded: an unbounded field would also pass the assertion above.
+    expect(mb_strlen($error))->toBeLessThanOrEqual(4001);
+    expect($error)->toStartWith('…');
+});
+
+it('does not truncate a stderr that already fits', function () {
+    $reference = '8a1d0e44-6b92-4f18-a3c7-1e90bb52d4aa';
+
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'api.error',
+        'context' => ['reference' => $reference, 'status' => 500, 'stderr' => 'short and complete'],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-09-10T11:31:44+00:00',
+    ]).PHP_EOL);
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson("/api/admin/error-logs?reference={$reference}")
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.error', 'short and complete');
+});
+
+// A restore failure logged the ordinary way: Monolog puts the message at the top level, only
+// ServerOps also writes one inside `context`, and `context.detail` holds the cause.
+it('shows what a failed restore actually said', function () {
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'restore failed',
+        'context' => [
+            'feature' => 'backup',
+            'op' => 'restore',
+            'restore' => 1,
+            'application' => 1,
+            'step' => 'download_artifact',
+            'reference' => '638a9d2c-75c7-4222-bc7b-fe32b374cd1c',
+            'detail' => 'the artefact backups/site/2026-09-19/a.tar.gz is not on the destination',
+        ],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-09-19T10:20:51+00:00',
+    ]).PHP_EOL);
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs')
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.message', 'restore failed')
+        ->assertJsonPath('error_logs.0.feature', 'backup')
+        ->assertJsonPath('error_logs.0.operation', 'restore')
+        ->assertJsonPath(
+            'error_logs.0.error',
+            'the artefact backups/site/2026-09-19/a.tar.gz is not on the destination',
+        );
+});
+
+// Command output still wins: `detail` explains things that are not shell commands.
+it('prefers what the command printed over a summary of it', function () {
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'server operation',
+        'context' => [
+            'reference' => 'b1',
+            'stderr' => 'gyp ERR! stack Error: not found: make',
+            'detail' => 'a less specific summary',
+        ],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-09-19T10:20:51+00:00',
+    ]).PHP_EOL);
+
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs')
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.error', 'gyp ERR! stack Error: not found: make');
+});
+
+// The screen reads the server-ops log, so failed jobs and scheduled tasks must be written there.
+
+it('shows a queued job that failed', function () {
+    // The event the queue worker fires when a job gives up for good.
+    $job = new SyncJob(app(), json_encode([
+        'displayName' => 'App\\Jobs\\ProvisionApplication', 'job' => 'Illuminate\\Queue\\CallQueuedHandler@call', 'data' => [],
+    ]), 'redis', 'default');
+
+    event(new JobFailed('redis', $job, new RuntimeException('the worker gave up on this')));
+
+    $entries = $this->actingAs(User::factory()->admin()->create())
+        ->getJson('/api/admin/error-logs')->assertOk()->json('error_logs');
+
+    $entry = collect($entries)->firstWhere('operation', 'job.failed');
+
+    expect($entry)->not->toBeNull()
+        ->and($entry['message'])->toBe('A background job failed.')
+        ->and($entry['command'])->toBe('App\\Jobs\\ProvisionApplication')
+        ->and($entry['error'])->toContain('the worker gave up on this');
+});
+
+it('shows a scheduled command that exited non-zero', function () {
+    $event = new Event(app(EventMutex::class), 'php artisan applications:measure-sizes');
+    $event->exitCode = 1;
+
+    event(new ScheduledTaskFinished($event, 0.5));
+
+    $entries = $this->actingAs(User::factory()->admin()->create())
+        ->getJson('/api/admin/error-logs')->assertOk()->json('error_logs');
+
+    $entry = collect($entries)->firstWhere('operation', 'schedule.failed');
+
+    expect($entry['message'])->toBe('A scheduled task failed.')
+        ->and($entry['command'])->toContain('measure-sizes')
+        ->and($entry['exit_code'])->toBe(1);
+});
+
+it('does not log a scheduled command that succeeded', function () {
+    $event = new Event(app(EventMutex::class), 'php artisan applications:measure-sizes');
+    $event->exitCode = 0;
+
+    event(new ScheduledTaskFinished($event, 0.5));
+
+    $entries = $this->actingAs(User::factory()->admin()->create())
+        ->getJson('/api/admin/error-logs')->assertOk()->json('error_logs');
+
+    expect(json_encode($entries))->not->toContain('schedule.failed');
+});
+
+it('gives an API 500 the reference the user was shown, not a new one', function () {
+    $exception = new SettingOperationException('0d3f6c1e-6b1a-4c55-9f0e-1c2b3a4d5e6f');
+
+    app(ApiErrorLogWriter::class)->record($exception, Request::create('/api/anything', 'GET'));
+
+    $entries = $this->actingAs(User::factory()->admin()->create())
+        ->getJson('/api/admin/error-logs?reference=0d3f6c1e-6b1a-4c55-9f0e-1c2b3a4d5e6f')->assertOk()->json('error_logs');
+
+    expect($entries)->not->toBeEmpty();
+});
+
+// The recorded status is the one rendered: an exception that renders its own 4xx is not a 500 crash.
+it('does not record an exception that answered the user with a 4xx', function (Throwable $exception) {
+    Log::shouldReceive('channel')->never();
+
+    app(ApiErrorLogWriter::class)->record($exception, Request::create('/api/fail2ban/ignore-ips', 'DELETE'));
+})->with([
+    'fail2ban lockout risk (422)' => fn () => Fail2banException::lockoutRisk(),
+    'fail2ban ignore ip missing (404)' => fn () => Fail2banException::ignoreIpMissing(),
+]);
+
+it('still records an exception that rendered a 5xx, with that status', function () {
+    $logger = Mockery::mock();
+    $logger->shouldReceive('error')->once()->with('api.error', Mockery::on(function (array $context): bool {
+        expect($context['status'])->toBe(500);
+
+        return true;
+    }));
+    Log::shouldReceive('channel')->once()->with('server-ops')->andReturn($logger);
+
+    app(ApiErrorLogWriter::class)->record(
+        Fail2banException::operationFailed('ref-1'),
+        Request::create('/api/fail2ban', 'GET'),
+    );
+});
+
+// The admin screen shows words; the raw identifiers (`pm2_jlist_user`) stay in `operation` /
+// `feature` for anyone searching the log.
+function errorLogEntryWith(array $context): array
+{
+    File::put(test()->logDir.'/server-ops.log', json_encode([
+        'message' => 'server operation',
+        'context' => $context + ['status' => 500],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-11-05T09:00:00+00:00',
+    ]).PHP_EOL);
+
+    $token = User::factory()->admin()->create()->createToken('test')->plainTextToken;
+
+    return test()->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/error-logs')
+        ->assertOk()
+        ->json('error_logs.0');
+}
+
+it('names the operation and the feature in words and keeps the raw identifiers', function (string $op, string $label) {
+    $entry = errorLogEntryWith(['feature' => 'application', 'op' => $op]);
+
+    expect($entry['operation'])->toBe($op)
+        ->and($entry['operation_label'])->toBe($label)
+        ->and($entry['feature'])->toBe('application')
+        ->and($entry['feature_label'])->toBe('Application');
+})->with([
+    'database query' => ['query', 'Database query'],
+    'pm2 listing' => ['pm2_jlist_user', 'List PM2 processes'],
+    'staging copies' => ['staging_dump_list', 'List staging database copies'],
+    'nested dotted op' => ['git.fetch', 'Fetch from Git remote'],
+    'installer step' => ['installer.extract', 'Unpack application files'],
+]);
+
+it('names a feature written with underscores', function () {
+    $entry = errorLogEntryWith(['feature' => 'disk_cleaner', 'op' => 'clean']);
+
+    expect($entry['feature_label'])->toBe('Disk cleaner')
+        ->and($entry['operation_label'])->toBe('Clean up disk space');
+});
+
+it('spells out an operation or feature it has no name for instead of leaving it blank', function () {
+    $entry = errorLogEntryWith(['feature' => 'brand_new_thing', 'op' => 'do_the_thing.now']);
+
+    expect($entry['feature_label'])->toBe('Brand new thing')
+        ->and($entry['operation_label'])->toBe('Do the thing now');
+});
+
+it('does not return an array when an operation names a group of nested labels', function () {
+    $entry = errorLogEntryWith(['feature' => 'application', 'op' => 'git']);
+
+    expect($entry['operation_label'])->toBeString()->toBe('Git');
+});
+
+it('gives null labels, not empty strings, when the entry has no feature or operation', function () {
+    $entry = errorLogEntryWith([]);
+
+    expect($entry['feature'])->toBeNull()
+        ->and($entry['feature_label'])->toBeNull()
+        ->and($entry['operation'])->toBeNull()
+        ->and($entry['operation_label'])->toBeNull();
+});
+
+it('names background failures written by the log writer', function () {
+    $entry = errorLogEntryWith(['feature' => 'queue', 'op' => 'job.failed']);
+
+    expect($entry['feature_label'])->toBe('Background job')
+        ->and($entry['operation_label'])->toBe('Background job failed');
+});
+
+it('names the operation in the language the administrator asked for', function () {
+    File::put($this->logDir.'/server-ops.log', json_encode([
+        'message' => 'server operation',
+        'context' => ['status' => 500, 'feature' => 'application', 'op' => 'pm2_jlist_user'],
+        'level_name' => 'ERROR',
+        'datetime' => '2026-11-05T09:00:00+00:00',
+    ]).PHP_EOL);
+    $token = User::factory()->admin()->create()->createToken('test')->plainTextToken;
+
+    $this->withHeaders(['Authorization' => "Bearer {$token}", 'Accept-Language' => 'de'])
+        ->getJson('/api/admin/error-logs')
+        ->assertOk()
+        ->assertJsonPath('error_logs.0.operation', 'pm2_jlist_user')
+        ->assertJsonPath('error_logs.0.operation_label', 'PM2-Prozesse auflisten')
+        ->assertJsonPath('error_logs.0.feature_label', 'Anwendung');
+});

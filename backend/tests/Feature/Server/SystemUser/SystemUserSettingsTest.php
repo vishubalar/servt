@@ -1,0 +1,291 @@
+<?php
+
+use App\Actions\Server\SystemUser\SetSystemUserPassword;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\SystemUsers\InstalledShells;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+    $this->su = SystemUser::create(['username' => 'deploy', 'home_path' => '/home/deploy', 'shell' => '/bin/bash', 'sudo' => false]);
+});
+
+it('sets the system user password via chpasswd (never in the command)', function () {
+    Process::fake();
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/password", ['password' => 'Password123'])
+        ->assertNoContent();
+
+    Process::assertRan(function ($process) {
+        // the password is piped to stdin, not in the command array
+        return $process->command === ['chpasswd']
+            && ! str_contains(implode(' ', (array) $process->command), 'Password123');
+    });
+
+    // Operator decision: the plaintext password is persisted so an admin can
+    // copy it later for server login.
+    expect($this->su->fresh()->password)->toBe('Password123');
+});
+
+it('exposes the stored password on the system user resource', function () {
+    Process::fake();
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/password", ['password' => 'Password123']);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson("/api/system-users/{$this->su->id}")
+        ->assertOk()
+        ->assertJsonPath('system_user.password', 'Password123');
+});
+
+it('rejects a weak system user password', function () {
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/password", ['password' => 'short'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('password');
+});
+
+it('grants sudo, running usermod and persisting the flag', function () {
+    Process::fake();
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => true]);
+
+    $response->assertOk()->assertJsonPath('system_user.sudo', true);
+    expect($this->su->fresh()->sudo)->toBeTrue();
+    Process::assertRan(fn ($p) => $p->command === ['usermod', '-aG', 'sudo', 'deploy']);
+});
+
+/**
+ * A server whose groups change as gpasswd runs: `id -nG` answers from $groups.
+ *
+ * @param  array<int, string>  $groups
+ * @param  array<int, string>  $stuck  groups gpasswd "removes" but that stay
+ */
+function fakeSudoGroups(array &$groups, array $stuck = []): void
+{
+    Process::fake(function ($process) use (&$groups, $stuck) {
+        $command = (array) $process->command;
+
+        if (($command[0] ?? '') === 'id') {
+            return Process::result(output: implode(' ', ['deploy', ...$groups])."\n");
+        }
+
+        if (($command[0] ?? '') === 'gpasswd' && ($command[1] ?? '') === '-d') {
+            if (! in_array($command[3], $groups, true)) {
+                return Process::result(errorOutput: "gpasswd: user 'deploy' is not a member of '{$command[3]}'\n", exitCode: 3);
+            }
+
+            if (! in_array($command[3], $stuck, true)) {
+                $groups = array_values(array_diff($groups, [$command[3]]));
+            }
+        }
+
+        return Process::result();
+    });
+}
+
+it('revokes sudo, running gpasswd', function () {
+    $groups = ['sudo'];
+    fakeSudoGroups($groups);
+    $this->su->update(['sudo' => true]);
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => false]);
+
+    $response->assertOk()->assertJsonPath('system_user.sudo', false);
+    expect($this->su->fresh()->sudo)->toBeFalse()->and($groups)->toBe([]);
+    Process::assertRan(fn ($p) => $p->command === ['gpasswd', '-d', 'deploy', 'sudo']);
+});
+
+/*
+ * FS-C22 #16 (2026-10-23): `admin` also grants sudo (the default sudoers on
+ * older Ubuntu, servers moved from v7), and Server Sync counts it. Turning sudo
+ * off removed only `sudo`: a user in `admin` alone got a failing gpasswd, one
+ * in both kept sudo while the panel said off.
+ */
+it('takes sudo away from a user who has it only through admin', function () {
+    $groups = ['admin', 'www-data'];
+    fakeSudoGroups($groups);
+    $this->su->update(['sudo' => true]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => false])
+        ->assertOk()->assertJsonPath('system_user.sudo', false);
+
+    expect($groups)->toBe(['www-data']);
+    Process::assertRan(fn ($p) => $p->command === ['gpasswd', '-d', 'deploy', 'admin']);
+    Process::assertNotRan(fn ($p) => $p->command === ['gpasswd', '-d', 'deploy', 'sudo']);
+});
+
+it('takes the user out of both sudo and admin', function () {
+    $groups = ['sudo', 'admin'];
+    fakeSudoGroups($groups);
+    $this->su->update(['sudo' => true]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => false])
+        ->assertOk();
+
+    expect($groups)->toBe([])->and($this->su->fresh()->sudo)->toBeFalse();
+});
+
+it('does not report sudo off while a sudo group is still there', function () {
+    $groups = ['sudo', 'admin'];
+    fakeSudoGroups($groups, stuck: ['admin']);
+    $this->su->update(['sudo' => true]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => false])
+        ->assertStatus(500)->assertJsonStructure(['message', 'reference']);
+
+    expect($this->su->fresh()->sudo)->toBeTrue();
+});
+
+it('turns sudo off for a user already in no sudo group without running gpasswd', function () {
+    $groups = ['www-data'];
+    fakeSudoGroups($groups);
+    $this->su->update(['sudo' => true]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => false])
+        ->assertOk()->assertJsonPath('system_user.sudo', false);
+
+    Process::assertNotRan(fn ($p) => ($p->command[0] ?? '') === 'gpasswd');
+});
+
+it('changes the shell to an allowlisted value, running usermod', function () {
+    Process::fake();
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/shell", ['shell' => '/usr/sbin/nologin']);
+
+    $response->assertOk()->assertJsonPath('system_user.shell', '/usr/sbin/nologin');
+    expect($this->su->fresh()->shell)->toBe('/usr/sbin/nologin');
+    Process::assertRan(fn ($p) => $p->command === ['usermod', '-s', '/usr/sbin/nologin', 'deploy']);
+});
+
+it('rejects a shell outside the allowlist', function () {
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/shell", ['shell' => '/bin/evil'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('shell');
+});
+
+it('enables SSH access, running usermod against the ssh-users group', function () {
+    Process::fake();
+    $this->su->update(['ssh_access' => false]);
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/ssh", ['ssh_access' => true]);
+
+    $response->assertOk()->assertJsonPath('system_user.ssh_access', true);
+    expect($this->su->fresh()->ssh_access)->toBeTrue();
+    Process::assertRan(fn ($p) => $p->command === ['usermod', '-aG', 'ssh-users', 'deploy']);
+});
+
+it('disables SSH access, running gpasswd against the ssh-users group', function () {
+    Process::fake();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/ssh", ['ssh_access' => false]);
+
+    $response->assertOk()->assertJsonPath('system_user.ssh_access', false);
+    expect($this->su->fresh()->ssh_access)->toBeFalse();
+    Process::assertRan(fn ($p) => $p->command === ['gpasswd', '-d', 'deploy', 'ssh-users']);
+});
+
+it('returns a translated error with reference when the ssh op fails', function () {
+    Process::fake(['*usermod*' => Process::result(output: '', errorOutput: 'nope', exitCode: 1)]);
+
+    // Captured rather than assumed: this used to assert the column default,
+    // which made it a test of the migration as much as of the failure path.
+    $before = $this->su->fresh()->ssh_access;
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/ssh", ['ssh_access' => true])
+        ->assertStatus(500)
+        ->assertJsonStructure(['message', 'reference']);
+
+    // The flag must not move when the OS op failed — the panel would then be
+    // claiming access the server never granted.
+    expect($this->su->fresh()->ssh_access)->toBe($before);
+});
+
+it('denies a viewer (no manage permission) from toggling ssh access', function () {
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'system_user', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/system-users/{$this->su->id}/ssh", ['ssh_access' => false])
+        ->assertForbidden();
+});
+
+it('returns a translated error with reference when a settings op fails', function () {
+    Process::fake(['*usermod*' => Process::result(output: '', errorOutput: 'nope', exitCode: 1)]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => true])
+        ->assertStatus(500)
+        ->assertJsonStructure(['message', 'reference']);
+
+    expect($this->su->fresh()->sudo)->toBeFalse();
+});
+
+it('denies a viewer (no manage permission) from changing settings', function () {
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'system_user', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/system-users/{$this->su->id}/sudo", ['sudo' => true])
+        ->assertForbidden();
+});
+
+it('refuses a password with a line break, and never runs chpasswd', function () {
+    // `Password123\nqa-bob:BobHijacked999` changed ANOTHER user's password on
+    // a real server (2026-09-23): chpasswd reads one account per line.
+    Process::fake();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/password", ['password' => "Password123\nroot:Hijacked999"])
+        ->assertUnprocessable()
+        ->assertJsonPath('errors.password.0', __('errors/system-user.password_control_characters'));
+
+    Process::assertNothingRan();
+    expect($this->su->fresh()->password)->toBeNull();
+});
+
+it('will not build a second chpasswd line even when validation is skipped', function () {
+    // The action is not only reachable from the FormRequest.
+    Process::fake();
+
+    expect(fn () => app(SetSystemUserPassword::class)->execute($this->su, "Password123\nroot:Hijacked999"))
+        ->toThrow(InvalidArgumentException::class);
+
+    Process::assertNotRan(fn ($p) => in_array('chpasswd', $p->command, true));
+});
+
+it('refuses a shell this server does not have installed', function () {
+    // usermod -s accepts a path that does not exist, and the user can then
+    // never log in — zsh on a stock Ubuntu, reproduced 2026-09-23.
+    Process::fake();
+    $this->app->instance(InstalledShells::class, new class extends InstalledShells
+    {
+        public function isInstalled(string $path): bool
+        {
+            return $path !== '/usr/bin/zsh';
+        }
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/system-users/{$this->su->id}/shell", ['shell' => '/usr/bin/zsh'])
+        ->assertUnprocessable()
+        ->assertJsonPath('errors.shell.0', __('errors/system-user.shell_not_installed', ['shell' => '/usr/bin/zsh']));
+
+    Process::assertNothingRan();
+    expect($this->su->fresh()->shell)->toBe('/bin/bash');
+});

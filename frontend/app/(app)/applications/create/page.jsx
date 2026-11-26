@@ -1,0 +1,135 @@
+import { getTranslations, getFormatter } from "next-intl/server";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import { getSiteTypes, getServerCapabilities } from "@/lib/applications/get-applications";
+import { getSystemUserOptions } from "@/lib/system-users/get-system-users";
+import { getGitAccounts } from "@/lib/git/get-git";
+import { getPhp } from "@/lib/php/get-php";
+import { getNode } from "@/lib/node/get-node";
+import { installedNodeVersions } from "@/lib/node/installed-node-versions";
+import { getTimezones } from "@/lib/settings/get-timezones";
+import { getEngines } from "@/lib/databases/get-databases";
+import { engineInstalling, noDatabaseEngine } from "@/lib/applications/database-readiness";
+import { withAvailability } from "@/lib/applications/blockers";
+import { withServableRenderingTypes } from "@/lib/applications/rendering-options";
+import { NoDatabaseEngineNotice } from "@/components/applications/no-database-engine-notice";
+import { CreateApplicationForm } from "@/components/applications/create-application-form";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PageHeader } from "@/components/ui/page-header";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata() {
+  const t = await getTranslations("applications");
+  return { title: t("createTitle") };
+}
+
+export default async function CreateApplicationPage({ searchParams }) {
+  const sp = await searchParams;
+  const initialDockerSource = ["search", "compose", "manual"].includes(sp?.mode) ? sp.mode : "search";
+  const [permissions, t, tEngines, format, types, systemUsers, accounts, php, node, capabilities, timezones, engines] = await Promise.all([
+    getPermissions(),
+    getTranslations("applications"),
+    getTranslations("databases.engines"),
+    getFormatter(),
+    getSiteTypes(),
+    getSystemUserOptions(),
+    getGitAccounts(),
+    getPhp(),
+    getNode(),
+    getServerCapabilities().catch(() => null),
+    getTimezones().catch(() => []),
+    getEngines().catch(() => ({ engines: [], failed: true })),
+  ]);
+
+  const phpVersions = (php.data?.versions ?? []).filter((version) => !version.status || version.status === "ready");
+  const nodeVersions = installedNodeVersions(node.data);
+
+  if (!can(permissions, "application", "manage")) {
+    return <PermissionDenied title={t("createTitle")} description={t("noPermission")} />;
+  }
+
+  if (types.failed) return <LoadFailed description={t("loadFailed")} status={types.status} failure={types.failure} message={types.message} debug={types.debug} />;
+
+  const siteTypes = withAvailability(
+    withServableRenderingTypes(types.siteTypes, capabilities?.servingProfiles),
+    {
+      runtimes: {
+        phpVersions,
+        nodeVersions,
+        phpInstallable: php.data?.installable ?? [],
+        nodeInstallable: node.data?.installable ?? [],
+        failed: php.failed || node.failed,
+      },
+      engines,
+    },
+    (block) => {
+      if (block.kind === "runtime") {
+        const key = block.suggest ? "install" : "none";
+        return t(`unavailableRuntime.${block.runtime}.${key}`, {
+          range: block.label,
+          installed: format.list(block.installed, { type: "conjunction" }),
+          suggest: block.suggest ?? "",
+        });
+      }
+
+      return t(`unavailableDatabase.${block.state}`, {
+        engines: format.list(
+          block.engines.map((engine) => (tEngines.has(engine) ? tEngines(engine) : engine)),
+          { type: "disjunction" },
+        ),
+      });
+    },
+  );
+
+  const prefillType = siteTypes.some((type) => type.name === sp?.type && type.available)
+    ? sp.type
+    : "";
+
+  const prefillGitAccount = (accounts.accounts ?? []).some(
+    (account) => String(account.id) === String(sp?.git_account),
+  )
+    ? String(sp.git_account)
+    : "";
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("createTitle")} />
+      <CreateApplicationForm
+        databaseNotice={
+          noDatabaseEngine(engines) ? <NoDatabaseEngineNotice installing={engineInstalling(engines)} /> : null
+        }
+        initialType={prefillType}
+        initialDockerSource={initialDockerSource}
+        initialName={prefillType === "docker" ? "" : prefillType}
+        siteTypes={siteTypes}
+        systemUsers={systemUsers.users}
+        systemUsersFailed={systemUsers.failed}
+        canCreateSystemUser={can(permissions, "system_user", "manage")}
+        initialGitAccountId={prefillGitAccount}
+        gitAccounts={accounts.accounts}
+        gitAccountsFailed={accounts.failed}
+        phpVersions={phpVersions}
+        phpDefaultVersion={php.data?.default ?? null}
+        phpVersionsFailed={php.failed}
+        nodeVersions={nodeVersions}
+        nodeDefaultVersion={node.data?.default ?? null}
+        nodeVersionsFailed={node.failed}
+        serverIp={capabilities?.serverIp ?? null}
+        temporaryDomainSuffixes={capabilities?.temporaryDomainSuffixes ?? []}
+        timezones={timezones ?? []}
+        engines={engines?.engines ?? []}
+        phpVersionsAll={php.data?.versions ?? []}
+        nodeVersionsAll={node.data?.versions ?? []}
+        phpInstallable={php.data?.installable ?? []}
+        nodeInstallable={node.data?.installable ?? []}
+        canInstall={{
+          php: can(permissions, "php", "manage"),
+          node: can(permissions, "node", "manage"),
+          database: can(permissions, "database", "manage"),
+        }}
+      />
+    </div>
+  );
+}

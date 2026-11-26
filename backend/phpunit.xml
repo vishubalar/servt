@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+>
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <!-- The encrypted cast (GitAccount::token, StorageDestination::access_key + secret_key,
+             Application::webhook_secret) needs a 32-byte key. A static, fixture-only key
+             used solely inside the test env means a leaked ciphertext from a test run cannot
+             decrypt any other row, anywhere. -->
+        <env name="APP_KEY" value="base64:oJWd0mTT0XuR0Wvpr1QBpOauWIc3ZvDL0VVjBpMYDvk="/>
+        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <env name="BCRYPT_ROUNDS" value="4"/>
+        <env name="BROADCAST_CONNECTION" value="null"/>
+        <env name="CACHE_STORE" value="array"/>
+        <env name="DB_CONNECTION" value="sqlite" force="true"/>
+        <env name="SERVER_BINARY_SEARCH_PATH" value=""/>
+        <env name="DB_DATABASE" value=":memory:" force="true"/>
+        <env name="DB_URL" value="" force="true"/>
+        <!-- force="true" sets getenv() and $_ENV only, and Laravel reads $_SERVER
+             first, where a shell variable already sits. Both, so no shell can
+             point a run at a real database (S-12; tests/Support/TestDatabaseGuard). -->
+        <server name="DB_CONNECTION" value="sqlite"/>
+        <server name="DB_DATABASE" value=":memory:"/>
+        <server name="DB_URL" value=""/>
+        <env name="MAIL_MAILER" value="array"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <!-- Feature tests assert on the exact command a feature runs. A sudo
+             prefix on every one of them would assert the prefix instead.
+             ServerOpsPrivilegeTest enables it and covers the prefixing. -->
+        <env name="SERVER_OPS_SUDO" value="false"/>
+        <!-- No test may call a real Central; BrandingTest sets central.url itself. -->
+        <env name="CENTRAL_URL" value=""/>
+        <!-- The host's own clock must never decide a test: ServerTimezone reads
+             /etc/localtime first (RC-1), so a test that sets only timezone_file
+             would otherwise read this machine's zone. Tests that need a link set
+             server.localtime_link themselves. -->
+        <env name="SERVER_LOCALTIME_LINK" value="/nonexistent/panel-test-localtime"/>
+        <!-- SshPort reads the main sshd_config after the drop-ins: never the host's own in a test. -->
+        <env name="SERVER_SSHD_CONFIG_FILE" value="/nonexistent/panel-test-sshd_config"/>
+        <!-- NginxDriver writes [::] listens only where this exists: a file every host has, so tests render the same configs on any host. -->
+        <env name="SERVER_IPV6_PROBE_FILE" value="/dev/null"/>
+        <!-- Off in tests: a cached probe would carry one test's fake server into the next request. ProbeCacheTest turns it on. -->
+        <env name="SERVER_PROBE_CACHE_SECONDS" value="0"/>
+        <env name="SERVER_APP_SHELL_SYNC" value="false"/>
+        <env name="SERVER_APP_SETTLE_SECONDS" value="0"/>
+        <env name="SV_AUTO_ISSUE_RETRY_SECONDS" value="0"/>
+        <!-- This machine's own certbot renewals must not decide whether a test
+             server "renews anything" (certificates:refresh-expiry). -->
+        <env name="SV_LETSENCRYPT_RENEWAL_DIR" value="/nonexistent/panel-test-letsencrypt-renewal"/>
+        <env name="PANEL_UPDATE_LAUNCH" value="false"/>
+        <!-- Creating a Docker site reads its image from the registry, which is
+             ON in production (DS-03). Off here so no create test reaches a real
+             registry; DockerCreateDefaultsTest turns it back on with the
+             inspector mocked. -->
+        <env name="DOCKER_INSPECT_ON_CREATE" value="false"/>
+        <!-- The readiness check after `compose up` (DS-03). No sleep between
+             tries, and with no interval it counts tries instead of watching the
+             clock, so a failing check is three instant tries. Tests about the
+             deadline set an interval and fake Sleep (ContainerReadinessTest). -->
+        <env name="DOCKER_READINESS_INTERVAL" value="0"/>
+        <env name="DOCKER_READINESS_TIMEOUT" value="3"/>
+        <!-- A version counts as installed only when its FPM binary is really
+             there, which is what stops a removed version lingering on the PHP
+             screen. Every suite that fakes `php_dir` invents versions this
+             machine does not have, and none of them are about detection, so
+             the check is pointed at a path that always exists. `{version}`
+             never appears in it, so it resolves the same for any version.
+             FpmPhpStackDetectionTest overrides this to assert the real rule. -->
+        <env name="SERVER_PHP_FPM_BINARY_PATTERN" value="/bin/sh"/>
+        <!-- The PHP screen's default reads /usr/local/bin/php before
+             update-alternatives. Off here, so a machine that happens to have
+             one cannot decide what the default-version tests see. -->
+        <env name="SERVER_PHP_PATH_LINK" value=""/>
+        <!-- Keep test runs out of the real operations log. Left alone the
+             suite appended ~570k lines to it. `single` (not daily) so a test
+             that reads the file knows its exact name. -->
+        <env name="LOG_SERVER_OPS_DRIVER" value="single"/>
+        <env name="LOG_SERVER_OPS_PATH" value="storage/framework/testing/server-ops.log"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <!-- Tests run on the localhost host; the real .env pins SESSION_DOMAIN
+             to the deployed parent domain, which wouldn't match here and
+             would break cookie-session auth assertions. -->
+        <env name="SESSION_DOMAIN" value="null"/>
+        <env name="FRONTEND_URL" value=""/>
+        <env name="SANCTUM_STATEFUL_DOMAINS" value="localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1"/>
+        <env name="PULSE_ENABLED" value="false"/>
+        <env name="TELESCOPE_ENABLED" value="false"/>
+        <env name="NIGHTWATCH_ENABLED" value="false"/>
+    </php>
+</phpunit>

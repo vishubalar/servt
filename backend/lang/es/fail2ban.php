@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'install_started' => 'Instalando fail2ban. Esto tarda un momento.',
+
+    'bantime' => [
+        '10m' => '10 minutos',
+        '1h' => '1 hora',
+        '1d' => '1 día',
+        '1w' => '1 semana',
+        'permanent' => 'Permanente',
+    ],
+
+    'created_successfully' => '¡Fail2ban configurado correctamente!',
+    'test_failed' => 'La prueba de configuración de Fail2ban falló.',
+    'rejected' => 'Fail2ban rechazó esta configuración, así que no se cambió nada.',
+    'already_disabled' => 'Fail2ban ya está desactivado para esta aplicación.',
+    'disabled_successfully' => '¡Fail2ban desactivado correctamente!',
+
+    'validation' => [
+        'jail_content_required' => 'La configuración de la jaula es obligatoria.',
+        'jail_content_string' => 'La configuración de la jaula debe ser texto.',
+        'jail_content_max' => 'La configuración de la jaula es demasiado grande (máx. 65535 caracteres).',
+        'filter_content_required' => 'La configuración del filtro es obligatoria.',
+        'filter_content_string' => 'La configuración del filtro debe ser texto.',
+        'filter_content_max' => 'La configuración del filtro es demasiado grande (máx. 65535 caracteres).',
+        'foreign_jail' => 'Este jail solo puede configurar el jail propio de esta aplicación. Sustituya [:section] por [{name}] (se convierte en :name).',
+        'foreign_filter' => 'Este jail solo puede usar el filtro propio de esta aplicación. Sustituya filter = :filter por filter = {filter} (se convierte en :name).',
+        'disallowed_setting' => 'El ajuste ":setting" no está permitido en la jaula de una aplicación. Permitidos: :allowed.',
+    ],
+    // FB-wp: the default filter is WordPress's.
+    'app_default_filter_wordpress_only' => 'Esta aplicación aún no tiene una regla de inicio de sesión, por lo que no se bloquea a nadie. Añada una regla para su página de inicio de sesión.',
+];

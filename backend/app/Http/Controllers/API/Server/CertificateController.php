@@ -1,0 +1,143 @@
+<?php
+
+namespace App\Http\Controllers\API\Server;
+
+use App\Actions\Server\Application\RemoveCertificate;
+use App\Actions\Server\Application\RequestCertificate;
+use App\Actions\Server\Application\SetForceHttps;
+use App\Actions\Server\Application\StartCertificateDryRun;
+use App\Actions\Server\Application\UploadCertificate;
+use App\Enums\CertificateType;
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Server\Application\StoreCertificateRequest;
+use App\Http\Requests\Server\Application\UpdateForceHttpsRequest;
+use App\Http\Resources\CertificateDryRunResource;
+use App\Http\Resources\CertificateResource;
+use App\Models\Application;
+use App\Services\Server\Certificates\CertificateDryRunStore;
+use App\Services\Server\Certificates\CertificateLock;
+use App\Services\Server\Certificates\CertificateOptions;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
+
+class CertificateController extends Controller
+{
+    /**
+     * `null` rather than a 404 when there is no certificate: that is a normal state, not an error.
+     */
+    public function show(Application $application, CertificateOptions $options): JsonResponse
+    {
+        $certificate = $application->certificate;
+
+        return response()->json([
+            'certificate' => $certificate === null
+                ? null
+                : CertificateResource::make($certificate)->resolve(),
+            // What this site can actually be given, so the screen offers only options that
+            // work (a test or internal domain can always take a self-signed certificate).
+            'available_types' => $options->for($application),
+        ]);
+    }
+
+    /**
+     * Issuing is queued and returns 202; uploading is synchronous and returns 201. ACME
+     * needs a round trip back to this box and outlasts the request; writing two files
+     * does not.
+     */
+    public function store(Application $application, StoreCertificateRequest $request, RequestCertificate $issue, UploadCertificate $upload, CertificateLock $certificates): JsonResponse
+    {
+        $type = CertificateType::from($request->validated('type'));
+
+        if ($type === CertificateType::Custom) {
+            // Takes turns with an issuance in progress (CertificateLock): the upload revokes
+            // the site's Let's Encrypt lineage.
+            $lock = $certificates->forChange($application);
+
+            try {
+                $certificate = $upload->execute($application->refresh(), $request->validated());
+            } finally {
+                $lock->release();
+            }
+
+            return response()->json([
+                'certificate' => CertificateResource::make($certificate)->resolve(),
+            ], 201);
+        }
+
+        return response()->json([
+            'certificate' => CertificateResource::make(
+                $issue->execute($application, $type, (bool) $request->validated('force', false))
+            )->resolve(),
+        ], 202);
+    }
+
+    /**
+     * Rehearse an issuance. 202 and a queued job, like `store()`: the second half is a
+     * round trip to Let's Encrypt's staging server.
+     *
+     * @throws ValidationException
+     */
+    public function dryRun(Application $application, StartCertificateDryRun $action): JsonResponse
+    {
+        return response()->json([
+            'dry_run' => CertificateDryRunResource::make($action->execute($application))->resolve(),
+        ], 202);
+    }
+
+    /**
+     * Polled while the run is in flight. `null` rather than a 404 when there has never
+     * been one: that is a normal state, not an error.
+     */
+    public function dryRunStatus(Application $application, CertificateDryRunStore $store): JsonResponse
+    {
+        $state = $store->get($application->id);
+
+        return response()->json([
+            'dry_run' => $state === null
+                ? null
+                : CertificateDryRunResource::make($state)->resolve(),
+        ]);
+    }
+
+    /**
+     * @throws ValidationException
+     */
+    public function forceHttps(Application $application, UpdateForceHttpsRequest $request, SetForceHttps $action): JsonResponse
+    {
+        $validated = $request->validated();
+
+        $certificate = $application->certificate;
+
+        if ($certificate === null) {
+            throw ValidationException::withMessages([
+                'force_https' => [__('errors/certificate.force_https_without_certificate')],
+            ]);
+        }
+
+        return response()->json([
+            'certificate' => CertificateResource::make(
+                $action->execute($certificate, (bool) $validated['force_https'])
+            )->resolve(),
+        ]);
+    }
+
+    public function destroy(Application $application, RemoveCertificate $action, CertificateLock $certificates): JsonResponse
+    {
+        // Same lock as the upload; read the certificate only once it is held, so an issuance
+        // that just finished is the one removed.
+        $lock = $certificates->forChange($application);
+
+        try {
+            $certificate = $application->refresh()->certificate;
+
+            if ($certificate !== null) {
+                $action->execute($certificate);
+            }
+        } finally {
+            $lock->release();
+        }
+
+        return response()->json(null, 204);
+    }
+}

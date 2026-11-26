@@ -1,0 +1,19 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+import { useIsTablet } from "@/hooks/use-mobile";
+import { useSidebar } from "@/components/ui/sidebar";
+
+export function SidebarAutoCollapse() {
+  const isTablet = useIsTablet();
+  const { setOpen } = useSidebar();
+  const previous = useRef(null);
+
+  useEffect(() => {
+    if (previous.current === isTablet) return;
+    previous.current = isTablet;
+    setOpen(!isTablet);
+  }, [isTablet, setOpen]);
+
+  return null;
+}

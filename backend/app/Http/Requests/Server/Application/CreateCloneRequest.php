@@ -1,0 +1,57 @@
+<?php
+
+namespace App\Http\Requests\Server\Application;
+
+use App\Enums\CloneStatus;
+use App\Rules\Hostname;
+use App\Rules\NotPanelHost;
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
+
+class CreateCloneRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return $this->user()?->canManage('app_clone') ?? false;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function rules(): array
+    {
+        return [
+            // `applications.name` is unique, so without this a name already in
+            // use reaches the database and surfaces as a 500 rather than as
+            // the field error it is.
+            'name' => ['sometimes', 'string', 'max:255', Rule::unique('applications', 'name')],
+            'domain' => [
+                'required', 'string', 'max:255',
+                new Hostname,
+                Rule::unique('applications', 'domain'),
+                // A staging or clone gets a domains row as its primary, and that
+                // table's unique index covers every alias on the server too — an
+                // alias of another site passed the check above and then failed
+                // on insert.
+                Rule::unique('application_domains', 'domain'),
+                // A clone still being made has no application row yet, so its
+                // domain passed both checks above and was accepted twice
+                // (CL-B1).
+                Rule::unique('clones', 'domain')->where(fn ($query) => $query->whereIn('status', [CloneStatus::Pending->value, CloneStatus::Running->value])),
+                new NotPanelHost,
+            ],
+        ];
+    }
+
+    protected function prepareForValidation(): void
+    {
+        if ($this->has('domain')) {
+            $this->merge(['domain' => strtolower(trim((string) $this->input('domain')))]);
+        }
+    }
+
+    public function domain(): string
+    {
+        return (string) $this->validated('domain');
+    }
+}

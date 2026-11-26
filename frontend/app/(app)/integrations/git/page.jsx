@@ -1,0 +1,44 @@
+import { getTranslations } from "next-intl/server";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import { getGitAccounts, getGitProviders } from "@/lib/git/get-git";
+import { AccountsCard } from "@/components/integrations/git/accounts-card";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PageHeader } from "@/components/ui/page-header";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata() {
+  const t = await getTranslations("git");
+  return { title: t("title") };
+}
+
+export default async function GitIntegrationsPage() {
+  const [permissions, t, list, providerList] = await Promise.all([
+    getPermissions(),
+    getTranslations("git"),
+    getGitAccounts(),
+    getGitProviders(),
+  ]);
+
+  if (!can(permissions, "git", "view")) return <PermissionDenied title={t("title")} />;
+  const canManage = can(permissions, "git", "manage");
+
+  if (list.failed) return <LoadFailed description={t("loadFailed")} status={list.status} failure={list.failure} message={list.message} debug={list.debug} />;
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("title")} />
+
+      <div >
+        <AccountsCard
+          accounts={list.accounts}
+          providers={providerList.providers}
+          providersFailed={providerList.failed}
+          canManage={canManage}
+        />
+      </div>
+    </div>
+  );
+}

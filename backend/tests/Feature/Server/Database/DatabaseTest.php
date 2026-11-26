@@ -1,0 +1,1290 @@
+<?php
+
+use App\Actions\Server\Database\ExportDatabase;
+use App\Contracts\DatabaseEngine;
+use App\Contracts\Firewall;
+use App\Enums\ExportStatus;
+use App\Exceptions\Server\Database\DatabaseOperationException;
+use App\Jobs\InstallDatabaseEngine;
+use App\Jobs\RunDatabaseExport;
+use App\Models\Database;
+use App\Models\DatabaseConnection;
+use App\Models\DatabaseExport;
+use App\Models\DatabaseUser;
+use App\Models\DbMetric;
+use App\Models\FirewallRule;
+use App\Models\User;
+use App\Services\Server\Databases\DatabaseIdentifier;
+use App\Services\Server\Databases\DatabaseManager;
+use App\Services\Server\Databases\MongoEngine;
+use App\Services\Server\Databases\SqlEngine;
+use App\Services\Server\ServerOps;
+use App\Services\Server\ServerOpsResult;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+    config(['server.databases.auth_file_dir' => sys_get_temp_dir()]);
+});
+
+/** Fake the DB clients + ufw. SQL is branched on the stdin the engine pipes. */
+function fakeDb(): void
+{
+    Process::fake(function ($process) {
+        $cmd = $process->command;
+        $bin = $cmd[0] ?? '';
+        $sql = (string) ($process->input ?? '');
+
+        if (in_array($bin, ['mysql', 'mariadb'], true)) {
+            return match (true) {
+                str_contains($sql, 'VERSION()') => Process::result(output: '8.0.36'),
+                str_contains($sql, 'SHOW DATABASES') => Process::result(output: "app_db\nother_db\ninformation_schema\nmysql\n"),
+                str_contains($sql, 'information_schema.PROCESSLIST') => Process::result(output: "12\troot\tlocalhost\tshop\tQuery\t3\texecuting\tSELECT 1\n"),
+                str_contains($sql, "LIKE 'max_connections'") => Process::result(output: "max_connections\t151"),
+                str_contains($sql, 'SHOW GLOBAL STATUS') => Process::result(output: "Threads_connected\t5\nThreads_running\t1\nQueries\t1000\nSlow_queries\t2\nUptime\t3600"),
+                str_contains($sql, 'SELECT table_name') => Process::result(output: "users\t42\t8192\nposts\t10\t4096"),
+                // information_schema.schemata (what a database was created with). Must come before
+                // the COALESCE size query, which also selects from information_schema.
+                str_contains($sql, 'default_character_set_name') => Process::result(output: "utf8mb4\tutf8mb4_uca1400_ai_ci"),
+                str_contains($sql, 'SELECT COALESCE') => Process::result(output: '1048576'),
+                str_contains($sql, 'SELECT 1') => Process::result(output: '1'),
+                default => Process::result(exitCode: 0), // CREATE/DROP/ALTER/GRANT/RENAME/OPTIMIZE/REPAIR/KILL
+            };
+        }
+        if ($bin === 'mongosh') {
+            return Process::result(output: '1');
+        }
+        if ($bin === 'ufw') {
+            return Process::result(output: "Status: inactive\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function dbAuth(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+it('names generic SQL and MongoDB client operations in the server log', function (string $engine, string $class) {
+    $connection = new DatabaseConnection([
+        'engine' => $engine,
+        'connection_type' => 'tcp',
+        'host' => '127.0.0.1',
+        'port' => $engine === 'mongodb' ? 27017 : 3306,
+        'username' => 'panel',
+        'password' => 'secret',
+        'options' => [],
+    ]);
+
+    $ops = Mockery::mock(ServerOps::class);
+    $ops->shouldReceive('run')->once()->withArgs(
+        fn (array $command, array $context): bool => $context['feature'] === 'database'
+            && $context['engine'] === $engine
+            && $context['op'] === 'query',
+    )->andReturn(new ServerOpsResult(true, 'query-reference', null));
+    // MongoDB looks for its client first.
+    $ops->shouldReceive('probe')->andReturn(new ServerOpsResult(true, 'probe-reference', null));
+
+    expect((new $class($connection, $ops))->available())->toBeTrue();
+})->with([
+    'SQL' => ['mysql', SqlEngine::class],
+    'MongoDB' => ['mongodb', MongoEngine::class],
+]);
+
+it('checks the live SQL server before approving a generated identifier', function () {
+    Process::fake(fn () => Process::result(output: '0'));
+
+    $connection = new DatabaseConnection([
+        'engine' => 'mysql',
+        'connection_type' => 'tcp',
+        'host' => '127.0.0.1',
+        'port' => 3306,
+        'username' => 'panel',
+        'password' => 'secret',
+    ]);
+
+    $engine = new SqlEngine($connection, app(ServerOps::class));
+
+    expect($engine->identifierAvailable('clone_shop_abc123'))->toBeFalse();
+
+    Process::assertRan(fn ($process) => str_contains((string) $process->input, "schema_name = 'clone_shop_abc123'")
+        && str_contains((string) $process->input, "user = 'clone_shop_abc123'"));
+});
+
+it('refuses to approve an identifier when the live check cannot be completed', function () {
+    Process::fake(fn () => Process::result(exitCode: 1, errorOutput: 'unreachable'));
+
+    $connection = new DatabaseConnection([
+        'engine' => 'mysql',
+        'connection_type' => 'tcp',
+        'host' => '127.0.0.1',
+        'port' => 3306,
+        'username' => 'panel',
+        'password' => 'secret',
+    ]);
+
+    $engine = new SqlEngine($connection, app(ServerOps::class));
+
+    expect(fn () => $engine->identifierAvailable('clone_shop_abc123'))
+        ->toThrow(DatabaseOperationException::class);
+});
+
+it('regenerates an automatic identifier when the panel or live server already uses it', function () {
+    Database::create(['name' => 'clone_shop_aaaaaa', 'engine' => 'mysql']);
+
+    $engine = Mockery::mock(DatabaseEngine::class);
+    $engine->shouldReceive('identifierAvailable')->once()->with('clone_shop_bbbbbb')->andReturnFalse();
+    $engine->shouldReceive('identifierAvailable')->once()->with('clone_shop_cccccc')->andReturnTrue();
+
+    $manager = Mockery::mock(DatabaseManager::class);
+    $manager->shouldReceive('engine')->once()->with('mysql')->andReturn($engine);
+
+    $suffixes = ['aaaaaa', 'bbbbbb', 'cccccc'];
+    Str::createRandomStringsUsing(function (int $length) use (&$suffixes): string {
+        return array_shift($suffixes) ?? str_repeat('z', $length);
+    });
+
+    try {
+        $identifier = (new DatabaseIdentifier($manager))->generateAvailable('Shop', 'mysql', 'clone');
+    } finally {
+        Str::createRandomStringsNormally();
+    }
+
+    expect($identifier)->toBe('clone_shop_cccccc');
+});
+
+it('lists engine capabilities with live version', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/engines')->assertOk()
+        ->assertJsonPath('engines.0.engine', 'mysql')
+        ->assertJsonPath('engines.0.running', true)
+        ->assertJsonPath('engines.0.version', '8.0.36');
+});
+
+it('creates a database', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
+    ])->assertStatus(201)
+        ->assertJsonPath('database.name', 'shop')
+        ->assertJsonPath('database.engine', 'mysql');
+
+    expect(Database::where('name', 'shop')->exists())->toBeTrue();
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'created']);
+});
+
+it('refuses a charset the chosen engine has never heard of', function () {
+    fakeDb();
+
+    // `utf8mb4` is a MySQL charset: validation is per engine, so MongoDB (no such concept)
+    // must not store it.
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mongodb', 'charset' => 'utf8mb4',
+    ])->assertStatus(422)->assertJsonValidationErrors('charset');
+
+    expect(Database::where('name', 'shop')->exists())->toBeFalse();
+});
+
+it('still accepts that charset on the engine it belongs to', function () {
+    // The other half of the rule above: engine-scoped must not block every charset.
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop2', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_bin',
+    ])->assertStatus(201);
+});
+
+it('creates a database with a user and returns its connection string', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mysql',
+        'create_user' => ['username' => 'shop_user', 'password' => 'S3cretPass99', 'connection_preference' => 'localhost'],
+    ])->assertStatus(201)
+        ->assertJsonPath('database.users.0.username', 'shop_user')
+        ->assertJsonPath('database.users.0.password', 'S3cretPass99')
+        ->assertJsonPath('database.users.0.connection_string', 'mysql://shop_user:S3cretPass99@127.0.0.1:3306/shop');
+});
+
+it('rolls back a new database when its requested initial user cannot be created', function () {
+    Process::fake(function ($process) {
+        $sql = (string) ($process->input ?? '');
+
+        return match (true) {
+            // A running engine: creating on one that does not answer is a 422 before any SQL
+            // (DatabaseEngineNotRunningTest).
+            str_contains($sql, 'VERSION()') => Process::result(output: '8.0.36'),
+            str_contains($sql, 'CREATE USER') => Process::result(exitCode: 1, errorOutput: 'user create failed'),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mysql',
+        'create_user' => ['username' => 'shop_user', 'password' => 'S3cretPass99'],
+    ])->assertStatus(500);
+
+    expect(Database::where('name', 'shop')->exists())->toBeFalse();
+    Process::assertRan(fn ($p) => str_contains((string) ($p->input ?? ''), 'DROP DATABASE IF EXISTS'));
+});
+
+it('generates a password when none is given', function () {
+    fakeDb();
+
+    $res = test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mysql',
+        'create_user' => ['username' => 'shop_user', 'connection_preference' => 'localhost'],
+    ])->assertStatus(201);
+
+    expect(strlen((string) $res->json('database.users.0.password')))->toBeGreaterThanOrEqual(16);
+});
+
+it('rejects a system schema name', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', ['name' => 'mysql', 'engine' => 'mysql'])
+        ->assertStatus(422)->assertJsonValidationErrorFor('name');
+});
+
+it('rejects an invalid database name', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', ['name' => 'bad name!', 'engine' => 'mysql'])
+        ->assertStatus(422)->assertJsonValidationErrorFor('name');
+});
+
+it('rejects a collation that does not match the charset', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'latin1_swedish_ci',
+    ])->assertStatus(422)->assertJsonValidationErrorFor('collation');
+});
+
+it('adds a user to an existing database', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/users", [
+        'username' => 'later_user', 'password' => 'AnotherPass88', 'connection_preference' => 'remote', 'host' => '10.0.0.5',
+    ])->assertStatus(201)
+        ->assertJsonPath('user.username', 'later_user')
+        ->assertJsonPath('user.host', '10.0.0.5');
+
+    expect(DatabaseUser::where('username', 'later_user')->first()->connection_preference)->toBe('remote');
+});
+
+it('refuses a username that already exists instead of failing with a 500 (bug #36)', function () {
+    $sqls = new ArrayObject;
+    Process::fake(function ($process) use ($sqls) {
+        $sql = (string) ($process->input ?? '');
+        $sqls[] = $sql;
+
+        return str_contains($sql, 'FROM mysql.user WHERE user')
+            ? Process::result(output: 'user_exists')
+            : Process::result(output: '1');
+    });
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    // An existing account must give a clear 422, not a generic "operation failed" reference.
+    test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/users", [
+        'username' => 'shop_user', 'password' => 'AnotherPass88', 'connection_preference' => 'localhost',
+    ])->assertStatus(422)
+        ->assertJsonPath('errors.username.0', __('errors/database.user_exists', ['username' => 'shop_user']));
+
+    expect(collect($sqls)->contains(fn (string $q) => str_contains($q, 'CREATE USER')))->toBeFalse()
+        ->and(DatabaseUser::where('username', 'shop_user')->exists())->toBeFalse();
+});
+
+it('refuses a taken first-user name before making the new database', function () {
+    $sqls = new ArrayObject;
+    Process::fake(function ($process) use ($sqls) {
+        $sql = (string) ($process->input ?? '');
+        $sqls[] = $sql;
+
+        return str_contains($sql, 'FROM mysql.user WHERE user')
+            ? Process::result(output: 'user_exists')
+            : Process::result(output: '1');
+    });
+
+    // The check runs before creating: otherwise the database is made, logged and dropped again.
+    test()->withHeaders(dbAuth())->postJson('/api/databases', [
+        'name' => 'shop', 'engine' => 'mysql',
+        'create_user' => ['username' => 'shop_user', 'password' => 'S3cretPass99'],
+    ])->assertStatus(422)
+        ->assertJsonValidationErrors(['create_user.username' => __('errors/database.user_exists', ['username' => 'shop_user'])]);
+
+    expect(collect($sqls)->contains(fn (string $q) => str_contains($q, 'CREATE DATABASE')))->toBeFalse()
+        ->and(Database::where('name', 'shop')->exists())->toBeFalse();
+});
+
+it('removes an engine user when remote firewall setup fails', function () {
+    fakeDb();
+    app()->instance(Firewall::class, new class implements Firewall
+    {
+        public function status(): array
+        {
+            return ['enabled' => true, 'default_policy' => ['incoming' => 'deny', 'outgoing' => 'allow']];
+        }
+
+        public function apply(FirewallRule $rule): ServerOpsResult
+        {
+            return new ServerOpsResult(false, 'firewall-failed', null);
+        }
+
+        public function remove(FirewallRule $rule): ServerOpsResult
+        {
+            return new ServerOpsResult(true, 'unused', null);
+        }
+
+        public function enable(): ServerOpsResult
+        {
+            return new ServerOpsResult(true, 'unused', null);
+        }
+
+        public function disable(): ServerOpsResult
+        {
+            return new ServerOpsResult(true, 'unused', null);
+        }
+    });
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/users", [
+        'username' => 'remote_user', 'password' => 'AnotherPass88',
+        'connection_preference' => 'remote', 'host' => '10.0.0.5',
+    ])->assertStatus(500);
+
+    expect(DatabaseUser::where('username', 'remote_user')->exists())->toBeFalse();
+    Process::assertRan(fn ($p) => str_contains((string) ($p->input ?? ''), 'CREATE USER'));
+    Process::assertRan(fn ($p) => str_contains((string) ($p->input ?? ''), 'DROP USER'));
+});
+
+it('rejects a system database username', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/users", [
+        'username' => 'root', 'connection_preference' => 'localhost',
+    ])->assertStatus(422)->assertJsonValidationErrorFor('username');
+});
+
+it('changes a database user password', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $user = $db->users()->create(['username' => 'u', 'password' => 'old', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->putJson("/api/databases/{$db->id}/users/{$user->id}/password", ['password' => 'BrandNewPass77'])
+        ->assertOk();
+
+    expect($user->fresh()->password)->toBe('BrandNewPass77');
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'password_reset']);
+});
+
+it('deletes a database user', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $user = $db->users()->create(['username' => 'u', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}/users/{$user->id}")->assertNoContent();
+
+    expect(DatabaseUser::find($user->id))->toBeNull();
+});
+
+it('deletes a database and cascades its users', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $db->users()->create(['username' => 'u', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertNoContent();
+
+    expect(Database::find($db->id))->toBeNull();
+    expect(DatabaseUser::where('database_id', $db->id)->count())->toBe(0);
+});
+
+it('keeps users and the panel record when dropping the database fails', function () {
+    Process::fake(function ($process) {
+        $sql = (string) ($process->input ?? '');
+
+        return str_contains($sql, 'DROP DATABASE IF EXISTS')
+            ? Process::result(exitCode: 1, errorOutput: 'drop failed')
+            : Process::result(exitCode: 0);
+    });
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $user = $db->users()->create(['username' => 'u', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertStatus(500);
+
+    expect(Database::find($db->id))->not->toBeNull();
+    expect(DatabaseUser::find($user->id))->not->toBeNull();
+    Process::assertNotRan(fn ($process) => str_contains((string) ($process->input ?? ''), 'DROP USER'));
+});
+
+it('can retry cleanup after the database was dropped but a user cleanup failed', function () {
+    $dropUserFails = true;
+    Process::fake(function ($process) use (&$dropUserFails) {
+        $sql = (string) ($process->input ?? '');
+
+        if (str_contains($sql, 'DROP USER') && $dropUserFails) {
+            return Process::result(exitCode: 1, errorOutput: 'user drop failed');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $db->users()->create(['username' => 'u', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertStatus(500);
+    expect(Database::find($db->id))->not->toBeNull();
+
+    $dropUserFails = false;
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertNoContent();
+
+    expect(Database::find($db->id))->toBeNull();
+});
+
+it('deletes a PostgreSQL database whose role cleanup would have needed it', function () {
+    // psql behaves like a real cluster: once the database is gone, any connection aimed at it
+    // fails, so role cleanup must not run inside the dropped database.
+    $dropped = false;
+    Process::fake(function ($process) use (&$dropped) {
+        $cmd = implode(' ', (array) $process->command);
+        $sql = (string) ($process->input ?? '');
+
+        if (str_contains($sql, 'DROP DATABASE')) {
+            $dropped = true;
+        }
+
+        if ($dropped && str_contains($cmd, '--dbname=shop_db')) {
+            return Process::result(exitCode: 2, errorOutput: 'FATAL: database "shop_db" does not exist');
+        }
+
+        return Process::result(output: '1');
+    });
+
+    $db = Database::create(['name' => 'shop_db', 'engine' => 'postgresql']);
+    $user = $db->users()->create(['username' => 'shop_user', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertNoContent();
+
+    expect(Database::find($db->id))->toBeNull()
+        ->and(DatabaseUser::find($user->id))->toBeNull();
+});
+
+it('clears a PostgreSQL row stranded by the old delete, on a plain retry', function () {
+    // The real database is already gone and only the panel row survives. No repair endpoint is
+    // needed: DROP DATABASE/ROLE IF EXISTS succeed against nothing, so deleting again clears it.
+    Process::fake(function ($process) {
+        $cmd = implode(' ', (array) $process->command);
+
+        return str_contains($cmd, '--dbname=pgverify_tmp')
+            ? Process::result(exitCode: 2, errorOutput: 'FATAL: database "pgverify_tmp" does not exist')
+            : Process::result(output: '1');
+    });
+
+    $db = Database::create(['name' => 'pgverify_tmp', 'engine' => 'postgresql']);
+    $db->users()->create(['username' => 'pgverify_tmp', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertNoContent();
+
+    expect(Database::find($db->id))->toBeNull();
+});
+
+it('lists untracked server databases', function () {
+    fakeDb();
+    Database::create(['name' => 'app_db', 'engine' => 'mysql']); // tracked
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/untracked?engine=mysql')->assertOk()
+        ->assertJsonPath('untracked', ['other_db']); // app_db tracked, system schemas filtered
+});
+
+it('adopts untracked databases without dropping anything', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases/adopt', ['engine' => 'mysql', 'names' => ['other_db']])
+        ->assertStatus(201)->assertJsonPath('databases.0.name', 'other_db');
+
+    expect(Database::where('name', 'other_db')->exists())->toBeTrue();
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'imported']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| What an adopted database was created with
+|--------------------------------------------------------------------------
+|
+| The panel records charset and collation when it creates a database, so one it adopts from
+| another panel must have them read back from the engine instead of showing a blank charset.
+*/
+
+it('records the charset an adopted database already had', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases/adopt', ['engine' => 'mysql', 'names' => ['other_db']])
+        ->assertStatus(201)
+        ->assertJsonPath('databases.0.charset', 'utf8mb4')
+        ->assertJsonPath('databases.0.collation', 'utf8mb4_uca1400_ai_ci');
+
+    expect(Database::where('name', 'other_db')->first())
+        ->charset->toBe('utf8mb4')
+        ->collation->toBe('utf8mb4_uca1400_ai_ci');
+});
+
+it('leaves the charset null when the engine cannot say', function () {
+    // MongoDB has no database-level charset (BSON is UTF-8; a collation belongs to an index or
+    // query). Null, not an invented "UTF8": the field means "what this was created with".
+    fakeDb();
+
+    expect(app(DatabaseManager::class)->engine('mongodb')->describeDatabase('anything'))
+        ->toBe(['charset' => null, 'collation' => null]);
+});
+
+it('saves and tests a connection', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->putJson('/api/databases/connections/mysql', [
+        'connection_type' => 'tcp', 'host' => '127.0.0.1', 'port' => 3306, 'username' => 'root', 'test' => true,
+    ])->assertOk()
+        ->assertJsonPath('mysql.host', '127.0.0.1')
+        ->assertJsonPath('mysql.has_password', false)
+        ->assertJsonPath('mysql.reachable', true);
+});
+
+it('denies a viewer without manage from creating a database', function () {
+    fakeDb();
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'database', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    test()->withHeaders(['Authorization' => "Bearer {$token}"])
+        ->postJson('/api/databases', ['name' => 'shop', 'engine' => 'mysql'])
+        ->assertForbidden();
+});
+
+// ---- P2: edit user, monitoring, maintenance ----
+
+it('renames a database user and can change host + password in one call', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $user = $db->users()->create(['username' => 'old_u', 'password' => 'oldpw', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->patchJson("/api/databases/{$db->id}/users/{$user->id}", [
+        'username' => 'new_u', 'connection_preference' => 'remote', 'host' => '10.0.0.9', 'password' => 'BrandNewPass55',
+    ])->assertOk()
+        ->assertJsonPath('user.username', 'new_u')
+        ->assertJsonPath('user.host', '10.0.0.9');
+
+    Process::assertRan(fn ($p) => str_contains((string) ($p->input ?? ''), "RENAME USER 'old_u'@'localhost' TO 'new_u'@'10.0.0.9'"));
+    $fresh = $user->fresh();
+    expect($fresh->connection_preference)->toBe('remote');
+    expect($fresh->password)->toBe('BrandNewPass55');
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'user_updated']);
+});
+
+it('lists database processes for an engine', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/processes?engine=mysql')->assertOk()
+        ->assertJsonPath('processes.0.id', '12')
+        ->assertJsonPath('processes.0.command', 'Query')
+        ->assertJsonPath('processes.0.time', 3);
+});
+
+it('answers 422 naming engine, not 404, when a per-engine endpoint has no or an unknown engine', function (string $method, string $url) {
+    fakeDb();
+
+    foreach (['', '?engine=oracle'] as $query) {
+        test()->withHeaders(dbAuth())->json($method, $url.$query)
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('engine');
+    }
+
+    Process::assertNothingRan();
+})->with([
+    'processes' => ['GET', '/api/databases/processes'],
+    'kill' => ['DELETE', '/api/databases/processes/12'],
+    'untracked' => ['GET', '/api/databases/untracked'],
+    'history' => ['GET', '/api/databases/metrics/history'],
+]);
+
+it('records the charset the engine picked when none was asked for', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', ['name' => 'nocharset', 'engine' => 'mysql'])
+        ->assertCreated()
+        ->assertJsonPath('database.charset', 'utf8mb4')
+        ->assertJsonPath('database.collation', 'utf8mb4_uca1400_ai_ci');
+});
+
+it('keeps an asked-for charset rather than asking the engine', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases', ['name' => 'latin', 'engine' => 'mysql', 'charset' => 'latin1', 'collation' => 'latin1_swedish_ci'])
+        ->assertCreated()
+        ->assertJsonPath('database.charset', 'latin1')
+        ->assertJsonPath('database.collation', 'latin1_swedish_ci');
+
+    Process::assertDidntRun(fn ($p) => str_contains((string) ($p->input ?? ''), 'default_character_set_name'));
+});
+
+it('kills a database process (guarded) and logs it', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->deleteJson('/api/databases/processes/12?engine=mysql')->assertNoContent();
+
+    Process::assertRan(fn ($p) => str_contains((string) ($p->input ?? ''), 'KILL 12'));
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'process_killed']);
+});
+
+it('returns an engine health status', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/status/mysql')->assertOk()
+        ->assertJsonPath('status.connections', 5)
+        ->assertJsonPath('status.max_connections', 151)
+        ->assertJsonPath('status.queries', 1000)
+        ->assertJsonPath('status.slow_queries', 2)
+        ->assertJsonPath('status.uptime_seconds', 3600);
+});
+
+it('lists tables in a database with rows and size', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}/tables")->assertOk()
+        ->assertJsonPath('tables.0.name', 'users')
+        ->assertJsonPath('tables.0.rows', 42)
+        ->assertJsonPath('tables.0.size_bytes', 8192);
+});
+
+it('says the engine is not answering rather than listing no tables (FS-C12)', function () {
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    Process::fake(fn () => Process::result(errorOutput: "ERROR 2002 (HY000): Can't connect to local server\n", exitCode: 1));
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}/tables")
+        ->assertStatus(503)
+        ->assertJsonPath('reason', 'engine_unreachable');
+});
+
+it('still lists no tables for an empty database on a running engine', function () {
+    $db = Database::create(['name' => 'empty', 'engine' => 'mysql']);
+    Process::fake(fn ($process) => str_contains((string) $process->input, 'SELECT table_name')
+        ? Process::result(output: '')
+        : Process::result(output: "8.0.36\n"));
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}/tables")
+        ->assertOk()
+        ->assertJsonPath('tables', []);
+});
+
+it('no longer offers to optimize or repair', function () {
+    // The endpoints are removed, not just unlinked. On InnoDB `REPAIR TABLE` reports success
+    // having done nothing, and `OPTIMIZE TABLE` is a whole-table rebuild inside the request.
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    foreach (['optimize', 'repair'] as $action) {
+        test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/{$action}")->assertNotFound();
+    }
+
+    Process::assertNotRan(fn ($p) => str_contains((string) ($p->input ?? ''), 'OPTIMIZE TABLE')
+        || str_contains((string) ($p->input ?? ''), 'REPAIR TABLE'));
+});
+
+it('returns the QPS history from db_metrics', function () {
+    Carbon::setTestNow(Carbon::parse('2026-07-28 12:00:00'));
+    DbMetric::create(['engine' => 'mysql', 'queries' => 1000, 'connections' => 3, 'threads_running' => 1, 'sampled_at' => Carbon::parse('2026-07-28 11:50:00')]);
+    DbMetric::create(['engine' => 'mysql', 'queries' => 4000, 'connections' => 4, 'threads_running' => 2, 'sampled_at' => Carbon::parse('2026-07-28 11:55:00')]); // +3000 over 300s = 10 qps
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/metrics/history?engine=mysql')->assertOk()
+        ->assertJsonPath('metrics.0.qps', 0)   // first sample: no delta
+        ->assertJsonPath('metrics.1.qps', 10); // 3000/300s
+
+    Carbon::setTestNow();
+});
+
+it('samples db metrics into the table and prunes old rows', function () {
+    Carbon::setTestNow(Carbon::parse('2026-07-28 12:00:00'));
+    DbMetric::create(['engine' => 'mysql', 'queries' => 1, 'connections' => 1, 'threads_running' => 0, 'sampled_at' => Carbon::parse('2026-07-26 12:00:00')]); // >24h old
+    fakeMetricsServer(['mysql-server']);
+
+    test()->artisan('db:sample-metrics')->assertExitCode(0);
+
+    // old row pruned; a fresh row added for the installed, reachable engine.
+    expect(DbMetric::where('sampled_at', '<', Carbon::parse('2026-07-27 12:00:00'))->count())->toBe(0);
+    expect(DbMetric::where('engine', 'mysql')->where('queries', 1000)->exists())->toBeTrue();
+
+    Carbon::setTestNow();
+});
+
+/**
+ * fakeDb(), plus a dpkg that reports exactly these server packages installed. SQL client
+ * calls are recorded by binary, so a test can see which engines were probed.
+ *
+ * @param  array<int, string>  $packages
+ */
+function fakeMetricsServer(array $packages): ArrayObject
+{
+    $probes = new ArrayObject;
+
+    Process::fake(function ($process) use ($packages, $probes) {
+        $cmd = $process->command;
+
+        if (($cmd[0] ?? '') === 'dpkg-query') {
+            return in_array(end($cmd), $packages, true)
+                ? Process::result(output: 'install ok installed')
+                : Process::result(exitCode: 1, errorOutput: 'dpkg-query: no packages found');
+        }
+
+        if (in_array($cmd[0] ?? '', ['mysql', 'mariadb', 'psql', 'mongosh'], true)) {
+            $probes[] = $cmd[0];
+        }
+
+        $sql = (string) ($process->input ?? '');
+
+        return match (true) {
+            str_contains($sql, 'SHOW GLOBAL STATUS') => Process::result(output: "Threads_connected\t5\nThreads_running\t1\nQueries\t1000"),
+            default => Process::result(output: '1'),
+        };
+    });
+
+    return $probes;
+}
+
+it('samples only engines whose server is installed, without probing the rest (bug #22)', function () {
+    // On a MariaDB server, probing "MySQL" reaches MariaDB's own port as root with no password:
+    // an "Access denied" in its log on every sample.
+    $probes = fakeMetricsServer(['mariadb-server']);
+
+    test()->artisan('db:sample-metrics')->assertExitCode(0);
+
+    expect(DbMetric::pluck('engine')->all())->toBe(['mariadb'])
+        ->and(collect($probes)->unique()->values()->all())->toBe(['mariadb'])
+        // Not even the empty root connection record the probe used to create.
+        ->and(DatabaseConnection::where('engine', 'mysql')->exists())->toBeFalse();
+});
+
+// ---- P2b: export (safe, read-only) ----
+
+it('exports a database and streams the download', function () {
+    $dir = sys_get_temp_dir().'/sv-oss-exp-'.uniqid();
+    config(['server.databases.export_dir' => $dir]);
+
+    Process::fake(function ($process) {
+        $cmd = $process->command;
+        if (in_array($cmd[0] ?? '', ['mysqldump', 'mariadb-dump'], true)) {
+            foreach ($cmd as $arg) {
+                if (str_starts_with($arg, '--result-file=')) {
+                    $out = substr($arg, 14);
+                    @mkdir(dirname($out), 0700, true);
+                    file_put_contents($out, "-- dump\nCREATE TABLE t (id INT);\n");
+                }
+            }
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    // Faked so dispatch does not run inline: the request must return before the dump does.
+    Queue::fake();
+
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    // 202, not 201: the dump is queued and would outlive nginx's read timeout on a real database.
+    $res = test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/export")->assertStatus(202);
+    expect($res->json('export.status'))->toBe('queued')
+        ->and($res->json('export.file'))->toBeNull()
+        ->and($res->json('export.download_url'))->toBeNull();
+
+    // Run the queued work the way a worker would.
+    app(RunDatabaseExport::class, ['exportId' => $res->json('export.id'), 'databaseId' => $db->id])
+        ->handle(app(ExportDatabase::class));
+
+    $export = DatabaseExport::find($res->json('export.id'));
+    expect($export->status)->toBe(ExportStatus::Completed)
+        ->and($export->size_bytes)->toBeGreaterThan(0);
+
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'exported']);
+
+    test()->withHeaders(dbAuth())->get("/api/databases/exports/{$export->file}")->assertOk();
+
+    File::deleteDirectory($dir);
+});
+
+it('records a failed export instead of leaving it queued forever', function () {
+    $dir = sys_get_temp_dir().'/sv-oss-exp-'.uniqid();
+    config(['server.databases.export_dir' => $dir]);
+
+    // The dump itself fails — no file is written.
+    Process::fake(fn ($process) => in_array($process->command[0] ?? '', ['mysqldump', 'mariadb-dump'], true)
+        ? Process::result(exitCode: 1, errorOutput: 'access denied')
+        : Process::result(exitCode: 0));
+
+    Queue::fake();
+
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    $res = test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/export")->assertStatus(202);
+    $id = $res->json('export.id');
+
+    try {
+        app(RunDatabaseExport::class, ['exportId' => $id, 'databaseId' => $db->id])->handle(app(ExportDatabase::class));
+    } catch (Throwable) {
+        // Rethrown so the queue marks the job failed; the row is already written.
+    }
+
+    $export = DatabaseExport::find($id);
+    expect($export->status)->toBe(ExportStatus::Failed)
+        ->and($export->reason)->toBe('dump_failed')
+        // A code, worded at read time — never a stored sentence.
+        ->and($export->message())->not->toBeNull()
+        ->and($export->reference)->not->toBeNull();
+
+    File::deleteDirectory($dir);
+});
+
+it('does not strand an export at running when the worker dies', function () {
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+    $export = DatabaseExport::create([
+        'database_id' => $db->id, 'database_name' => 'shop', 'engine' => 'mysql',
+        'status' => ExportStatus::Running,
+    ]);
+
+    // Without the failed() hook the row sits at `running` forever.
+    (new RunDatabaseExport($export->id, $db->id))->failed(null);
+
+    expect($export->refresh()->status)->toBe(ExportStatus::Failed)
+        ->and($export->reason)->toBe('worker')
+        ->and($export->reference)->not->toBeEmpty();
+});
+
+it('404s a missing or traversal export filename', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/exports/nope-does-not-exist.sql')->assertNotFound();
+    test()->withHeaders(dbAuth())->getJson('/api/databases/exports/..%2f..%2fetc%2fpasswd')->assertNotFound();
+});
+
+it('lists exports newest first, including ones still running', function () {
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+    DatabaseExport::create([
+        'database_id' => $db->id, 'database_name' => 'shop', 'engine' => 'mysql',
+        'status' => ExportStatus::Completed, 'file' => 'old.sql', 'size_bytes' => 2048,
+    ]);
+    DatabaseExport::create([
+        'database_id' => $db->id, 'database_name' => 'shop', 'engine' => 'mysql',
+        'status' => ExportStatus::Running,
+    ]);
+
+    $res = test()->withHeaders(dbAuth())->getJson('/api/databases/exports')->assertOk();
+
+    // The in-flight dump must be listed: hiding it until it finishes makes the page look idle.
+    expect($res->json('exports.0.status'))->toBe('running')
+        ->and($res->json('exports.1.status'))->toBe('completed')
+        ->and($res->json('exports.1.database'))->toBe('shop')
+        ->and($res->json('exports.1.size_human'))->toBe('2.0 KB');
+});
+
+it('does not offer a download for an export whose file has been removed', function () {
+    config(['server.databases.export_dir' => sys_get_temp_dir().'/sv-oss-gone-'.uniqid()]);
+
+    DatabaseExport::create([
+        'database_name' => 'shop', 'engine' => 'mysql',
+        'status' => ExportStatus::Completed, 'file' => 'deleted-by-hand.sql', 'size_bytes' => 10,
+    ]);
+
+    $res = test()->withHeaders(dbAuth())->getJson('/api/databases/exports')->assertOk();
+
+    // A link that 404s is worse than saying the file has gone.
+    expect($res->json('exports.0.available'))->toBeFalse()
+        ->and($res->json('exports.0.download_url'))->toBeNull();
+});
+
+it('deletes an export and the file it points at', function () {
+    $dir = sys_get_temp_dir().'/sv-oss-del-'.uniqid();
+    File::ensureDirectoryExists($dir);
+    File::put($dir.'/dump.sql', 'x');
+    config(['server.databases.export_dir' => $dir]);
+
+    $export = DatabaseExport::create([
+        'database_name' => 'shop', 'engine' => 'mysql',
+        'status' => ExportStatus::Completed, 'file' => 'dump.sql', 'size_bytes' => 1,
+    ]);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/exports/{$export->id}")->assertNoContent();
+
+    expect(File::exists($dir.'/dump.sql'))->toBeFalse()
+        ->and(DatabaseExport::find($export->id))->toBeNull();
+    test()->assertDatabaseHas('activity_logs', ['type' => 'database', 'action' => 'export_deleted']);
+
+    File::deleteDirectory($dir);
+});
+
+it('deletes a failed export that never produced a file', function () {
+    $export = DatabaseExport::create([
+        'database_name' => 'shop', 'engine' => 'mysql',
+        'status' => ExportStatus::Failed, 'reason' => 'dump_failed',
+    ]);
+
+    // Keyed by id so these are removable; by filename they could never be cleared.
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/exports/{$export->id}")->assertNoContent();
+
+    expect(DatabaseExport::find($export->id))->toBeNull();
+});
+
+it('refuses to delete an export without manage permission', function () {
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'database', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $export = DatabaseExport::create([
+        'database_name' => 'shop', 'engine' => 'mysql', 'status' => ExportStatus::Completed,
+    ]);
+
+    // Deleting a dump destroys the only copy of that data; reading the list
+    // does not.
+    test()->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/databases/exports/{$export->id}")->assertForbidden();
+
+    test()->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/databases/exports')->assertOk();
+});
+
+// ---- size refresh ----
+
+it('re-measures the size when a single database is shown', function () {
+    fakeDb();
+
+    // The size column is refreshed, not written once at creation: a grown database must not
+    // read as empty.
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql', 'size_bytes' => 0]);
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}")->assertOk()
+        ->assertJsonPath('database.size_bytes', 1048576);
+
+    expect($db->refresh()->size_bytes)->toBe(1048576);
+});
+
+it('says the size is unknown, not 0, when the engine is down (FS-C12)', function () {
+    // Everything fails — the engine is stopped.
+    Process::fake(fn () => Process::result(exitCode: 1, errorOutput: 'connection refused'));
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql', 'size_bytes' => 0]);
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}")->assertOk()
+        ->assertJsonPath('database.size_bytes', null)
+        ->assertJsonPath('database.size_human', null)
+        ->assertJsonPath('database.size_reason', 'engine_unreachable');
+
+    // The stored figure is the last known one, untouched.
+    expect($db->refresh()->size_bytes)->toBe(0);
+});
+
+it('says unmeasured when the engine answers but the size query fails', function () {
+    Process::fake(function ($process) {
+        $sql = (string) ($process->input ?? '');
+
+        return match (true) {
+            str_contains($sql, 'VERSION()') => Process::result(output: '8.0.36'),
+            str_contains($sql, 'SELECT COALESCE') => Process::result(exitCode: 1, errorOutput: 'denied'),
+            default => Process::result(),
+        };
+    });
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql', 'size_bytes' => 4096]);
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}")->assertOk()
+        ->assertJsonPath('database.size_bytes', null)
+        ->assertJsonPath('database.size_reason', 'unmeasured');
+});
+
+it('sends no size reason when the size was measured', function () {
+    fakeDb();
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql', 'size_bytes' => 0]);
+
+    test()->withHeaders(dbAuth())->getJson("/api/databases/{$db->id}")->assertOk()
+        ->assertJsonPath('database.size_bytes', 1048576)
+        ->assertJsonPath('database.size_reason', null);
+});
+
+it('refreshes every tracked database size on the scheduled tick', function () {
+    fakeDb();
+
+    Database::create(['name' => 'shop', 'engine' => 'mysql', 'size_bytes' => 0]);
+    Database::create(['name' => 'blog', 'engine' => 'mysql', 'size_bytes' => 0]);
+
+    test()->artisan('databases:refresh-sizes')->assertExitCode(0);
+
+    expect(Database::pluck('size_bytes')->all())->toBe([1048576, 1048576]);
+});
+
+it('leaves the last known size alone when the engine cannot be reached', function () {
+    // Everything fails — the engine is down.
+    Process::fake(fn () => Process::result(exitCode: 1, errorOutput: 'connection refused'));
+
+    $db = Database::create(['name' => 'shop', 'engine' => 'mysql', 'size_bytes' => 4096]);
+
+    test()->artisan('databases:refresh-sizes')->assertExitCode(0);
+
+    // Writing a failed probe as 0 would report every database on a stopped engine as empty.
+    expect($db->refresh()->size_bytes)->toBe(4096);
+});
+
+// ---- installed vs running ----
+
+it('reports an engine that answers as both installed and running', function () {
+    fakeDb();
+
+    test()->withHeaders(dbAuth())->getJson('/api/databases/engines')->assertOk()
+        ->assertJsonPath('engines.0.running', true)
+        ->assertJsonPath('engines.0.installed', true);
+});
+
+it('tells a stopped engine apart from one that was never installed', function () {
+    Process::fake(function ($process) {
+        $bin = $process->command[0] ?? '';
+
+        // The server is down, so nothing answers a query...
+        if (in_array($bin, ['mysql', 'mariadb', 'mongosh'], true)) {
+            return Process::result(exitCode: 1, errorOutput: "Can't connect to local server");
+        }
+        // ...but the package is still on the box.
+        if ($bin === 'dpkg-query') {
+            return Process::result(output: 'install ok installed');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $res = test()->withHeaders(dbAuth())->getJson('/api/databases/engines')->assertOk();
+
+    // Both of these are `running: false`. Without `installed` the UI cannot
+    // tell "start the service" from "install it first".
+    expect($res->json('engines.0.running'))->toBeFalse()
+        ->and($res->json('engines.0.installed'))->toBeTrue()
+        ->and($res->json('engines.0.version'))->toBeNull();
+});
+
+it('reports an engine that is neither running nor present as not installed', function () {
+    Process::fake(function ($process) {
+        $bin = $process->command[0] ?? '';
+
+        if ($bin === 'dpkg-query') {
+            return Process::result(exitCode: 1, errorOutput: 'no packages found');
+        }
+        if ($bin === 'which') {
+            return Process::result(exitCode: 1);
+        }
+
+        return Process::result(exitCode: 1, errorOutput: 'not found');
+    });
+
+    $res = test()->withHeaders(dbAuth())->getJson('/api/databases/engines')->assertOk();
+
+    expect($res->json('engines.0.running'))->toBeFalse()
+        ->and($res->json('engines.0.installed'))->toBeFalse();
+});
+
+it('repairs an engine that is installed but the panel cannot reach', function () {
+    // "The package is present" is not "the panel can use it": installing an engine is apt and
+    // provisioning the account the panel connects with. Skipping the second half leaves the
+    // default connection (root, TCP, no password), and queries fail with ERROR 1698 because
+    // Ubuntu's root authenticates over the unix socket. The response must say `queued: true`
+    // so the setup page has something to poll.
+    Bus::fake();
+
+    Process::fake(function ($process) {
+        $bin = $process->command[0] ?? '';
+
+        // The package is there...
+        if ($bin === 'dpkg-query') {
+            return Process::result(output: 'install ok installed');
+        }
+
+        // ...and the panel cannot authenticate against it.
+        if (in_array($bin, ['mysql', 'mariadb'], true)) {
+            return Process::result(
+                exitCode: 1,
+                errorOutput: "ERROR 1698 (28000): Access denied for user 'root'@'localhost'",
+            );
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    test()->withHeaders(dbAuth())
+        ->postJson('/api/databases/engines/mariadb')
+        ->assertStatus(202)
+        ->assertJsonPath('queued', true);
+
+    Bus::assertDispatched(InstallDatabaseEngine::class);
+});
+
+it('does nothing when the engine is installed and answering', function () {
+    // The normal case stays a no-op: installing on a working engine must not re-provision it.
+    Bus::fake();
+
+    Process::fake(function ($process) {
+        $bin = $process->command[0] ?? '';
+
+        if ($bin === 'dpkg-query') {
+            return Process::result(output: 'install ok installed');
+        }
+
+        if (in_array($bin, ['mysql', 'mariadb'], true)) {
+            return Process::result(output: '1');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    test()->withHeaders(dbAuth())
+        ->postJson('/api/databases/engines/mariadb')
+        ->assertOk()
+        ->assertJsonPath('queued', false);
+
+    Bus::assertNotDispatched(InstallDatabaseEngine::class);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Adopted databases and their users
+|--------------------------------------------------------------------------
+|
+| Adopting records the database and its users, and deleting it drops them. A user that serves
+| two databases (common on a server brought over from v7) must not be dropped with the first
+| one: the other site would stop working.
+*/
+function fakeDbWithUsers(): ArrayObject
+{
+    $sqls = new ArrayObject;
+
+    Process::fake(function ($process) use ($sqls) {
+        $sql = (string) ($process->input ?? '');
+        $sqls->append($sql);
+
+        return match (true) {
+            str_contains($sql, 'SHOW DATABASES') => Process::result(output: "other_db\nshared_db\n"),
+            str_contains($sql, 'FROM mysql.user') => Process::result(output: "only_user\tlocalhost\nshared_user\t%\n"),
+            str_contains($sql, "SHOW GRANTS FOR 'only_user'") => Process::result(output: "GRANT ALL PRIVILEGES ON `other_db`.* TO `only_user`@`localhost`\n"),
+            str_contains($sql, "SHOW GRANTS FOR 'shared_user'") => Process::result(output: "GRANT ALL PRIVILEGES ON `other_db`.* TO `shared_user`@`%`\nGRANT SELECT ON `shared_db`.* TO `shared_user`@`%`\n"),
+            str_contains($sql, 'default_character_set_name') => Process::result(output: "utf8mb4\tutf8mb4_general_ci"),
+            default => Process::result(output: '0'),
+        };
+    });
+
+    return $sqls;
+}
+
+it('records the users an adopted database already has', function () {
+    fakeDbWithUsers();
+
+    test()->withHeaders(dbAuth())->postJson('/api/databases/adopt', ['engine' => 'mysql', 'names' => ['other_db']])->assertStatus(201);
+
+    $users = Database::where('name', 'other_db')->first()->users;
+
+    expect($users->map(fn ($u) => $u->username.'@'.$u->host)->sort()->values()->all())->toBe(['only_user@localhost', 'shared_user@%'])
+        ->and($users->firstWhere('username', 'shared_user')->connection_preference)->toBe('anywhere')
+        // The engine holds a hash, never the password.
+        ->and($users->pluck('password')->filter()->all())->toBe([]);
+});
+
+it('drops only the users that serve nothing else when an adopted database is deleted', function () {
+    $sqls = fakeDbWithUsers();
+    test()->withHeaders(dbAuth())->postJson('/api/databases/adopt', ['engine' => 'mysql', 'names' => ['other_db']])->assertStatus(201);
+    $db = Database::where('name', 'other_db')->first();
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertNoContent();
+
+    $dropped = collect($sqls)->filter(fn ($sql) => str_contains($sql, 'DROP USER'))->implode("\n");
+
+    expect($dropped)->toContain("'only_user'@'localhost'")
+        ->and($dropped)->not->toContain('shared_user');
+});
+
+it('keeps a user the panel has on another database too', function () {
+    $sqls = fakeDbWithUsers();
+    $one = Database::create(['name' => 'one', 'engine' => 'mysql']);
+    $two = Database::create(['name' => 'two', 'engine' => 'mysql']);
+    $one->users()->create(['username' => 'both', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+    $two->users()->create(['username' => 'both', 'password' => 'p', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$one->id}")->assertNoContent();
+
+    expect(collect($sqls)->contains(fn ($sql) => str_contains($sql, 'DROP USER')))->toBeFalse()
+        ->and($two->users()->count())->toBe(1);
+});
+
+it('keeps an adopted user when the engine cannot say what else it serves', function () {
+    $sqls = new ArrayObject;
+    Process::fake(function ($process) use ($sqls) {
+        $sql = (string) ($process->input ?? '');
+        $sqls->append($sql);
+
+        // The account listing fails; everything else works.
+        return str_contains($sql, 'FROM mysql.user')
+            ? Process::result(exitCode: 1, errorOutput: 'denied')
+            : Process::result(output: '0');
+    });
+    $db = Database::create(['name' => 'old_site', 'engine' => 'mysql']);
+    $db->users()->create(['username' => 'v7_user', 'password' => null, 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    test()->withHeaders(dbAuth())->deleteJson("/api/databases/{$db->id}")->assertNoContent();
+
+    expect(collect($sqls)->contains(fn ($sql) => str_contains($sql, 'DROP USER')))->toBeFalse();
+});
+
+describe('database usernames (bug #25)', function () {
+    it('refuses a rename onto a name the server already has', function () {
+        $sqls = new ArrayObject;
+        Process::fake(function ($process) use ($sqls) {
+            $sql = (string) ($process->input ?? '');
+            $sqls[] = $sql;
+
+            return str_contains($sql, 'FROM mysql.user WHERE user')
+                ? Process::result(output: 'user_exists')
+                : Process::result(output: '1');
+        });
+        $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+        $user = $db->users()->create(['username' => 'old_u', 'password' => 'oldpw', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+        // A duplicate name must be a 422, not a 500 from inside the engine.
+        test()->withHeaders(dbAuth())->patchJson("/api/databases/{$db->id}/users/{$user->id}", ['username' => 'taken_u'])
+            ->assertStatus(422)
+            ->assertJsonPath('errors.username.0', __('errors/database.user_exists', ['username' => 'taken_u']));
+
+        expect(collect($sqls)->contains(fn (string $q) => str_contains($q, 'RENAME USER')))->toBeFalse()
+            ->and($user->fresh()->username)->toBe('old_u');
+    });
+
+    it('does not ask about the name when only the host changes', function () {
+        // A PostgreSQL role has no host, so asking would find the user itself.
+        Process::fake(fn () => Process::result(output: 'user_exists'));
+        $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+        $user = $db->users()->create(['username' => 'same_u', 'password' => 'pw', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+        test()->withHeaders(dbAuth())->patchJson("/api/databases/{$db->id}/users/{$user->id}", [
+            'connection_preference' => 'remote', 'host' => '10.0.0.9',
+        ])->assertJsonMissingValidationErrors('username');
+    });
+
+    it('refuses PostgreSQL\'s own and reserved names', function (string $name) {
+        fakeDb();
+        $db = Database::create(['name' => 'shop', 'engine' => 'mysql']);
+
+        test()->withHeaders(dbAuth())->postJson("/api/databases/{$db->id}/users", [
+            'username' => $name, 'password' => 'AnotherPass88', 'connection_preference' => 'localhost',
+        ])->assertStatus(422)->assertJsonValidationErrors('username');
+    })->with(['postgres', 'pg_monitor', 'PG_x']);
+});

@@ -1,0 +1,134 @@
+import { useState } from "react";
+import { useRefresh } from "@/hooks/use-refresh";
+import { useForm, useWatch } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { FolderTree, Loader2 } from "lucide-react";
+import { updateWebRoot } from "@/lib/api/applications";
+import { listFiles } from "@/lib/api/files";
+import { apiMessage } from "@/lib/api/error-message";
+import { handleValidationError } from "@/lib/api/handle-validation-error";
+import { isReloadFailed } from "@/lib/applications/reload-pending";
+import { useReloadPending, useReloadPendingActions } from "@/components/applications/reload-pending-provider";
+import { ReloadPendingNotice } from "@/components/applications/reload-pending-notice";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { FormModal } from "@/components/ui/form-modal";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+
+const schema = z.object({
+  web_root: z
+    .string()
+    .trim()
+    .max(255, "max255")
+    .regex(/^[A-Za-z0-9._\-/]*$/, "invalidPath")
+    .refine((value) => !/(^|\/)\.\.(\/|$)/.test(value), "noTraversal"),
+});
+
+export function WebRootDialog({ application, open, onOpenChange }) {
+  const t = useTranslations("applications.webRoot");
+  const tPending = useTranslations("applications.reloadPending");
+  const { refreshAndWait } = useRefresh();
+  const [saving, setSaving] = useState(false);
+  const pending = useReloadPending(application.id);
+  const { mark, stillPending } = useReloadPendingActions();
+
+  const form = useForm({
+    resolver: zodResolver(schema),
+    mode: "onBlur",
+    defaultValues: { web_root: application.web_root ?? "" },
+  });
+
+  const typed = useWatch({ control: form.control, name: "web_root" }) ?? "";
+  const relative = String(typed).trim().replace(/^\/+|\/+$/g, "");
+  const base = String(application.path ?? "").replace(/\/+$/, "");
+  const resolved = base ? (relative ? `${base}/${relative}` : base) : null;
+
+  async function save(values) {
+    setSaving(true);
+    try {
+      const folder = String(values.web_root ?? "").trim().replace(/^\/+|\/+$/g, "");
+      if (folder) {
+        const missing = await listFiles(application.id, folder).then(
+          () => false,
+          (error) => [404, 422].includes(error.response?.status),
+        );
+        if (missing) {
+          form.setError("web_root", { type: "manual", message: t("missingFolder", { path: `${base}/${folder}` }) });
+          return;
+        }
+      }
+      await updateWebRoot(application.id, values.web_root);
+      await refreshAndWait();
+      if (stillPending(application.id)) toast.warning(tPending("stillPendingToast"));
+      else toast.success(t("saved"));
+      onOpenChange?.(false);
+    } catch (error) {
+      if (isReloadFailed(error)) {
+        mark(application.id, error);
+        form.reset({ web_root: values.web_root });
+        await refreshAndWait();
+      } else if (error.response?.data?.errors) handleValidationError(error, form);
+      else toast.error(apiMessage(error, t("failed")));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Form {...form}>
+      <FormModal
+        open={open}
+        onOpenChange={(next) => !saving && onOpenChange?.(next)}
+        asForm
+        onSubmit={form.handleSubmit(save)}
+        icon={FolderTree}
+        title={t("title")}
+        description={t("description")}
+        footer={
+          <>
+            <Button type="button" variant="outline" onClick={() => onOpenChange?.(false)} disabled={saving}>
+              {pending && !form.formState.isDirty ? t("close") : t("cancel")}
+            </Button>
+            <Button type="submit" disabled={saving}>
+              {saving ? <Loader2 className="size-4 animate-spin" /> : null}
+              {t("submit")}
+            </Button>
+          </>
+        }
+      >
+        <ReloadPendingNotice appId={application.id} />
+        <FormField
+          control={form.control}
+          name="web_root"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel hint={t("hint")}>{t("label")}</FormLabel>
+              <FormControl>
+                <Input {...field} placeholder="/public" className="font-mono text-sm" disabled={saving} />
+              </FormControl>
+              <FormMessage />
+              {resolved ? (
+                <p className="text-sm text-muted-foreground">
+                  {t.rich("resolved", {
+                    path: resolved,
+                    code: (chunks) => <code className="font-mono text-foreground [overflow-wrap:anywhere]">{chunks}</code>,
+                  })}
+                </p>
+              ) : null}
+            </FormItem>
+          )}
+        />
+      </FormModal>
+    </Form>
+  );
+}

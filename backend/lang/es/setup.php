@@ -1,0 +1,46 @@
+<?php
+
+return [
+
+    'installing' => 'Instalando :component',
+
+    'detail' => [
+        'cache_in_use' => 'en uso para la caché del panel',
+    ],
+
+    'components' => [
+        'database' => [
+            'title' => 'Base de datos',
+            'description' => 'Necesaria antes de instalar WordPress o cualquier aplicación que almacene datos.',
+        ],
+        'php' => [
+            'title' => 'PHP',
+            'description' => 'Añada otra versión cuando una aplicación la necesite.',
+        ],
+        'node' => [
+            'title' => 'Node.js',
+            'description' => 'Gestionado con fnm, para que cada aplicación fije su propia versión.',
+        ],
+        'docker' => [
+            'title' => 'Docker',
+            'description' => 'El motor de contenedores en el que este servidor ejecuta sus aplicaciones. Lo deja instalado el instalador.',
+        ],
+        'redis' => [
+            'title' => 'Redis',
+            'description' => 'Se usa para la caché del panel. Sin él, el panel recurre a la base de datos: funciona, pero es más lento.',
+        ],
+        'fail2ban' => [
+            'title' => 'fail2ban',
+            'description' => 'Bloquea intentos de acceso repetidos contra SSH y sus aplicaciones.',
+        ],
+        'build_tools' => [
+            'title' => 'Herramientas de compilación',
+            'description' => 'Permite al servidor compilar componentes de aplicaciones que no vienen precompilados. Algunas apps Node lo necesitan para instalarse.',
+        ],
+        'wp_cli' => [
+            'title' => 'WP-CLI',
+            'description' => 'La herramienta de línea de comandos de WordPress. El panel la usa para cada tarea de WordPress y la descarga con la primera aplicación WordPress si falta.',
+        ],
+    ],
+
+];

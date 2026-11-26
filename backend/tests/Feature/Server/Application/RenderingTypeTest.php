@@ -1,0 +1,254 @@
+<?php
+
+use App\Models\Application;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Applications\ServingProfile;
+use App\Services\Applications\SiteTypeManager;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Testing\TestResponse;
+
+/**
+ * How a git application is built decides how it is served.
+ *
+ * Static and client-side rendering produce files a web server hands out; server-side rendering
+ * produces a process to proxy to. Confusing the two publishes source or gives a permanent 502.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'mern', 'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => true],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    $this->su = SystemUser::create([
+        'username' => 'gituser', 'home_path' => '/home/gituser',
+        'shell' => '/bin/bash', 'sudo' => false,
+    ]);
+
+    Process::fake(fn ($process) => fakeGitRemoteAnswer($process) ?? Process::result(output: ''));
+});
+
+function renderPayload(array $overrides = []): array
+{
+    return array_merge([
+        'system_user_id' => test()->su->id,
+        'name' => 'App', 'domain' => 'app.test', 'site_type' => 'git',
+        'git_source' => 'public_url',
+        'repository_url' => 'https://github.com/laravel/laravel.git',
+        'branch' => 'main',
+        'rendering_type' => 'ssr',
+        'start_command' => 'node server.js',
+        'package_manager' => 'npm',
+    ], $overrides);
+}
+
+function createRendered(array $overrides = []): TestResponse
+{
+    return test()->withHeaders(['Authorization' => 'Bearer '.test()->token])
+        ->postJson('/api/applications', renderPayload($overrides));
+}
+
+it('serves server-side rendering by proxy', function () {
+    createRendered()
+        ->assertCreated()
+        ->assertJsonPath('application.serving_profile', 'node')
+        ->assertJsonPath('application.rendering_type', 'ssr')
+        // A process needs somewhere to listen, and the panel picks one.
+        ->assertJsonPath('application.has_process', true);
+});
+
+it('serves the built files for client-side rendering, with no process', function (string $type) {
+    $response = createRendered([
+        'rendering_type' => $type,
+        'domain' => "{$type}.test",
+        'start_command' => null,
+    ])->assertCreated();
+
+    // No process, so no unit, no port, and nothing to proxy to.
+    expect($response->json('application.serving_profile'))->toBe('static')
+        ->and($response->json('application.has_process'))->toBeFalse()
+        ->and($response->json('application.app_port'))->toBeNull();
+})->with(['csr', 'static']);
+
+it('requires something to start for server-side rendering', function () {
+    // Otherwise the app is proxied with nothing behind it: a vhost that returns 502 forever.
+    createRendered(['start_command' => null])
+        ->assertJsonValidationErrors('start_command');
+});
+
+it('drops a start command for a build that has no process', function () {
+    // Storing it would leave the UI offering process controls for a site that
+    // has no unit behind them.
+    createRendered(['rendering_type' => 'static', 'start_command' => 'node server.js'])
+        ->assertCreated()
+        ->assertJsonPath('application.start_command', null)
+        ->assertJsonPath('application.has_process', false);
+});
+
+it('offers the choice on the git card, with the fields that depend on it', function () {
+    $git = collect(app(SiteTypeManager::class)->catalog())->firstWhere('name', 'git');
+    $fields = collect($git['fields']);
+
+    $rendering = $fields->firstWhere('name', 'rendering_type');
+
+    // A PHP repository is the most common use of this card, so it is one of the answers.
+    expect(collect($rendering['options'])->pluck('value')->all())->toBe(['php', 'ssr', 'csr', 'static'])
+        // The form hides these rather than collecting answers it would refuse.
+        ->and($fields->firstWhere('name', 'start_command')['depends_on'])->toBe('rendering_type')
+        ->and($fields->firstWhere('name', 'app_port')['depends_on'])->toBe('rendering_type');
+});
+
+it('follows the rendering type when it changes', function () {
+    $id = createRendered()->json('application.id');
+
+    // Switching to a built-to-files type must stop the site being proxied, or
+    // it 502s the moment the process is gone.
+    $this->withHeaders(['Authorization' => 'Bearer '.$this->token])
+        ->putJson("/api/applications/{$id}", ['rendering_type' => 'csr'])
+        ->assertOk()
+        ->assertJsonPath('application.serving_profile', 'static')
+        // The command and the port go with it: keeping them would show
+        // process controls with no unit behind them, and hold a port the next
+        // application could have had.
+        ->assertJsonPath('application.start_command', null)
+        ->assertJsonPath('application.app_port', null);
+});
+
+describe('the resolver', function () {
+    it('prefers the rendering type over the start command', function () {
+        // The rendering type is the user saying what they built; a start
+        // command is only a fallback for types that have no rendering type at
+        // all, like the one-click Node installers.
+        expect(ServingProfile::resolve(null, ['rendering_type' => 'ssr']))->toBe('node')
+            ->and(ServingProfile::resolve(null, ['rendering_type' => 'csr', 'start_command' => 'node x.js']))->toBe('static');
+    });
+
+    it('serves a PHP repository through the PHP stack', function () {
+        // The card is used for Laravel far more often than for Node, and that
+        // is neither built to files nor run as a process.
+        expect(ServingProfile::resolve(null, ['rendering_type' => 'php']))->toBe('php');
+    });
+
+    it('keeps the current profile when neither is mentioned', function () {
+        // A partial update that touches neither must not silently reshape how
+        // the site is served.
+        expect(ServingProfile::resolve(null, ['name' => 'Renamed'], 'node'))->toBe('node');
+    });
+});
+
+/*
+ * The deploy script must be settable at creation: the first deploy runs automatically once
+ * provisioning finishes, so a script added later has already missed it.
+ */
+it('stores a deploy script given at creation', function () {
+    createRendered(['deploy_script' => "npm ci\nnpm run build"])->assertCreated();
+
+    expect(Application::where('name', 'App')->first()->deploy_script)
+        ->toBe("npm ci\nnpm run build");
+});
+
+it('normalises Windows line endings in a deploy script', function () {
+    // `sh` reads the \r as part of the command ("command not found: npm\r"), invisible in a log.
+    // The Deployment screen already normalises this; creating a site must too.
+    createRendered(['deploy_script' => "npm ci\r\nnpm run build"])->assertCreated();
+
+    expect(Application::where('name', 'App')->first()->deploy_script)
+        ->toBe("npm ci\nnpm run build")
+        ->not->toContain("\r");
+});
+
+/**
+ * Records what the installer actually writes for a MERN box.
+ *
+ * `beforeEach` builds its row by hand without `serving_profiles`, so every test here falls on
+ * `ServerCapabilities::DEFAULT_PROFILES`, which contains `php`: the file could not see the git
+ * card being refused on a real MERN server.
+ *
+ * `php => true` is deliberate: the stack preset says `false`, but `recordStack()` merges runtime
+ * detection over it and the panel is itself a PHP application. `serving_profiles` answers a
+ * different question: what this box will *serve*.
+ */
+function recordRealMernStack(): void
+{
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'mern', 'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => true, 'serving_profiles' => ['node', 'static']],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+}
+
+it('deploys from git on a MERN server recorded by the installer', function () {
+    // The regression: `GitSiteType::servingProfile()` falls back to `php`, the catalog gated on
+    // that one value, and a MERN box serves node and static, so "deploy from git" was refused.
+    //
+    // Asserted through a real create because `StoreApplicationRequest` calls the same
+    // `unavailable()`: a card that returns while the endpoint still refuses is not a fix.
+    recordRealMernStack();
+
+    createRendered(['domain' => 'real-mern.test'])
+        ->assertCreated()
+        ->assertJsonPath('application.serving_profile', 'node')
+        ->assertJsonPath('application.has_process', true);
+});
+
+it('offers the git card on a real MERN server without letting the PHP types back in', function () {
+    // Both halves matter: the card comes back, and a MERN box still hosts no PHP sites. The profile
+    // *set* separates them: git can be served three ways, WordPress one.
+    recordRealMernStack();
+
+    $names = collect(app(SiteTypeManager::class)->catalog())->pluck('name');
+
+    expect($names)->toContain('git')
+        ->and($names)->not->toContain('wordpress')
+        ->and($names)->not->toContain('php')
+        ->and($names)->not->toContain('phpmyadmin');
+});
+
+it('publishes the deploy script as a field on the git site type', function () {
+    // The frontend renders this form from the API, so a field the schema does
+    // not list is a field the user never sees.
+    $fields = test()->withHeaders(['Authorization' => 'Bearer '.test()->token])
+        ->getJson('/api/site-types')
+        ->assertOk()
+        ->json();
+
+    $git = collect(data_get($fields, 'site_types', $fields))
+        ->firstWhere('name', 'git');
+
+    expect(collect($git['fields'])->pluck('name'))->toContain('deploy_script');
+
+    // The schema says what the rules require, so the form can too.
+    expect(collect($git['fields'])->firstWhere('name', 'start_command')['required_if'] ?? null)
+        ->toBe(['rendering_type' => ['ssr']]);
+});
+
+it('refuses a git site rendered as PHP on a MERN server, which serves no PHP sites', function () {
+    // The git card is offered on MERN because two of its three profiles are
+    // hosted there; the profile this request resolves to has to be one too.
+    recordRealMernStack();
+
+    createRendered(['domain' => 'php-on-mern.test', 'rendering_type' => 'php', 'start_command' => null])
+        ->assertJsonValidationErrors('rendering_type')
+        ->assertJsonPath('errors.rendering_type.0', __('application.unavailable.profile', ['profile' => 'PHP']));
+
+    createRendered(['domain' => 'static-on-mern.test', 'rendering_type' => 'static', 'start_command' => null])
+        ->assertCreated();
+});
+
+it('refuses switching a git site on MERN to PHP rendering afterwards', function () {
+    recordRealMernStack();
+    $id = createRendered(['domain' => 'later-php.test'])->assertCreated()->json('application.id');
+
+    test()->withHeaders(['Authorization' => 'Bearer '.test()->token])
+        ->putJson("/api/applications/{$id}", ['rendering_type' => 'php'])
+        ->assertJsonValidationErrors('rendering_type');
+});

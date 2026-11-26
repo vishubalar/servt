@@ -1,0 +1,499 @@
+<?php
+
+namespace App\Services\Server\Applications;
+
+use App\Models\Application;
+use App\Services\Server\Docker\DockerResources;
+use App\Services\Server\Docker\NetworkIsolation;
+use App\Services\Server\ServerOps;
+use App\Support\CommandRedactor;
+use Illuminate\Support\Str;
+
+/**
+ * Decides whether a compose file somebody pasted is safe to run here.
+ *
+ * Parsed by Docker itself (`docker compose config --format json`), not by a YAML
+ * library: a validator whose parser differs from the executor's is a bypass waiting
+ * to be found. `config` also normalises (`- /:/host` and the long bind form resolve
+ * to one shape), so each rule is written once. It does not pull, create or start
+ * anything.
+ */
+class ComposeValidator
+{
+    /** Most characters of Docker's own error quoted back to the user, ellipsis included. */
+    private const ERROR_LIMIT = 300;
+
+    /**
+     * Service keys that hand over the host, whatever else the file says.
+     *
+     * Each is a documented way out of the container onto the machine:
+     *
+     *  - `privileged` — all capabilities and devices; root on the host.
+     *  - `cap_add` — `SYS_ADMIN` alone is enough to mount filesystems.
+     *  - `devices` — raw block devices expose every file on the disk.
+     *  - `pid` / `ipc` / `userns_mode` — shares the host's namespaces.
+     *  - `security_opt` — where `apparmor:unconfined` / `seccomp:unconfined` are set.
+     *  - `network_mode` — `host` bypasses the loopback publishing and the firewall.
+     *  - `cgroup_parent` — escapes the panel's resource limits.
+     *  - `build` — the context is a host path the daemon reads as root (`context: /root`
+     *    puts the server's keys in an image); the bind-mount check walks only `volumes`.
+     *    The panel runs images, it is not a build service.
+     *
+     * @var array<string, string>
+     */
+    private const FORBIDDEN_KEYS = [
+        'privileged' => 'privileged',
+        'cap_add' => 'cap_add',
+        'devices' => 'devices',
+        'pid' => 'namespace',
+        'ipc' => 'namespace',
+        'userns_mode' => 'namespace',
+        'security_opt' => 'security_opt',
+        'network_mode' => 'network_mode',
+        'cgroup_parent' => 'cgroup_parent',
+        'build' => 'build',
+    ];
+
+    public function __construct(private ServerOps $serverOps) {}
+
+    /**
+     * Check a compose file, fixing what can safely be fixed.
+     *
+     * `compose` in the result is what should be written: the user's file with published
+     * ports bound to loopback. Everything else stays a refusal (`privileged`,
+     * `network_mode: host`, a bind mount of `/`): there is no safe rewrite.
+     *
+     * @return array{ok: bool, errors: list<string>, resolved: array<string, mixed>|null, compose: string, rewrote_ports: bool}
+     */
+    public function validate(string $compose, string $documentRoot): array
+    {
+        $dockerError = null;
+        $parsed = $this->parse($compose, $documentRoot, $dockerError);
+
+        if ($parsed === null) {
+            return [
+                'ok' => false,
+                // Docker's own words; with nothing to quote (refused sudo grant, timeout) the
+                // generic sentence is used.
+                'errors' => [$dockerError === null
+                    ? __('errors/application.compose_unparsable_generic')
+                    : __('errors/application.compose_unparsable', ['error' => $dockerError])],
+                'resolved' => null,
+                'compose' => $compose,
+                'rewrote_ports' => false,
+            ];
+        }
+
+        $rewrote = false;
+
+        // Rewrite, then verify with Docker's own parser: if any published port still lacks a
+        // loopback address, the file is refused, never silently published to the world.
+        if ($this->hasPublicPort($parsed)) {
+            $candidate = $this->bindToLoopback($compose);
+            $reparsed = $candidate === $compose ? null : $this->parse($candidate, $documentRoot);
+
+            if ($reparsed !== null && ! $this->hasPublicPort($reparsed)) {
+                $compose = $candidate;
+                $parsed = $reparsed;
+                $rewrote = true;
+            }
+        }
+
+        $errors = [];
+
+        // Only reached when the rewrite could not fix it (exotic mapping form, or the
+        // re-parse rejected it).
+        if ($this->hasPublicPort($parsed)) {
+            $errors[] = __('errors/application.compose_port_public', [
+                'service' => '',
+                'port' => '',
+            ]);
+        }
+        $services = $parsed['services'] ?? [];
+
+        if (! is_array($services) || $services === []) {
+            $errors[] = __('errors/application.compose_no_services');
+        }
+
+        foreach ($services as $name => $service) {
+            if (! is_array($service)) {
+                continue;
+            }
+
+            foreach (self::FORBIDDEN_KEYS as $key => $reason) {
+                if (array_key_exists($key, $service)) {
+                    $errors[] = __("errors/application.compose_forbidden.{$reason}", ['service' => $name]);
+                }
+            }
+
+            $errors = array_merge(
+                $errors,
+                $this->bindMountErrors((string) $name, $service, $documentRoot),
+            );
+        }
+
+        return [
+            'ok' => $errors === [],
+            // Unique: one forbidden key across five services is one problem.
+            'errors' => array_values(array_unique($errors)),
+            'resolved' => $parsed,
+            'compose' => $compose,
+            'rewrote_ports' => $rewrote,
+        ];
+    }
+
+    /**
+     * The host port nginx should proxy to, from a resolved compose document.
+     *
+     * The panel cannot allocate this one: with a pasted file the container listens where
+     * the compose file says. One published port is unambiguous; with several,
+     * `container_port` (the port inside the container) picks one. Otherwise null, and the
+     * caller asks for the container port rather than guessing.
+     *
+     * @param  array<string, mixed>  $resolved
+     */
+    public function publishedPort(array $resolved, ?int $containerPort = null): ?int
+    {
+        $published = [];
+
+        foreach (($resolved['services'] ?? []) as $service) {
+            foreach ((array) ($service['ports'] ?? []) as $port) {
+                if (is_array($port) && isset($port['published'])) {
+                    $published[] = [
+                        'host' => (int) $port['published'],
+                        'target' => (int) ($port['target'] ?? 0),
+                    ];
+                }
+            }
+        }
+
+        if ($published === []) {
+            return null;
+        }
+
+        if (count($published) === 1) {
+            return $published[0]['host'];
+        }
+
+        foreach ($published as $entry) {
+            if ($containerPort !== null && $entry['target'] === $containerPort) {
+                return $entry['host'];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Why this file may not use one of the networks it names, or null.
+     *
+     * `network_mode` is not the only way onto a network: a top-level `networks:` entry
+     * with `external: true` and `name: host` (or `name: sv-app-6_default`) joins one too.
+     * Every resolved name is checked, external or not: an explicit `name:` makes Compose
+     * reuse an existing network.
+     *
+     * Asked by the requests, not by `validate()`, so a redeploy of an existing site is not
+     * stopped by a rule it predates; only a save of the file is.
+     *
+     * @param  array<string, mixed>  $resolved
+     * @param  int|null  $applicationId  the site the file is for; its own networks
+     *                                   are allowed. Null when creating one.
+     */
+    public function unjoinableNetwork(array $resolved, ?int $applicationId = null): ?string
+    {
+        $networks = $resolved['networks'] ?? [];
+
+        if (! is_array($networks)) {
+            return null;
+        }
+
+        foreach ($networks as $network) {
+            // `config` writes the real name on every entry, external ones included; not the
+            // key (`default` is the project's own).
+            $name = is_array($network) ? ($network['name'] ?? null) : null;
+
+            if (is_string($name) && ($refusal = NetworkIsolation::refusal($name, $applicationId)) !== null) {
+                return $refusal;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Why this file cannot have its ports, when another application holds one.
+     *
+     * `applications.app_port` is unique (two sites on one port would cross traffic). A
+     * pasted file chooses its own port, so this must be asked before the row exists, or
+     * the provisioning job dies on the unique index and leaves a `failed` site.
+     *
+     * Every published port is checked, not only the proxied one, which is named first.
+     *
+     * @param  array<string, mixed>  $resolved
+     * @param  int|null  $except  the application being edited; its own port is no clash
+     */
+    public function portTaken(array $resolved, ?int $containerPort, ?int $except = null): ?string
+    {
+        $held = Application::query()
+            ->where('app_port', '>', 0)
+            ->when($except !== null, fn ($query) => $query->whereKeyNot($except))
+            ->orderBy('app_port')
+            ->pluck('name', 'app_port');
+
+        $ranges = $this->publishedRanges($resolved);
+
+        if (($proxied = $this->publishedPort($resolved, $containerPort)) !== null) {
+            array_unshift($ranges, [$proxied, $proxied]);
+        }
+
+        foreach ($ranges as [$low, $high]) {
+            foreach ($held as $port => $name) {
+                if ($port >= $low && $port <= $high) {
+                    return __('errors/application.compose_port_taken', ['port' => $port, 'application' => $name]);
+                }
+            }
+        }
+
+        return $this->portListening($ranges, $except);
+    }
+
+    /**
+     * A published port something on the server is already listening on.
+     *
+     * The check above knows only the panel's own applications. Anything else on the box
+     * (web server on 80/443, SSH, a database) would otherwise pass and fail later at
+     * "Container start" with "address already in use". Same approach as
+     * {@see PortAllocator::conflict()}.
+     *
+     * For an existing site, the ports its own containers publish right now are not a
+     * conflict (the listener is the site itself).
+     *
+     * @param  list<array{0: int, 1: int}>  $ranges
+     */
+    private function portListening(array $ranges, ?int $except): ?string
+    {
+        $listening = app(PortAllocator::class)->listening();
+
+        if ($listening === [] || $ranges === []) {
+            return null;
+        }
+
+        $own = [];
+
+        if ($except !== null && ($application = Application::query()->find($except)) !== null) {
+            $own = app(DockerResources::class)->publishedHostPorts(app(ContainerSupervisor::class)->project($application));
+        }
+
+        foreach ($ranges as [$low, $high]) {
+            foreach ($listening as $port) {
+                if ($port >= $low && $port <= $high && ! in_array($port, $own, true)) {
+                    return __('errors/application.compose_port_in_use', ['port' => $port]);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Every host port the file publishes, as `[low, high]` in file order.
+     *
+     * A range (`"8000-8010:8000-8010"`) resolves to `published: "8000-8010"`; a
+     * plain `(int)` would read that as 8000 and miss the other ten.
+     *
+     * @param  array<string, mixed>  $resolved
+     * @return list<array{0: int, 1: int}>
+     */
+    private function publishedRanges(array $resolved): array
+    {
+        $ranges = [];
+
+        foreach (($resolved['services'] ?? []) as $service) {
+            foreach ((array) (is_array($service) ? ($service['ports'] ?? []) : []) as $port) {
+                if (is_array($port) && preg_match('/^(\d+)(?:-(\d+))?$/', (string) ($port['published'] ?? ''), $m) === 1) {
+                    $ranges[] = [(int) $m[1], (int) ($m[2] ?? $m[1])];
+                }
+            }
+        }
+
+        return $ranges;
+    }
+
+    /**
+     * Bind mounts must stay inside the application's own directory.
+     *
+     * Checked on the *resolved* path: a relative `source` such as `../..` climbs out of
+     * the tree while looking local. Named volumes are untouched.
+     *
+     * @param  array<string, mixed>  $service
+     * @return list<string>
+     */
+    private function bindMountErrors(string $name, array $service, string $documentRoot): array
+    {
+        $errors = [];
+        $root = rtrim($documentRoot, '/');
+
+        foreach ((array) ($service['volumes'] ?? []) as $volume) {
+            if (! is_array($volume) || ($volume['type'] ?? null) !== 'bind') {
+                continue;
+            }
+
+            $source = (string) ($volume['source'] ?? '');
+
+            // Separator appended to both sides: otherwise `/home/shop-evil` passes a
+            // `str_starts_with('/home/shop')` check.
+            $resolved = $this->normalise($source, $root);
+
+            if ($resolved !== $root && ! str_starts_with($resolved.'/', $root.'/')) {
+                $errors[] = __('errors/application.compose_bind_outside', [
+                    'service' => $name,
+                    'path' => $source,
+                ]);
+            }
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Whether any published port is bound to every address.
+     *
+     * A missing `host_ip` in the resolved document means that (`"8080:80"` expands so).
+     * Docker's rules sit ahead of ufw's, so such a port is reachable from the internet while
+     * the Firewall page reports it closed. It is fixed by a rewrite rather than refused,
+     * because upstream compose files publish that way.
+     *
+     * @param  array<string, mixed>  $resolved
+     */
+    private function hasPublicPort(array $resolved): bool
+    {
+        foreach (($resolved['services'] ?? []) as $service) {
+            foreach ((array) ($service['ports'] ?? []) as $port) {
+                if (! is_array($port)) {
+                    continue;
+                }
+
+                if (! in_array((string) ($port['host_ip'] ?? ''), ['127.0.0.1', '::1'], true)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Rewrite short-form port mappings to publish on loopback.
+     *
+     * A plain text rewrite of the short forms (`- "3001:3001"`, `- 3001:3001`). Safety does
+     * not rest on it: the caller re-runs `docker compose config` and refuses unless every
+     * published port names a loopback address.
+     */
+    private function bindToLoopback(string $compose): string
+    {
+        return preg_replace_callback(
+            // A bare `host:container[/proto]` mapping, optionally quoted; one that already has
+            // an address has two colons and does not match.
+            '/^(\s*-\s*)(["\']?)(\d+:\d+(?:\/\w+)?)\2\s*$/m',
+            fn (array $m): string => $m[1].'"127.0.0.1:'.$m[3].'"',
+            $compose,
+        ) ?? $compose;
+    }
+
+    /**
+     * Absolute, with `.` and `..` collapsed, without touching the filesystem.
+     *
+     * Not `realpath()`: it returns false for a directory compose will create, and follows
+     * symlinks, so the answer would depend on what is on disk.
+     */
+    private function normalise(string $path, string $root): string
+    {
+        $path = str_starts_with($path, '/') ? $path : $root.'/'.$path;
+
+        $parts = [];
+
+        foreach (explode('/', $path) as $segment) {
+            if ($segment === '' || $segment === '.') {
+                continue;
+            }
+
+            if ($segment === '..') {
+                array_pop($parts);
+
+                continue;
+            }
+
+            $parts[] = $segment;
+        }
+
+        return '/'.implode('/', $parts);
+    }
+
+    /**
+     * @param  string|null  $dockerError  Set to Docker's short, redacted complaint when it refused the file.
+     * @return array<string, mixed>|null
+     */
+    private function parse(string $compose, string $documentRoot, ?string &$dockerError = null): ?array
+    {
+        $result = $this->serverOps->run(
+            ['docker', 'compose', '-f', '-', 'config', '--format', 'json'],
+            ['feature' => 'application', 'op' => 'compose_validate'],
+            timeout: 30,
+            input: $compose,
+            // The cwd is load-bearing: Compose resolves a relative bind source against it, so
+            // validating elsewhere than the deploy directory resolves different paths.
+            cwd: $documentRoot,
+        );
+
+        if (! $result->answered) {
+            // A refused grant puts sudo's complaint on stderr; showing it would blame the file.
+            $dockerError = $result->denied ? null : $this->shortError($result->errorOutput());
+
+            return null;
+        }
+
+        $decoded = json_decode($result->output(), true);
+
+        return is_array($decoded) ? $decoded : null;
+    }
+
+    /**
+     * Docker's complaint reduced to something safe to put in a 422.
+     *
+     * `docker compose config` echoes values back in some messages (a bad `$` in an
+     * environment value, a type mismatch), and pasted files hold passwords. Known shapes are
+     * masked on top of CommandRedactor, and the result is capped.
+     *
+     * Warning lines are dropped: a `WARN` for a deprecated `version:` key precedes the real
+     * error.
+     */
+    private function shortError(string $stderr): ?string
+    {
+        $lines = [];
+
+        foreach (preg_split('/\R/', $stderr) ?: [] as $line) {
+            $line = trim(preg_replace('/\e\[[0-9;]*m/', '', $line) ?? $line);
+
+            if ($line === '' || preg_match('/^(?:WARN|time=\S+\s+level=warn)/i', $line)) {
+                continue;
+            }
+
+            $line = CommandRedactor::line($line);
+            $line = preg_replace(
+                [
+                    '/(invalid interpolation format for [^:]+:\s*)".*"/',
+                    '/(cannot unmarshal !!\w+ )`.*`/',
+                    '/(\bcontains )\S.*?(, which is an invalid type)/',
+                ],
+                ['$1"[REDACTED]"', '$1`[REDACTED]`', '$1[REDACTED]$2'],
+                $line,
+            ) ?? $line;
+
+            $lines[] = $line;
+        }
+
+        $message = trim(preg_replace('/\s+/u', ' ', implode(' ', $lines)) ?? '');
+
+        return $message === '' ? null : Str::limit($message, self::ERROR_LIMIT - 1, '…');
+    }
+}

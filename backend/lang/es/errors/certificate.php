@@ -1,0 +1,40 @@
+<?php
+
+return [
+
+    'no_certifiable_domains' => 'Ningún dominio de esta aplicación está listo para un certificado. Verifique primero el DNS.',
+    'force_https_without_certificate' => 'No se puede forzar HTTPS sin un certificado activo: la aplicación dejaría de responder.',
+    'not_pem' => 'Esto no parece un archivo PEM. Debe empezar por -----BEGIN.',
+    'key_mismatch' => 'La clave privada no coincide con el certificado.',
+    'not_certificate' => 'Esto no es un certificado. Pegue aquí el certificado (-----BEGIN CERTIFICATE-----) y la clave privada en su propio campo.',
+    'domain_not_covered' => 'Este certificado no cubre ningún dominio de esta aplicación (:domains).',
+    'expired' => 'Este certificado ya ha caducado.',
+    'not_yet_valid' => 'Este certificado todavía no es válido.',
+    'invalid_chain' => 'La cadena solo debe contener certificados (bloques -----BEGIN CERTIFICATE-----).',
+
+    // Why the reachability dry run said no, per domain. The dry run does
+    // exactly what Let's Encrypt is about to do, so each of these is a
+    // distinct fix — 'SSL failed' would leave the user guessing between
+    // DNS, a firewall and their own rewrite rules.
+    'precheck' => [
+        // The passing verdict. Only the dry-run report needs it: the 422
+        // that refuses an issue request never lists a name that passed.
+        'ok' => ':domain está listo: este servidor respondió correctamente a la solicitud de validación.',
+        'dns_missing' => ':domain no se resuelve. Añada un registro DNS A que apunte a este servidor e inténtelo de nuevo.',
+        'dns_not_pointing' => ':domain apunta a :ip, que no es este servidor.',
+        'dns_unverifiable' => 'Este servidor está detrás de NAT, por lo que el panel no puede confirmar desde aquí que :domain apunte a él. Si el DNS es correcto, use Emitir de todos modos: la solicitud de validación llega desde fuera y funcionará.',
+        'behind_proxy' => ':domain apunta a Cloudflare, no a este servidor, por lo que la solicitud de validación nunca llega. Pause el proxy (nube gris) mientras se emite el certificado.',
+        'blocked_ip' => ':domain apunta a :ip, que no es una dirección pública para la que se pueda emitir un certificado.',
+        'unreachable' => 'Nada respondió en el puerto 80 para :domain. Compruebe que el firewall permite el puerto 80 y que el servidor web está en marcha.',
+        'challenge_redirected' => ':domain redirige la solicitud de validación en lugar de responderla. Desactive la redirección de HTTP a HTTPS hasta que se emita el certificado.',
+        'challenge_not_served' => ':domain respondió, pero no con el archivo de validación. Lo más probable es que la aplicación esté reescribiendo /.well-known/: revise sus reglas de reescritura.',
+        'precheck_failed' => 'No se pudo escribir el archivo de validación en este servidor, por lo que no se pudo comprobar :domain.',
+    ],
+
+    // Why a dry run would not start. Not a verdict on any domain — the
+    // run never happened, and saying so plainly stops the user reading
+    // a refusal as a DNS problem.
+    'dry_run' => [
+        'issue_in_flight' => 'Ahora mismo se está emitiendo un certificado para esta aplicación. Espere a que termine: certbot ejecuta un trabajo a la vez, así que una simulación iniciada ahora solo informaría del conflicto.',
+    ],
+];

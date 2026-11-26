@@ -1,0 +1,19 @@
+import { Info } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+export function Note({ icon: Icon = Info, title, children, className }) {
+  return (
+    <div
+      className={cn(
+        "flex items-start gap-2.5 rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm",
+        className,
+      )}
+    >
+      <Icon className="mt-0.5 size-4 shrink-0 text-primary" />
+      <div className="min-w-0 space-y-1">
+        {title ? <p className="font-medium text-foreground">{title}</p> : null}
+        <div className="text-muted-foreground">{children}</div>
+      </div>
+    </div>
+  );
+}

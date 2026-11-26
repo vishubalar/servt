@@ -1,0 +1,110 @@
+import { PageHeader } from "@/components/ui/page-header";
+import { ScrollText } from "lucide-react";
+import { redirect } from "next/navigation";
+import { cookies } from "next/headers";
+import { getTranslations } from "next-intl/server";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import { getApplication } from "@/lib/applications/get-applications";
+import {
+  getApplicationLogs,
+  getApplicationLog,
+} from "@/lib/applications/get-application-logs";
+import { ApplicationLogsPanel } from "@/components/applications/logs/application-logs-panel";
+import { APP_LOG_FOLLOW_COOKIE, APP_LOG_LINES_COOKIE, parseFollowPrefs, parseLinesPref } from "@/lib/logs/app-log-prefs";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+import { isSettled } from "@/lib/applications/settled";
+
+export const dynamic = "force-dynamic";
+
+const DEFAULT_LINES = 200;
+
+export async function generateMetadata({ params }) {
+  const { application } = await params;
+  const [t, result] = await Promise.all([
+    getTranslations("applications.logs"),
+    getApplication(application),
+  ]);
+  return { title: `${t("pageTitle")} — ${result.application?.name ?? ""}` };
+}
+
+export default async function ApplicationLogsPage({ params, searchParams }) {
+  const { application: id } = await params;
+  const [sp, permissions, appPermissions, t, result, cookieStore] = await Promise.all([
+    searchParams,
+    getPermissions(),
+    getPermissions("application", id).catch(() => []),
+    getTranslations("applications.logs"),
+    getApplication(id),
+    cookies(),
+  ]);
+  const followPrefs = parseFollowPrefs(safeDecode(cookieStore.get(APP_LOG_FOLLOW_COOKIE)?.value));
+  const lines = parseLinesPref(cookieStore.get(APP_LOG_LINES_COOKIE)?.value, DEFAULT_LINES);
+
+  if (!can(permissions, "application", "view")) return <PermissionDenied title={t("pageTitle")} />;
+  if (result.status === 404) redirect("/applications?gone=1");
+  if (result.failed || !result.application)
+    return <LoadFailed description={t("loadFailed")} status={result.status} failure={result.failure} message={result.message} debug={result.debug} />;
+
+  const application = result.application;
+  if (!can(appPermissions, "app_log", "view", "application")) {
+    return <PermissionDenied title={t("pageTitle")} />;
+  }
+
+  const canManage = can(appPermissions, "app_log", "manage", "application");
+  const settled = isSettled(application);
+
+  const { logs: sources, failed, status: logsStatus, failure: logsFailure, message: logsMessage } = settled
+    ? await getApplicationLogs(id)
+    : { logs: [], failed: false, status: null, failure: null };
+
+  const selected =
+    sources.find((s) => s.key === sp?.source)?.key ??
+    sources.find((s) => s.exists)?.key ??
+    sources[0]?.key ??
+    null;
+
+  const initial = selected
+    ? await getApplicationLog(id, selected, { lines })
+    : { status: "ok", log: null };
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("pageTitle")} />
+
+      {!settled ? (
+        <div className="rounded-2xl border bg-muted/30 p-6 text-sm text-muted-foreground">
+          {t("provisioning")}
+        </div>
+      ) : failed ? (
+        <LoadFailed description={t("loadFailed")} status={logsStatus} failure={logsFailure} message={logsMessage} />
+      ) : sources.length === 0 ? (
+        <EmptyState
+          icon={ScrollText}
+          title={t("noSources.title")}
+          description={t("noSources.body")}
+        />
+      ) : (
+        <ApplicationLogsPanel
+          appId={id}
+          sources={sources}
+          selected={selected}
+          initial={initial}
+          initialLines={lines}
+          followPrefs={followPrefs}
+          canManage={canManage}
+        />
+      )}
+    </div>
+  );
+}
+
+function safeDecode(value) {
+  try {
+    return value ? decodeURIComponent(value) : value;
+  } catch {
+    return value;
+  }
+}

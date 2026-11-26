@@ -1,0 +1,31 @@
+<?php
+
+return [
+
+    'policies' => [
+        'legacy_v7' => [
+            'title' => 'v7互換のAIブロック',
+            'description' => 'v7の広範なボット一覧とYandexBotの例外を維持します。',
+        ],
+        'allow_all' => [
+            'title' => 'すべてのAIボットを許可',
+            'description' => 'AIクローラーはブロックされません。',
+        ],
+        'block_training' => [
+            'title' => 'AI学習ボットをブロック',
+            'description' => 'コンテンツをAIモデルの学習に利用するボットを停止します。ChatGPT検索やPerplexityなど、訪問者を送ってくれるAI検索エンジンは引き続き機能します。',
+        ],
+        'block_agents' => [
+            'title' => 'AI学習とAIアシスタントをブロック',
+            'description' => '学習用クローラーと、ページを1件ずつ取得するAIアシスタントを停止します。AI検索エンジンは引き続きインデックスできるため、AIの回答での引用は維持されます。',
+        ],
+        'block_all' => [
+            'title' => 'すべてのAIボットをブロック',
+            'description' => 'AI検索結果からのアクセスを送ってくれるボットも含め、既知のすべてのAIボットをブロックします。',
+        ],
+    ],
+
+    'robots_txt' => [
+        'note' => 'Google（Gemini）と Apple は通常の検索クローラーが取得したページで AI を学習するため、検索から外れずにボットブロックで止めることはできません。AI 学習を拒否するには、アプリケーションの robots.txt に次の行を追加してください:',
+    ],
+];

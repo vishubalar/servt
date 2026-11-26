@@ -1,0 +1,633 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\CommandPipe;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+use Tests\Support\FakeCommandPipe;
+
+/*
+ * Reading a site's own logs. Every read shells out: the files live under /var/log (root-owned) or
+ * in the site's directory (owned by its system user), and the panel account can open neither.
+ */
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    $systemUser = SystemUser::create(['username' => 'logowner', 'home_path' => '/home/logowner']);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Logged Site',
+        'slug' => 'logged-site',
+        'domain' => 'logged.test',
+        'site_type' => 'php',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+    ]);
+
+    // All four in one directory beside public_html, not under it: everything under the document
+    // root is a URL, and an access log names every visitor.
+    $this->files = [
+        '/home/logowner/logged-site/logs/access.log' => "GET / 200\nGET /about 200\nGET /missing 404\n",
+        '/home/logowner/logged-site/logs/error.log' => "PHP Warning: something\n",
+        '/home/logowner/logged-site/logs/app.log' => "sv-app: listening on 3000\n",
+        '/home/logowner/logged-site/logs/app-error.log' => "Error: connect ECONNREFUSED\n",
+    ];
+});
+
+function fakeLogs(): void
+{
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+        [$binary] = $args;
+        $files = test()->files;
+
+        if ($binary === 'test') {
+            return Process::result(exitCode: array_key_exists($args[2] ?? '', $files) ? 0 : 1);
+        }
+
+        if ($binary === 'stat') {
+            $path = $args[4] ?? '';
+
+            // Size from the fixture, a fixed mtime (2026-10-16 12:00:00 UTC).
+            return array_key_exists($path, $files)
+                ? Process::result(output: strlen($files[$path])." 1792152000\n")
+                : Process::result(errorOutput: 'No such file', exitCode: 1);
+        }
+
+        if ($binary === 'tail') {
+            $path = $args[3] ?? '';
+
+            return array_key_exists($path, $files)
+                ? Process::result(output: $files[$path])
+                : Process::result(errorOutput: 'No such file', exitCode: 1);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function logUrl(string $suffix = ''): string
+{
+    return '/api/applications/'.test()->application->id.'/logs'.$suffix;
+}
+
+it('lists the sources this application has, with localized labels', function () {
+    fakeLogs();
+
+    $response = $this->actingAs($this->admin)->getJson(logUrl())->assertOk();
+    $logs = collect($response->json('logs'));
+
+    // Plus the HTTPS block's own files, v7's `-ssl` names.
+    expect($logs->pluck('key')->all())->toBe(['access', 'error', 'access_ssl', 'error_ssl'])
+        ->and($logs->firstWhere('key', 'access_ssl')['label'])->toBe('Access log (HTTPS)')
+        ->and($logs->firstWhere('key', 'error')['label'])->toBe('Error log')
+        ->and($logs->firstWhere('key', 'access')['exists'])->toBeTrue();
+});
+
+it('reports each log file\'s size and last write, so the screen can show which one is filling the disk', function () {
+    fakeLogs();
+    unset($this->files['/home/logowner/logged-site/logs/error.log']);
+
+    $logs = collect($this->actingAs($this->admin)->getJson(logUrl())->assertOk()->json('logs'));
+
+    expect($logs->firstWhere('key', 'access'))
+        ->toMatchArray(['exists' => true, 'size' => strlen("GET / 200\nGET /about 200\nGET /missing 404\n"), 'modified' => '16-10-2026 12:00:00'])
+        // Not written yet: unknown, not a 0-byte file from 1970.
+        ->and($logs->firstWhere('key', 'error'))->toMatchArray(['exists' => false, 'size' => null, 'modified' => null]);
+});
+
+it('reports no size for a log that is not a file', function () {
+    fakeLogs();
+    $this->application->update(['serving_profile' => 'docker']);
+
+    $container = collect($this->actingAs($this->admin)->getJson(logUrl())->json('logs'))->firstWhere('key', 'container');
+
+    expect($container)->toMatchArray(['kind' => 'container', 'exists' => true, 'size' => null, 'modified' => null]);
+});
+
+it('says unknown rather than zero when the size cannot be read', function () {
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        return match ($args[0]) {
+            'test' => Process::result(exitCode: 0),
+            'stat' => Process::result(errorOutput: 'Permission denied', exitCode: 2),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    $access = collect($this->actingAs($this->admin)->getJson(logUrl())->assertOk()->json('logs'))->firstWhere('key', 'access');
+
+    expect($access)->toMatchArray(['exists' => true, 'size' => null, 'modified' => null]);
+});
+
+it('offers the process output only for an application that runs one', function () {
+    fakeLogs();
+
+    // A PHP site has no process, so no output source.
+    expect(collect($this->actingAs($this->admin)->getJson(logUrl())->json('logs'))->pluck('key'))
+        ->not->toContain('application');
+
+    $this->application->update(['start_command' => 'node server.js']);
+
+    $logs = collect($this->actingAs($this->admin)->getJson(logUrl())->json('logs'));
+
+    // For a Node site the web-server logs describe the proxy, so the process output is needed.
+    // Two file sources, not one journal stream: "what did it print" and "what went wrong" are
+    // different questions, and merging them buries the second in the first.
+    expect($logs->pluck('key'))->toContain('application')
+        ->toContain('application_error')
+        ->and($logs->firstWhere('key', 'application')['kind'])->toBe('file')
+        ->and($logs->firstWhere('key', 'application_error')['kind'])->toBe('file');
+});
+
+it('reads a log', function () {
+    fakeLogs();
+
+    $response = $this->actingAs($this->admin)->getJson(logUrl('/access'))->assertOk();
+
+    expect($response->json('log.lines'))->toBe(['GET / 200', 'GET /about 200', 'GET /missing 404'])
+        ->and($response->json('log.exists'))->toBeTrue()
+        ->and($response->json('log.truncated'))->toBeFalse();
+});
+
+it('filters literally, not as a regex', function () {
+    fakeLogs();
+
+    expect($this->actingAs($this->admin)->getJson(logUrl('/access?grep=404'))->json('log.lines'))
+        ->toBe(['GET /missing 404']);
+
+    // A regex metacharacter is matched as itself; a user-supplied regex run over a large file
+    // is a denial of service.
+    expect($this->actingAs($this->admin)->getJson(logUrl('/access?grep=.*'))->json('log.lines'))
+        ->toBe([]);
+});
+
+it('reads the process output from the site\'s own log directory', function () {
+    $this->application->update(['start_command' => 'node server.js']);
+    fakeLogs();
+
+    expect($this->actingAs($this->admin)->getJson(logUrl('/application'))->json('log.lines'))
+        ->toContain('sv-app: listening on 3000');
+});
+
+it('shows a Node app\'s coloured output without the colour codes (bug #63)', function () {
+    $this->application->update(['start_command' => 'node server.js']);
+    $this->files['/home/logowner/logged-site/logs/app.log'] = "\e[32minfo\e[39m: listening on \e[1m3000\e[22m\n";
+    fakeLogs();
+
+    // The screen showed `[32minfo[39m`. A search matches the visible text.
+    expect($this->actingAs($this->admin)->getJson(logUrl('/application?grep=info: listening'))->json('log.lines'))
+        ->toBe(['info: listening on 3000']);
+});
+
+it('keeps the process\'s errors in a source of their own', function () {
+    // Merged into stdout, a stack trace is one line among thousands of
+    // request logs; separate, it is the first thing on the screen.
+    $this->application->update(['start_command' => 'node server.js']);
+    fakeLogs();
+
+    expect($this->actingAs($this->admin)->getJson(logUrl('/application_error'))->json('log.lines'))
+        ->toContain('Error: connect ECONNREFUSED');
+});
+
+it('answers calmly when the file does not exist yet', function () {
+    $this->files = [];
+    fakeLogs();
+
+    // A site nobody has visited has no access log. That is not an error.
+    $response = $this->actingAs($this->admin)->getJson(logUrl('/access'))->assertOk();
+
+    expect($response->json('log.exists'))->toBeFalse()
+        ->and($response->json('log.lines'))->toBe([]);
+});
+
+it('refuses a source it does not recognise', function () {
+    fakeLogs();
+
+    // The client names a key; the path comes from the driver. Nothing here
+    // can be pointed at a file of the caller's choosing.
+    $this->actingAs($this->admin)->getJson(logUrl('/etc-passwd'))->assertNotFound();
+    $this->actingAs($this->admin)->getJson(logUrl('/application'))->assertNotFound();
+});
+
+it('caps how much can be asked for', function () {
+    fakeLogs();
+
+    $this->actingAs($this->admin)->getJson(logUrl('/access?lines=999999'))
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('lines');
+});
+
+describe('permissions', function () {
+    it('is not satisfied by the server-wide logs permission', function () {
+        fakeLogs();
+        $user = User::factory()->create();
+        grantPermission($user, 'logs', view: true);
+
+        // Server `logs` is auth.log and syslog; `app_log` is one site's own traffic. Letting one
+        // stand in for the other is escalation.
+        $this->actingAs($user)->getJson(logUrl())->assertForbidden();
+    });
+
+    it('allows a user granted app_log', function () {
+        fakeLogs();
+        $user = User::factory()->create();
+        grantPermission($user, 'app_log', view: true);
+
+        $this->actingAs($user)->getJson(logUrl())->assertOk();
+        $this->actingAs($user)->getJson(logUrl('/access'))->assertOk();
+    });
+
+    it('denies an unauthenticated caller', function () {
+        fakeLogs();
+
+        $this->getJson(logUrl())->assertUnauthorized();
+    });
+});
+
+describe('a read that fails is not an empty log', function () {
+    it('reports a denied read as a failure, not as a site with no logs yet', function () {
+        // The file is there (`test -f` says so) but reading it fails: sudo refused, a wrong path,
+        // a timeout. It used to render as `exists: false`, i.e. "this site has no logs".
+        Process::fake(function ($process) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($args[0] ?? '') === 'test') {
+                return Process::result(exitCode: 0);
+            }
+
+            if (($args[0] ?? '') === 'tail') {
+                return Process::result(errorOutput: 'tail: cannot open: Permission denied', exitCode: 1);
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        $this->actingAs($this->admin)
+            ->getJson(logUrl('/error'))
+            ->assertStatus(500)
+            ->assertJsonPath('code', 'server_operation_failed')
+            ->assertJsonStructure(['message', 'reference']);
+    });
+
+    it('still reports a log that has genuinely never been written', function () {
+        // `test -f` says no: a site nobody has visited has no access log, which is an answer, not a
+        // fault.
+        Process::fake(function ($process) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($args[0] ?? '') === 'test') {
+                return Process::result(exitCode: 1);
+            }
+
+            if (($args[0] ?? '') === 'tail') {
+                return Process::result(errorOutput: 'No such file', exitCode: 1);
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        $this->actingAs($this->admin)
+            ->getJson(logUrl('/access'))
+            ->assertOk()
+            ->assertJsonPath('log.exists', false)
+            ->assertJsonPath('log.lines', []);
+    });
+});
+
+/**
+ * A `tail` that honours `-n`, which the fake above deliberately does not.
+ *
+ * These tests separate "that is the whole log" from "that is the end of the log", so a fake that
+ * always returns the whole file would answer the question before it was asked.
+ */
+function fakeBigLog(int $totalLines): void
+{
+    Process::fake(function ($process) use ($totalLines) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($args[0] ?? '') === 'test') {
+            return Process::result(exitCode: 0);
+        }
+
+        if (($args[0] ?? '') === 'tail') {
+            $asked = (int) ($args[2] ?? 0);
+            $from = max(1, $totalLines - $asked + 1);
+
+            $lines = [];
+
+            for ($i = $from; $i <= $totalLines; $i++) {
+                // One line far back mentions the needle, beyond a capped search window.
+                $lines[] = $i === 10 ? "line {$i} NEEDLE" : "line {$i}";
+            }
+
+            return Process::result(output: implode("\n", $lines)."\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+describe('how much of the log you are actually seeing', function () {
+    it('says the log is truncated when there is more above', function () {
+        fakeBigLog(1_000);
+
+        $response = $this->actingAs($this->admin)
+            ->getJson(logUrl('/access?lines=200'))->assertOk();
+
+        // `tail -n 200` never returns more than 200 lines, so comparing its count against 200 proves
+        // nothing: the last 200 lines of a huge log were reported as the whole log.
+        expect($response->json('log.lines'))->toHaveCount(200)
+            ->and($response->json('log.truncated'))->toBeTrue();
+    });
+
+    it('says it is not truncated when the whole log fits', function () {
+        fakeBigLog(50);
+
+        $response = $this->actingAs($this->admin)
+            ->getJson(logUrl('/access?lines=200'))->assertOk();
+
+        expect($response->json('log.lines'))->toHaveCount(50)
+            ->and($response->json('log.truncated'))->toBeFalse()
+            ->and($response->json('log.search_window_capped'))->toBeFalse();
+    });
+
+    it('admits when a search could not cover the whole log', function () {
+        fakeBigLog(50_000);
+
+        $response = $this->actingAs($this->admin)
+            ->getJson(logUrl('/access?grep=NEEDLE'))->assertOk();
+
+        // The needle is at line 10, outside the 5,000-line search window. Without this field an
+        // empty list reads as "not in your log" when the truth is "only the end was searched".
+        expect($response->json('log.lines'))->toBe([])
+            ->and($response->json('log.search_window_capped'))->toBeTrue();
+    });
+
+    it('does not claim a capped window when the search saw everything', function () {
+        fakeBigLog(20);
+
+        $response = $this->actingAs($this->admin)
+            ->getJson(logUrl('/access?grep=NEEDLE'))->assertOk();
+
+        expect($response->json('log.search_window_capped'))->toBeFalse();
+    });
+});
+
+/*
+ * Emptying a log: offered for a site's own logs only. The server-wide catalogue includes auth.log,
+ * ufw.log and fail2ban.log, and a one-click wipe of those would be an anti-forensics button.
+ */
+
+it('empties a log by truncating it, never by deleting it', function () {
+    $runs = new ArrayObject;
+
+    Process::fake(function ($process) use ($runs) {
+        $runs[] = $process->command;
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->actingAs($this->admin)->deleteJson(logUrl('/access'))->assertOk();
+
+    $commands = collect($runs)->map(fn ($c) => ($c[0] ?? '') === 'sudo' ? array_slice($c, 2) : $c);
+    $truncate = $commands->first(fn ($c) => ($c[0] ?? '') === 'truncate');
+
+    // Truncate, because an unlinked open log keeps its space until the writer restarts: `rm` would
+    // free nothing and leave nginx appending to a file no screen can read.
+    expect($truncate)->not->toBeNull()
+        ->and($truncate)->toBe(['truncate', '-s', '0', '/home/logowner/logged-site/logs/access.log'])
+        ->and($commands->pluck(0)->all())->not->toContain('rm');
+});
+
+it('records who emptied which log', function () {
+    fakeLogs();
+
+    $this->actingAs($this->admin)->deleteJson(logUrl('/error'))->assertOk();
+
+    // Destroying a record without recording that it was destroyed is the worst version of this
+    // feature.
+    $entry = ActivityLog::query()->where('action', 'log_cleared')->first();
+
+    expect($entry)->not->toBeNull()
+        ->and($entry->properties['log'])->toBe('error')
+        ->and($entry->subject_id)->toBe($this->application->id)
+        // The placeholder must be filled: it once read "Cleared the error log for :subject".
+        ->and(__('activity.application.log_cleared', $entry->properties))
+        ->toBe('Cleared the error log for '.$this->application->name);
+});
+
+it('refuses a source this application does not have', function () {
+    fakeLogs();
+
+    // Not a 500, and nothing truncated: the key is resolved through the same catalogue every read
+    // uses, so a request cannot name a path of its own.
+    $this->actingAs($this->admin)->deleteJson(logUrl('/auth'))->assertNotFound();
+    $this->actingAs($this->admin)->deleteJson(logUrl('/..%2F..%2Fetc%2Fpasswd'))->assertNotFound();
+});
+
+it('denies a viewer who may read logs but not manage them', function () {
+    fakeLogs();
+
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_log', view: true, manage: false);
+
+    // Reading a log and destroying it are not the same trust.
+    $this->actingAs($viewer)->deleteJson(logUrl('/access'))->assertForbidden();
+    $this->actingAs($viewer)->getJson(logUrl('/access'))->assertOk();
+});
+
+it('reports a failed truncate rather than claiming the log is empty', function () {
+    // Matched on the binary anywhere in the argv, not at index 0: phpunit.xml sets
+    // SERVER_OPS_SUDO=false so commands arrive bare, while production sees `sudo -n truncate …`.
+    Process::fake(fn ($process) => in_array('truncate', $process->command, true)
+        ? Process::result(exitCode: 1, errorOutput: 'truncate: cannot open: Permission denied')
+        : Process::result(exitCode: 0));
+
+    $this->actingAs($this->admin)
+        ->deleteJson(logUrl('/access'))
+        ->assertStatus(500)
+        ->assertJsonStructure(['message', 'reference']);
+});
+
+describe('downloading a whole log (LOG-dl)', function () {
+    beforeEach(function () {
+        FakeCommandPipe::reset();
+        FakeCommandPipe::$resolver = function (array $command): array {
+            $path = (string) end($command);
+
+            return array_key_exists($path, test()->files) ? [test()->files[$path], 0] : ['', 1];
+        };
+        app()->instance(CommandPipe::class, new FakeCommandPipe);
+    });
+
+    it('streams the file as an attachment and records who took it', function () {
+        fakeLogs();
+
+        $response = $this->actingAs($this->admin)->get(logUrl('/access/download'))->assertOk();
+
+        expect($response->streamedContent())->toBe("GET / 200\nGET /about 200\nGET /missing 404\n")
+            ->and($response->headers->get('Content-Disposition'))->toBe('attachment; filename="logged-site-access.log"')
+            ->and(ActivityLog::where('action', 'log_downloaded')->exists())->toBeTrue()
+            ->and(implode(' ', FakeCommandPipe::$opened))->toContain('cat /home/logowner/logged-site/logs/access.log');
+    });
+
+    it('answers 404 for a log that is not there yet, and for a source this site does not have', function () {
+        fakeLogs();
+        unset($this->files['/home/logowner/logged-site/logs/access.log']);
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access/download'))->assertNotFound();
+        $this->actingAs($this->admin)->getJson(logUrl('/nope/download'))->assertNotFound();
+    });
+
+    it('needs the application log permission', function () {
+        fakeLogs();
+
+        $this->actingAs(User::factory()->create())->getJson(logUrl('/access/download'))->assertForbidden();
+    });
+});
+
+describe('v7\'s advanced logs: a line range and field filters', function () {
+    beforeEach(function () {
+        $access = [
+            '203.0.113.5 - - [17/Oct/2026:10:00:01 +0000] "GET / HTTP/1.1" 200 512 "-" "curl"',
+            '198.51.100.7 - - [17/Oct/2026:10:00:02 +0000] "POST /wp-login.php HTTP/1.1" 403 404 "-" "bot"',
+            '203.0.113.5 - - [17/Oct/2026:10:00:03 +0000] "GET /missing-404 HTTP/1.1" 404 128 "-" "curl"',
+            '203.0.113.55 - - [17/Oct/2026:10:00:04 +0000] "GET /api/orders HTTP/2.0" 502 0 "-" "app"',
+            'a line that is not in the combined format',
+            '203.0.113.5 - - [17/Oct/2026:10:00:05 +0000] "DELETE /api/orders/9 HTTP/1.1" 500 64 "-" "app"',
+        ];
+        $this->files['/home/logowner/logged-site/logs/access.log'] = implode("\n", $access)."\n";
+
+        FakeCommandPipe::reset();
+        // `tail -n +N file`: from line N to the end.
+        FakeCommandPipe::$resolver = function (array $command): array {
+            $path = (string) end($command);
+            if (! array_key_exists($path, test()->files)) {
+                return ['', 1];
+            }
+            $from = (int) ltrim($command[2], '+');
+            $lines = explode("\n", rtrim(test()->files[$path], "\n"));
+
+            return [implode("\n", array_slice($lines, $from - 1))."\n", 0];
+        };
+        app()->instance(CommandPipe::class, new FakeCommandPipe);
+    });
+
+    it('reads from a given line, numbered from the top of the file', function () {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?from=2&lines=2'))
+            ->assertOk()
+            ->assertJsonPath('log.first_line', 2)
+            ->assertJsonPath('log.truncated', true)
+            ->assertJsonCount(2, 'log.lines')
+            ->assertJsonPath('log.lines.0', fn ($line) => str_contains($line, 'POST /wp-login.php'))
+            ->assertJsonPath('log.lines.1', fn ($line) => str_contains($line, 'GET /missing-404'));
+
+        expect(implode(' ', FakeCommandPipe::$opened))->toContain('tail -n +2 /home/logowner/logged-site/logs/access.log');
+    });
+
+    it('says when a range reaches the end of the file', function () {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?from=5&lines=10'))
+            ->assertOk()
+            ->assertJsonPath('log.truncated', false)
+            ->assertJsonCount(2, 'log.lines');
+    });
+
+    it('filters by IP exactly — not every address that starts with it', function () {
+        fakeLogs();
+
+        $lines = $this->actingAs($this->admin)->getJson(logUrl('/access?ip=203.0.113.5'))->assertOk()->json('log.lines');
+
+        expect($lines)->toHaveCount(3)
+            ->and(implode("\n", $lines))->not->toContain('203.0.113.55');
+    });
+
+    it('filters by status — the status, not a 404 anywhere in the line', function () {
+        fakeLogs();
+
+        $lines = $this->actingAs($this->admin)->getJson(logUrl('/access?status=404'))->assertOk()->json('log.lines');
+
+        // The 403 line has "404" as its byte count; the 404 line also has it in the URL.
+        expect($lines)->toHaveCount(1)->and($lines[0])->toContain('GET /missing-404');
+    });
+
+    it('filters by a status class', function () {
+        fakeLogs();
+
+        $lines = $this->actingAs($this->admin)->getJson(logUrl('/access?status=5xx'))->assertOk()->json('log.lines');
+
+        expect($lines)->toHaveCount(2);
+    });
+
+    it('combines method, URL and IP, and with the text search', function () {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?method=delete&url=/api/orders&ip=203.0.113.5'))
+            ->assertOk()->assertJsonCount(1, 'log.lines')
+            ->assertJsonPath('log.lines.0', fn ($line) => str_contains($line, 'DELETE /api/orders/9'));
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?url=/api/orders&grep=app'))
+            ->assertOk()->assertJsonCount(2, 'log.lines');
+    });
+
+    it('applies the filters inside a range too', function () {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?from=3&status=404'))
+            ->assertOk()
+            ->assertJsonPath('log.first_line', 3)
+            ->assertJsonCount(1, 'log.lines');
+    });
+
+    it('refuses field filters on a log that has no such fields', function () {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/error?status=500'))
+            ->assertStatus(422)
+            ->assertJsonPath('errors.log.0', __('app_log.errors.fields_unsupported'));
+    });
+
+    it('validates the filters', function (string $query, string $field) {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?'.$query))
+            ->assertStatus(422)->assertJsonValidationErrors($field);
+    })->with([
+        ['from=0', 'from'],
+        ['ip=not-an-ip', 'ip'],
+        ['status=600', 'status'],
+        ['status=4x', 'status'],
+        ['method=TRACE', 'method'],
+    ]);
+
+    it('answers calmly for a range of a log that does not exist yet', function () {
+        fakeLogs();
+        unset($this->files['/home/logowner/logged-site/logs/access.log']);
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access?from=1'))
+            ->assertOk()
+            ->assertJsonPath('log.exists', false)
+            ->assertJsonPath('log.first_line', null);
+    });
+
+    it('keeps the tail read unchanged, with no line number', function () {
+        fakeLogs();
+
+        $this->actingAs($this->admin)->getJson(logUrl('/access'))
+            ->assertOk()
+            ->assertJsonPath('log.first_line', null)
+            ->assertJsonCount(6, 'log.lines');
+    });
+});

@@ -1,0 +1,433 @@
+<?php
+
+use App\Models\Application;
+use App\Models\Permission;
+use App\Models\SystemUser;
+use App\Models\User;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+
+/**
+ * A non-admin user granted only the `system_user` permission (via a role),
+ * to prove pure role-based gating without relying on admin.
+ */
+function systemUserManager(bool $manage = true): User
+{
+    $user = User::factory()->create();
+    grantPermission($user, 'system_user', view: true, manage: $manage);
+
+    return $user;
+}
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+});
+
+it('creates a system user, running useradd and persisting the row', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy']);
+
+    $response->assertCreated()
+        ->assertJsonPath('system_user.username', 'deploy')
+        ->assertJsonPath('system_user.home_path', '/home/deploy');
+
+    expect(SystemUser::where('username', 'deploy')->exists())->toBeTrue();
+    Process::assertRan(fn ($process) => $process->command === ['useradd', '-m', '-s', '/bin/bash', 'deploy']);
+});
+
+it('returns a translated error with a reference when useradd fails', function () {
+    // getent answered too ("no such name"): unfaked, it reads the machine
+    // running the tests, which may well have a `deploy` account.
+    Process::fake(fn ($process) => match (true) {
+        in_array('getent', (array) $process->command, true) => Process::result(exitCode: 2),
+        in_array('useradd', (array) $process->command, true) => Process::result(output: '', errorOutput: 'boom', exitCode: 1),
+        default => Process::result(),
+    });
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy']);
+
+    $response->assertStatus(500)
+        ->assertJsonPath('message', 'Failed to create the system user on the server.')
+        ->assertJsonStructure(['message', 'reference']);
+
+    expect(SystemUser::where('username', 'deploy')->exists())->toBeFalse();
+});
+
+it('creates a system user with sudo, ssh_access, shell and password set in one call', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', [
+            'username' => 'deploy',
+            // A login shell, because ssh_access is on: a no-login shell with it is refused,
+            // since sshd would authenticate and then close the session.
+            'shell' => '/bin/bash',
+            'sudo' => true,
+            'ssh_access' => true,
+            'password' => 'Str0ngPassword!',
+        ]);
+
+    $response->assertCreated()
+        ->assertJsonPath('system_user.shell', '/bin/bash')
+        ->assertJsonPath('system_user.sudo', true)
+        ->assertJsonPath('system_user.ssh_access', true)
+        ->assertJsonPath('system_user.password', 'Str0ngPassword!');
+
+    Process::assertRan(fn ($process) => $process->command === [
+        'useradd', '-m', '-s', '/bin/bash', '-G', 'sudo,ssh-users', 'deploy',
+    ]);
+    // The group must be made before useradd names it, or useradd refuses the
+    // whole command and no account is created at all.
+    Process::assertRan(fn ($process) => $process->command === ['groupadd', '-f', 'ssh-users']);
+    Process::assertRan(fn ($process) => $process->command === ['chpasswd']);
+
+    expect(SystemUser::where('username', 'deploy')->first())
+        ->sudo->toBeTrue()
+        ->ssh_access->toBeTrue()
+        ->password->toBe('Str0ngPassword!');
+});
+
+it('defaults shell/sudo/ssh_access/password when none are given, unchanged from before', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy'])
+        ->assertCreated()
+        ->assertJsonPath('system_user.shell', '/bin/bash')
+        ->assertJsonPath('system_user.sudo', false)
+        ->assertJsonPath('system_user.ssh_access', false)
+        ->assertJsonPath('system_user.password', null);
+
+    Process::assertNotRan(fn ($process) => in_array('chpasswd', $process->command, true));
+});
+
+it('rejects a shell not on the allowlist at creation', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy', 'shell' => '/bin/evil'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('shell');
+});
+
+it('rejects a weak password at creation', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy', 'password' => 'short'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('password');
+});
+
+it('removes the OS account and panel row when chpasswd fails after user creation', function () {
+    Process::fake(fn ($process) => in_array('chpasswd', $process->command, true)
+        ? Process::result(exitCode: 1, errorOutput: 'boom')
+        : Process::result(exitCode: 0));
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy', 'password' => 'Str0ngPassword!'])
+        ->assertStatus(500);
+
+    expect(SystemUser::where('username', 'deploy')->exists())->toBeFalse();
+    Process::assertRan(fn ($process) => in_array('userdel', $process->command, true)
+        && in_array('-r', $process->command, true)
+        && in_array('deploy', $process->command, true));
+});
+
+it('removes the OS account and panel row when SSH-key setup fails', function () {
+    Process::fake(fn ($process) => in_array('tee', $process->command, true)
+        ? Process::result(exitCode: 1, errorOutput: 'boom')
+        : Process::result(exitCode: 0));
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', [
+            'username' => 'deploy',
+            'public_key' => 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC2jl2RaIM4z9e4xdFQkCOWCbJkF8PqwX5IaDLbPbIGW test',
+        ])
+        ->assertStatus(500);
+
+    expect(SystemUser::where('username', 'deploy')->exists())->toBeFalse();
+    Process::assertRan(fn ($process) => in_array('userdel', $process->command, true)
+        && in_array('-r', $process->command, true)
+        && in_array('deploy', $process->command, true));
+});
+
+it('labels the first key with its own comment, not "default" (FS-C30)', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->postJson('/api/system-users', [
+            'username' => 'deploy',
+            'public_key' => 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC2jl2RaIM4z9e4xdFQkCOWCbJkF8PqwX5IaDLbPbIGW dipali@laptop',
+        ])
+        ->assertCreated();
+
+    expect(SystemUser::where('username', 'deploy')->first()->sshKeys()->value('name'))->toBe('dipali@laptop');
+});
+
+it('rejects reserved usernames', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'root'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('username');
+});
+
+it('rejects invalid usernames', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'Bad Name!'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('username');
+});
+
+it('lists system users with a minimal applications array', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+    $su = SystemUser::create(['username' => 'app1', 'home_path' => '/home/app1', 'shell' => '/bin/bash']);
+    Application::create(['system_user_id' => $su->id, 'name' => 'Shop', 'site_type' => 'wordpress', 'status' => 'active']);
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/system-users');
+
+    $response->assertOk()
+        ->assertJsonPath('system_users.0.username', 'app1')
+        ->assertJsonPath('system_users.0.applications.0.name', 'Shop');
+    // minimal: only id + name, no site_type on the list
+    expect($response->json('system_users.0.applications.0'))->not->toHaveKey('site_type');
+});
+
+it('blocks deleting a system user that still owns applications', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+    $su = SystemUser::create(['username' => 'app1', 'home_path' => '/home/app1', 'shell' => '/bin/bash']);
+    Application::create(['system_user_id' => $su->id, 'name' => 'Shop', 'site_type' => 'wordpress', 'status' => 'active']);
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/system-users/{$su->id}")
+        ->assertUnprocessable();
+
+    expect(SystemUser::find($su->id))->not->toBeNull();
+    Process::assertNotRan(fn ($process) => str_contains(implode(' ', $process->command), 'userdel'));
+});
+
+it('deletes a system user, running userdel', function () {
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('t')->plainTextToken;
+    $su = SystemUser::create(['username' => 'gone', 'home_path' => '/home/gone', 'shell' => '/bin/bash']);
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/system-users/{$su->id}")
+        ->assertNoContent();
+
+    expect(SystemUser::find($su->id))->toBeNull();
+    Process::assertRan(fn ($process) => $process->command === ['userdel', '-r', 'gone']);
+});
+
+/*
+ * userdel removes a user's own group only when nobody else is in it, and provisioning a site
+ * puts the web server's account in it to write the logs. Without removing it first, every
+ * deleted user left its group behind and the name could never be reused.
+ */
+it('empties the user\'s own group before userdel, so the group goes with the user', function () {
+    $ran = collect();
+    Process::fake(function ($process) use ($ran) {
+        $ran->push($process->command);
+
+        return $process->command === ['getent', 'group', 'gone']
+            ? Process::result(output: "gone:x:1007:nobody,www-data\n")
+            : Process::result();
+    });
+    $admin = User::factory()->admin()->create();
+    $su = SystemUser::create(['username' => 'gone', 'home_path' => '/home/gone', 'shell' => '/bin/bash']);
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->deleteJson("/api/system-users/{$su->id}")
+        ->assertNoContent();
+
+    $order = $ran->map(fn (array $c) => implode(' ', $c))->values()->all();
+    $userdel = array_search('userdel -r gone', $order, true);
+
+    // Both members out, and both before the user goes.
+    expect(array_search('gpasswd -d nobody gone', $order, true))->toBeLessThan($userdel)
+        ->and(array_search('gpasswd -d www-data gone', $order, true))->toBeLessThan($userdel)
+        ->and($userdel)->not->toBeFalse();
+});
+
+it('runs no gpasswd when the user\'s group has no other members', function () {
+    Process::fake(fn ($process) => $process->command === ['getent', 'group', 'gone']
+        ? Process::result(output: "gone:x:1007:\n")
+        : Process::result());
+    $admin = User::factory()->admin()->create();
+    $su = SystemUser::create(['username' => 'gone', 'home_path' => '/home/gone', 'shell' => '/bin/bash']);
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->deleteJson("/api/system-users/{$su->id}")
+        ->assertNoContent();
+
+    Process::assertNotRan(fn ($process) => in_array('gpasswd', $process->command, true));
+    Process::assertRan(fn ($process) => $process->command === ['userdel', '-r', 'gone']);
+});
+
+it('denies a user without the system_user manage permission from creating', function () {
+    Process::fake();
+    $viewer = systemUserManager(manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy'])
+        ->assertForbidden();
+});
+
+it('allows a non-admin with the system_user permission (pure role-based)', function () {
+    Process::fake();
+    $manager = systemUserManager();
+    $token = $manager->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/system-users', ['username' => 'deploy'])
+        ->assertCreated();
+});
+
+it('refuses a password that would give chpasswd a second line, before anything runs', function () {
+    // chpasswd reads one account per line: a newline in the password could set another
+    // account's password.
+    Process::fake();
+    $admin = User::factory()->admin()->create();
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->postJson('/api/system-users', ['username' => 'deploy', 'password' => "Password123\nroot:Hijacked999"])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('password');
+
+    Process::assertNothingRan();
+    expect(SystemUser::count())->toBe(0);
+});
+
+it('says the name is taken on the server when useradd exits 9, not a 500', function () {
+    // The name is unique in the panel's table only; the server has accounts
+    // and groups the panel never made (`lsadm`, `ssh-users`, `panel`).
+    Process::fake(fn ($p) => in_array('useradd', $p->command, true)
+        ? Process::result(errorOutput: "useradd: user 'lsadm' already exists", exitCode: 9)
+        : Process::result());
+    $admin = User::factory()->admin()->create();
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->postJson('/api/system-users', ['username' => 'lsadm'])
+        ->assertUnprocessable()
+        ->assertJsonPath('errors.username.0', __('errors/system-user.username_taken_on_server'));
+
+    expect(SystemUser::count())->toBe(0);
+    // Not a failed create to clean up after: nothing was created.
+    Process::assertNotRan(fn ($p) => in_array('userdel', $p->command, true));
+});
+
+it('says the user still has processes when userdel exits 8, and keeps the row', function () {
+    Process::fake(fn ($p) => in_array('userdel', $p->command, true)
+        ? Process::result(errorOutput: 'userdel: user deploy is currently used by process 23458', exitCode: 8)
+        : Process::result());
+    $admin = User::factory()->admin()->create();
+    $su = SystemUser::create(['username' => 'deploy', 'home_path' => '/home/deploy', 'shell' => '/bin/bash']);
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->deleteJson("/api/system-users/{$su->id}")
+        ->assertUnprocessable()
+        ->assertJsonPath('errors.system_user.0', __('errors/system-user.has_processes', ['username' => 'deploy']));
+
+    expect(SystemUser::find($su->id))->not->toBeNull();
+    // Not asked to: nobody's session is ended behind their back.
+    Process::assertNotRan(fn ($p) => in_array('kill', $p->command, true));
+});
+
+it('ends the account\'s sessions first when asked, then deletes it (FS-C31)', function () {
+    $alive = new ArrayObject(['4101', '4102']);
+
+    Process::fake(function ($p) use ($alive) {
+        $command = array_values(array_filter($p->command, fn ($a) => ! in_array($a, ['sudo', '-n'], true)));
+
+        return match ($command[0] ?? '') {
+            'ps' => $alive->count() > 0 ? Process::result(output: implode("\n", $alive->getArrayCopy())."\n") : Process::result(exitCode: 1),
+            'kill' => tap(Process::result(), fn () => $alive->exchangeArray([])),
+            'userdel' => $alive->count() > 0
+                ? Process::result(errorOutput: 'userdel: user deploy is currently used by process 4101', exitCode: 8)
+                : Process::result(),
+            default => Process::result(),
+        };
+    });
+    $admin = User::factory()->admin()->create();
+    $su = SystemUser::create(['username' => 'deploy', 'home_path' => '/home/deploy', 'shell' => '/bin/bash']);
+
+    $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+        ->deleteJson("/api/system-users/{$su->id}?end_sessions=1")
+        ->assertNoContent();
+
+    expect(SystemUser::find($su->id))->toBeNull();
+    Process::assertRan(fn ($p) => in_array('kill', $p->command, true) && in_array('-KILL', $p->command, true)
+        && in_array('4101', $p->command, true) && in_array('4102', $p->command, true));
+});
+
+describe('a user already removed from the server (bug #26)', function () {
+    it('finishes the panel\'s side instead of failing forever', function () {
+        // userdel exits 6 for a name the server no longer has; getent agrees.
+        Process::fake(fn ($p) => match (true) {
+            in_array('userdel', $p->command, true) => Process::result(errorOutput: "userdel: user 'gone' does not exist", exitCode: 6),
+            in_array('getent', $p->command, true) && in_array('passwd', $p->command, true) => Process::result(exitCode: 2),
+            default => Process::result(),
+        });
+        $admin = User::factory()->admin()->create();
+        $su = SystemUser::create(['username' => 'gone', 'home_path' => '/home/gone', 'shell' => '/bin/bash']);
+
+        $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+            ->deleteJson("/api/system-users/{$su->id}")
+            ->assertSuccessful();
+
+        expect(SystemUser::count())->toBe(0);
+    });
+
+    it('still fails when the server says the user is there after all', function () {
+        // Exit 6 alone is not trusted: the row is only removed when getent
+        // cannot find the account either.
+        Process::fake(fn ($p) => match (true) {
+            in_array('userdel', $p->command, true) => Process::result(exitCode: 6),
+            in_array('getent', $p->command, true) && in_array('passwd', $p->command, true) => Process::result(output: "gone:x:1001:1001::/home/gone:/bin/bash\n"),
+            default => Process::result(),
+        });
+        $admin = User::factory()->admin()->create();
+        $su = SystemUser::create(['username' => 'gone', 'home_path' => '/home/gone', 'shell' => '/bin/bash']);
+
+        $this->withHeader('Authorization', 'Bearer '.$admin->createToken('t')->plainTextToken)
+            ->deleteJson("/api/system-users/{$su->id}")
+            ->assertServerError();
+
+        expect(SystemUser::count())->toBe(1);
+    });
+});

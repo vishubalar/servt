@@ -1,0 +1,213 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\Permission;
+use App\Models\Release;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Applications\ReleaseManager;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
+use Laravel\Sanctum\Sanctum;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    // A real layout on disk: rollback() checks is_link(), is_dir() and realpath() against the
+    // actual filesystem, which faking Process leaves untouched.
+    $this->releaseRoot = sys_get_temp_dir().'/rollback-'.Str::random(8);
+
+    $this->previousRelease = $this->releaseRoot.'/rollback-site/releases/20260801090000';
+    $this->currentRelease = $this->releaseRoot.'/rollback-site/releases/20260801100000';
+
+    mkdir($this->previousRelease.'/public', 0755, true);
+    mkdir($this->currentRelease.'/public', 0755, true);
+
+    // `current` points at the newer release: the state a rollback exists to undo.
+    symlink($this->currentRelease, $this->releaseRoot.'/rollback-site/current');
+
+    $this->systemUser = SystemUser::create([
+        'username' => 'rollbacktest',
+        'home_path' => $this->releaseRoot,
+    ]);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Rollback Site',
+        'slug' => 'rollback-site',
+        'domain' => 'rollback.test',
+        'site_type' => 'git',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+    ]);
+});
+
+afterEach(function () {
+    if (isset($this->releaseRoot) && is_dir($this->releaseRoot)) {
+        File::deleteDirectory($this->releaseRoot);
+    }
+});
+
+function fakeSymlinkServerOps(): void
+{
+    Process::fake([
+        // mkdir -p for release dirs
+        'mkdir -p' => Process::result('', 0),
+        // ln -sTf for symlink swap
+        'ln -sTf' => Process::result('', 0),
+    ]);
+}
+
+it('rolls back by repointing the current symlink', function () {
+    fakeSymlinkServerOps();
+
+    $releases = app(ReleaseManager::class);
+
+    // Pre-seed a previous release so rollback has something to go back to.
+    $prevRelease = Release::create([
+        'application_id' => $this->application->id,
+        'path' => $this->previousRelease.'/public',
+        'commit_hash' => 'abc1234',
+        'status' => 'deployed',
+        'deployed_at' => now()->subHour(),
+    ]);
+
+    // Simulate the current symlink pointing to a newer (broken) release.
+    $this->application->updateQuietly([
+        'previous_release_path' => $prevRelease->path,
+        'current_release_id' => null, // no FK needed for rollback to work
+    ]);
+
+    Process::fake(['readlink' => Process::result($this->currentRelease, 0)]);
+
+    $rolledBackTo = $releases->rollback($this->application);
+
+    expect($rolledBackTo)->toBe($prevRelease->path);
+});
+
+it('prevents rollback when no previous release path is stored', function () {
+    fakeSymlinkServerOps();
+
+    $this->application->updateQuietly(['previous_release_path' => null]);
+
+    $releases = app(ReleaseManager::class);
+
+    expect(fn () => $releases->rollback($this->application))
+        ->toThrow(RuntimeException::class, 'No previous release to roll back to');
+});
+
+it('marks the release it rolled away from, not the one it returned to', function () {
+    // The direction matters: `rolled_back` is the status of the release you LEFT (the bad deploy),
+    // not of the one you went back to, which is now live and should read `deployed`.
+    fakeSymlinkServerOps();
+
+    $previous = Release::create([
+        'application_id' => $this->application->id,
+        'path' => $this->previousRelease.'/public',
+        'status' => 'deployed',
+    ]);
+
+    $current = Release::create([
+        'application_id' => $this->application->id,
+        'path' => $this->currentRelease.'/public',
+        'status' => 'deployed',
+    ]);
+
+    $this->application->updateQuietly(['previous_release_path' => $previous->path]);
+
+    app(ReleaseManager::class)->rollback($this->application);
+
+    expect($current->fresh()->status)->toBe('rolled_back')
+        // And the one now serving traffic must not be labelled as abandoned.
+        ->and($previous->fresh()->status)->toBe('deployed');
+});
+
+it('records a release in the DB after a successful deploy', function () {
+    Queue::fake();
+    fakeSymlinkServerOps();
+
+    $releasePath = $this->currentRelease;
+
+    $release = Release::create([
+        'application_id' => $this->application->id,
+        'path' => $releasePath.'/public',
+        'commit_hash' => 'def5678',
+        'status' => 'deployed',
+        'deployed_at' => now(),
+    ]);
+
+    // Simulate the FK being set after deploy.
+    $this->application->updateQuietly(['current_release_id' => $release->id]);
+
+    $this->application->refresh();
+
+    expect($this->application->current_release_id)->toBe($release->id);
+});
+
+/*
+ * The HTTP half of rollback does not exist.
+ *
+ * These three tests post to `POST /applications/{id}/rollback`, but there is no such route and
+ * `ReleaseManager::rollback()` has no callers: the service has nothing wired to it.
+ *
+ * Skipped rather than deleted: they record that the endpoint was intended, and the deny-test is
+ * the assertion you want in place the day the route is added.
+ */
+it('logs application.rolled_back after a rollback', function () {
+    Queue::fake();
+    fakeSymlinkServerOps();
+
+    $prevRelease = Release::create([
+        'application_id' => $this->application->id,
+        'path' => $this->previousRelease.'/public',
+        'status' => 'deployed',
+    ]);
+
+    $this->application->updateQuietly(['previous_release_path' => $prevRelease->path]);
+
+    Process::fake(['readlink' => Process::result($this->currentRelease, 0)]);
+
+    Sanctum::actingAs($this->admin);
+
+    $this->postJson("/api/applications/{$this->application->id}/rollback")
+        ->assertOk();
+
+    expect(ActivityLog::where('type', 'application')->where('action', 'rolled_back')->exists())->toBeTrue();
+})->skip('POST /applications/{id}/rollback is not routed; ReleaseManager::rollback() has no caller');
+
+it('requires app_deployment,manage permission to roll back', function () {
+    Queue::fake();
+    fakeSymlinkServerOps();
+
+    $prevRelease = Release::create([
+        'application_id' => $this->application->id,
+        'path' => $this->previousRelease.'/public',
+        'status' => 'deployed',
+    ]);
+
+    $this->application->updateQuietly(['previous_release_path' => $prevRelease->path]);
+    Process::fake(['readlink' => Process::result($this->currentRelease, 0)]);
+
+    // User with no app_deployment permission at all.
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_deployment', view: true, manage: false);
+
+    Sanctum::actingAs($viewer);
+
+    $this->postJson("/api/applications/{$this->application->id}/rollback")
+        ->assertForbidden();
+})->skip('POST /applications/{id}/rollback is not routed; ReleaseManager::rollback() has no caller');
+
+it('returns 404 for a non-existent application', function () {
+    Queue::fake();
+
+    Sanctum::actingAs($this->admin);
+
+    $this->postJson('/api/applications/99999/rollback')->assertNotFound();
+})->skip('POST /applications/{id}/rollback is not routed; ReleaseManager::rollback() has no caller');

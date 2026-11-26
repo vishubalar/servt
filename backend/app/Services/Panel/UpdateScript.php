@@ -1,0 +1,652 @@
+<?php
+
+namespace App\Services\Panel;
+
+use App\Models\PanelUpdate;
+
+/**
+ * Renders the shell script that performs an in-place update.
+ *
+ * A shell script, not PHP: the update replaces the PHP source of the process performing it, so a
+ * long-lived PHP runner would run code that no longer matches the disk and autoload classes from
+ * the new tree. bash reads the script into memory, and each `artisan` call is a fresh process.
+ *
+ * The script is written OUTSIDE the repository: a copy in the tree would be swapped out from
+ * under bash by its own checkout.
+ *
+ * Nothing from the request reaches this: the version is validated against a strict pattern and
+ * every path comes from server-side config.
+ */
+class UpdateScript
+{
+    /** Ordered steps. The runner echoes each one into the state file. */
+    public const STEPS = [
+        'preflight_git',
+        'fetch_release',
+        'configure_queue_worker',
+        'maintenance_on',
+        'backup_database',
+        'checkout_release',
+        'composer_install',
+        'migrate',
+        'seed_permissions',
+        'configure_services',
+        'sync_privileges',
+        'configure_app_shell',
+        'resync_site_configs',
+        'record_firewall_defaults',
+        'resync_fail2ban',
+        'restrict_postgres_databases',
+        'refresh_npm_catalogue',
+        'refresh_lifecycle_catalogue',
+        'repair_node_runtime',
+        'repair_redis_policy',
+        'optimize',
+        'frontend_build',
+        'configure_frontend_unit',
+        'configure_ols_webadmin',
+        'restart_services',
+        'maintenance_off',
+        'health_check',
+    ];
+
+    public function __construct(
+        private InstalledPanelInfo $installed,
+        private PanelPhpBinary $php,
+    ) {}
+
+    /**
+     * A release version is only ever a dotted number, optionally v-prefixed.
+     * Anything else never reaches the script.
+     */
+    public static function isValidVersion(string $version): bool
+    {
+        return preg_match('/^v?\d+(\.\d+){0,3}$/', $version) === 1;
+    }
+
+    public function render(PanelUpdate $update, string $version, bool $dryRun = false): string
+    {
+        $repo = $this->installed->repositoryPath();
+        $backend = $repo.'/backend';
+        $frontend = $repo.'/frontend';
+        $php = $this->php->path();
+        $tag = 'v'.ltrim($version, 'vV');
+        $state = $this->statePath($update);
+        $rollbackTo = (string) $update->from_commit;
+
+        // Every git call carries the safe.directory exception itself: this script runs under
+        // `systemd-run`, whose HOME is not root's, so install.sh's ~/.gitconfig entry is never read
+        // and git refuses with "dubious ownership" (exit 128). A dry run hid it by echoing every step.
+        // Git runs as the account that owns the repository, not root: `git checkout --force` as root
+        // left root-owned files the panel account could no longer check out or clean, and every
+        // later update was then refused by preflight. safe.directory stays in case an operator has
+        // been root in this tree by hand.
+        $git = sprintf(
+            'sudo -u %s -H git -c %s -C %s',
+            escapeshellarg((string) config('panel_update.app_user')),
+            escapeshellarg('safe.directory='.$repo),
+            escapeshellarg($repo),
+        );
+
+        // Health check goes through the panel's own URL, not 127.0.0.1: the web server routes by
+        // hostname and a bare-IP request 404s, which would fail every check and roll back.
+        $healthUrl = rtrim((string) config('app.url'), '/').'/api/health';
+
+        $run = $dryRun ? 'echo DRY-RUN: ' : '';
+        $forwardOnly = ForwardOnlyGuard::script($git, $tag, $rollbackTo);
+
+        // Build steps run as the panel's own account, never as root. `systemd-run` starts a
+        // transient unit without HOME, so composer refuses to run and npm's cache lands in /root/.npm,
+        // leaving vendor/, node_modules/ and .next/ root-owned under services that run as `panel`.
+        // `sudo -u <user> -H` sets HOME to that account's home (as ReleaseUpdateScript and install.sh do).
+        $user = (string) config('panel_update.app_user');
+        $asUser = $dryRun ? 'echo DRY-RUN: ' : "sudo -u {$user} -H ";
+
+        // artisan runs as the panel account too: as root it left root-owned compiled Blade views and
+        // database backups that php-fpm (`panel`) cannot overwrite or read, and root-owned SQLite
+        // `-wal`/`-shm` files that made the database read-only ("attempt to write a readonly database").
+        // `panel:sudoers` is the deliberate exception: it writes /etc/sudoers.d and needs root.
+
+        $restoreDatabase = $this->restoreDatabase($update, $dryRun);
+        $writeRestoreHelper = $this->writeRestoreHelper($update);
+
+        return <<<BASH
+        #!/usr/bin/env bash
+        # Generated for panel update #{$update->getKey()}. Do not edit: this file
+        # is a disposable copy, rewritten on every update.
+        set -uo pipefail
+
+        STATE="{$state}"
+        STEP=""
+
+        # Progress is a file, not a database row and not this process's memory.
+        # restart_services kills whatever is watching, so the state has to
+        # outlive the watcher; the panel reconciles from this file on boot.
+        note() {
+            STEP="\$1"
+            printf '{"step":"%s","status":"running","at":"%s"}\\n' "\$1" "\$(date -u +%FT%TZ)" > "\$STATE"
+        }
+
+        finish() {
+            printf '{"step":"%s","status":"%s","reason":"%s","rolled_back":%s,"commit":"%s","at":"%s"}\\n' \\
+                "\$STEP" "\$1" "\${2:-}" "\${3:-false}" \\
+                "\$({$git} rev-parse HEAD 2>/dev/null || echo unknown)" "\$(date -u +%FT%TZ)" > "\$STATE"
+        }
+
+        # Any failure lands here. The old commit goes back before anything else
+        # so a half-updated tree is never left behind, and the panel comes out
+        # of maintenance either way — a panel stuck "down" is worse than a
+        # panel that failed to update.
+        rollback() {
+            local failed_step="\$STEP"
+            note "rollback"
+            # No reconciliation / a failed initial drain means no permission
+            # to signal the queue, undo live code, or restore its database.
+            if [ "\$QUEUE_DRAIN_VERIFIED" != "1" ] || [ "\$QUEUE_STOP_FAILED" = "1" ] || [ "\$QUEUE_RESUMPTION_ATTEMPTED" = "1" ]; then
+                finish failed "\$failed_step" false
+                exit 1
+            fi
+            # Drain BEFORE reverting code/dependencies or copying a snapshot.
+            # Even a health failure must not strand a live job in an old tree.
+            if ! {$run}sudo systemctl stop {$this->service('queue')}; then
+                finish failed "\$failed_step" false
+                exit 1
+            fi
+            {$run}{$git} checkout --force {$rollbackTo}
+            # Back onto the branch too, when it still points at that commit.
+            # A bare commit checkout left the box detached from `main`, and a
+            # manual `git pull` deploy then refuses to run (found on the test
+            # server, 2026-09-30).
+            if [ -n "\$ORIG_BRANCH" ] && [ "\$({$git} rev-parse --verify --quiet "\$ORIG_BRANCH" 2>/dev/null)" = "{$rollbackTo}" ]; then
+                {$run}{$git} checkout --force "\$ORIG_BRANCH" || true
+            fi
+            # The old code needs the old dependencies. The checkout above puts
+            # the code back and leaves vendor/ as the new release's composer
+            # install made it, so a failure at or after composer_install left
+            # the old code running against new packages (found in code review
+            # 2026-09-29). Best-effort: a rollback must still finish.
+            if [ "\$DEPS_CHANGED" = 1 ]; then
+                {$asUser}composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader -d {$backend} || true
+            fi
+            # The database, only if this update changed it. A migration that
+            # failed halfway left its table behind with no row in `migrations`,
+            # so every later attempt at the same release failed on "table
+            # already exists" (found on the test server, 2026-09-30). The
+            # queue worker was drained above, before the checkout too. The
+            # snapshot was captured AFTER the initial accepted job completed,
+            # so restoring it cannot resurrect that completed reservation.
+            DB_SUFFIX=""
+            if [ "\$DB_TOUCHED" = "1" ]; then
+        {$restoreDatabase}
+            fi
+            # Clear workers and OPcache that may have loaded the failed tree.
+            {$run}sudo systemctl restart {$this->service('php_fpm')}
+            {$run}sudo systemctl restart {$this->service('frontend')}
+            {$run}sudo systemctl restart {$this->service('queue')}
+            {$asUser}{$php} {$backend}/artisan up
+            finish failed "\$failed_step\$DB_SUFFIX" true
+            exit 1
+        }
+
+        QUEUE_DRAIN_VERIFIED=0
+        QUEUE_STOP_FAILED=0
+        QUEUE_RESUMPTION_ATTEMPTED=0
+        DEPS_CHANGED=0
+        DB_TOUCHED=0
+        DB_BACKUP=""
+        ORIG_BRANCH=""
+        {$writeRestoreHelper}
+        trap rollback ERR
+        set -e
+
+        # Real in both modes, and first. A dry run exists to answer "would the
+        # update work", and one that echoes every command cannot answer it —
+        # this one reported success on a box where the very first real command
+        # fails. Reading HEAD changes nothing and proves the thing every later
+        # step depends on: that git can operate on this repository as this
+        # user. Cheap enough to be worth doing before maintenance mode goes on.
+        note preflight_git
+        # Repair ownership inside .git before anything reads or writes it.
+        #
+        # install.sh hands the tree to the app user and then runs `git config`
+        # — and on a re-run, `git fetch` — as root, which leaves root-owned
+        # files behind in .git. Every later fetch as the app user then dies
+        # with "cannot open '.git/FETCH_HEAD': Permission denied". install.sh
+        # is fixed, but a shipped installer change reaches fresh installs only,
+        # so the repair has to live here, on the boxes that already have it.
+        #
+        # `safe.directory` does not help: it forgives git's *ownership check*,
+        # not the filesystem's permissions.
+        chown -R {$user}:{$user} {$repo}/.git
+        {$git} rev-parse HEAD > /dev/null
+        # A write, not just a read. `rev-parse HEAD` only reads, so it passed
+        # on exactly the boxes where the fetch was about to fail — the check
+        # answering a different question than the caller was asking. This one
+        # fails before maintenance mode goes on rather than after.
+        {$asUser}test -w {$repo}/.git
+        ORIG_BRANCH="\$({$git} symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+        # Fetch and compare before maintenance. A panel deployed from main can
+        # already contain the latest release plus newer commits; VERSION used
+        # to report 1.0.1 there, so the updater offered v1.0.7 and checked out
+        # older code. The API prevents that now, and this second guard closes
+        # the race between checking and executing.
+        note fetch_release
+        {$forwardOnly}
+
+        # A refused reconciliation is fatal BEFORE maintenance/code/schema
+        # changes. Never turn it into a warning followed by an unsafe restart.
+        note configure_queue_worker
+        {$run}{$php} {$backend}/artisan panel:queue-worker
+        QUEUE_DRAIN_VERIFIED=1
+
+        note maintenance_on
+        {$asUser}{$php} {$backend}/artisan down --retry=60
+        # Quiesce the accepted job before snapshot/migrations. Keeping the
+        # worker stopped also prevents old code from accepting the next job.
+        if ! {$run}sudo systemctl stop {$this->service('queue')}; then
+            QUEUE_STOP_FAILED=1
+            STEP=configure_queue_worker
+            false
+        fi
+
+        note backup_database
+        # The last line of its output is the backup's path; the rollback needs
+        # it to put the database back.
+        DB_BACKUP="\$({$asUser}{$php} {$backend}/artisan panel:backup-database | tail -n 1)"
+        echo "\$DB_BACKUP"
+
+        note checkout_release
+        {$run}{$git} checkout --force {$tag}
+
+        note composer_install
+        DEPS_CHANGED=1
+        {$asUser}composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader -d {$backend}
+
+        # The previous release's cached config, gone before any artisan step
+        # below reads it. `sites:resync` rewrote every vhost from it, so a
+        # setting this release changed reached the vhosts only one update later
+        # (seen live 2026-11-09: OpenLiteSpeed kept 10 LSAPI workers after the
+        # default became 35). `optimize` near the end caches the new one.
+        note clear_config_cache
+        {$asUser}{$php} {$backend}/artisan config:clear
+
+        note migrate
+        DB_TOUCHED=1
+        {$asUser}{$php} {$backend}/artisan migrate --force
+
+        # Idempotent, and required on every deploy: it re-syncs the permission
+        # catalogue so permissions added by this release reach administrators.
+        note seed_permissions
+        {$asUser}{$php} {$backend}/artisan db:seed --class=PermissionSeeder --force
+
+        # Existing installs were written with the queue and sessions on the
+        # database, which for a SQLite panel means the worker polls the same
+        # single-writer file every request writes to — "database is locked" on
+        # an idle box. The installer can only fix that for new installs, and
+        # an update never rewrites .env, so it is fixed here. Proves Redis
+        # answers first and changes nothing if it does not; must run before
+        # `optimize`, which caches the config this rewrites.
+        note configure_services
+        {$asUser}{$php} {$backend}/artisan panel:configure-services
+
+        # Before the restart, so the new code comes up with the grant it needs
+        # rather than one install-time snapshot older -- and before every step
+        # below that uses the grant. sites:resync locks the panel directory
+        # with setfacl through it, and ran first: on a server whose grant was
+        # older than that, the lock failed and the directory stayed readable
+        # (bug #19).
+        #
+        # This flow gets it too, and not only the release flow the design doc
+        # describes, because every server in the field is still this shape --
+        # a fix that waits for the migration is a fix nobody has. It is the
+        # single largest source of post-update breakage: touch, certbot and
+        # mysqldump each broke a shipped feature in one week on servers whose
+        # sudoers had not been rewritten since the day they were installed.
+        #
+        # Never fatal: the grant already on disk still serves the code already
+        # running, and refusing an otherwise-good update over it would make the
+        # update the outage. PanelSudoers leaves the existing file untouched on
+        # failure, and panel:doctor names the drift afterwards.
+        note sync_privileges
+        {$run}{$php} {$backend}/artisan panel:sudoers || echo "WARNING: sudoers not synced; run 'artisan panel:sudoers' as root"
+
+        # Container login (RC-28): a Docker app's own system user logs straight
+        # into its container. Installs the group, the root helper, its sudo rule
+        # (visudo-checked) and the sshd Match block (sshd -t before any reload),
+        # then rebuilds the access map from the database -- which is how apps
+        # installed before this release get it. After sync_privileges, because
+        # the visudo check runs through the grant that step just wrote. As the
+        # panel user like every other artisan call; never fatal, because a
+        # failure leaves sshd and sudo exactly as they were.
+        note configure_app_shell
+        {$asUser}{$php} {$backend}/artisan containers:sync-shell-access || echo "WARNING: container login not set up; run 'artisan containers:sync-shell-access'"
+
+        # A vhost is a rendered file, so the AI bot list, the 8G ruleset and
+        # the templates shipped in this release do not reach an existing site
+        # until its config is written again. Without this the panel reports
+        # the new list while sites still enforce the old one, and neither
+        # side can tell. Never fails the update: a site that could not be
+        # re-rendered was rolled back and is still serving.
+        # Apache's caching, HTTP/2 and Cloudflare real-IP modules, which the
+        # vhosts and panel-real-ip.conf now use the way v7 did (2026-11-08,
+        # 2026-11-11). install.sh enables them on new servers; this is the only
+        # place an existing one gets them. Before the resync, so the reload it
+        # does serves them; all three are used inside <IfModule>, so a server
+        # where this fails keeps working. Nothing to do on nginx or OLS.
+        note enable_apache_modules
+        if [ -d /etc/apache2/mods-available ]; then
+            {$run}sudo a2enmod -q expires http2 remoteip && {$run}sudo apache2ctl -t && {$run}sudo systemctl reload apache2 || echo "WARNING: Apache expires/http2/remoteip not enabled; run 'a2enmod expires http2 remoteip' as root"
+        fi
+
+        note resync_site_configs
+        {$asUser}{$php} {$backend}/artisan sites:resync
+
+        # The installer records the ports it allowed, but only from this
+        # release onwards: every server installed before it has a firewall
+        # screen reading its enabled flag live from ufw and its rules from an
+        # empty table. That backfill can only happen here, and it has to,
+        # because otherwise the fix reaches new installs and none of the
+        # servers that already have the problem. Records only; never runs ufw.
+        # Never fatal, for the same reason panel:sudoers is not.
+        #
+        # This runs `artisan` from the release just checked out, and the
+        # command only exists from the release that introduced it. Any target
+        # older than that -- which the API is supposed to refuse and, on a
+        # shallow clone, did not -- answers "There are no commands defined in
+        # the \"firewall\" namespace", exits non-zero, and `set -e` turns a
+        # records-only backfill into a failed update that rolls back a release
+        # which had already installed, migrated and resynced successfully.
+        #
+        # It is a backfill. Not running it leaves the firewall screen reading
+        # its rules from an empty table, exactly as before the update; failing
+        # over it costs the whole update. The first is recoverable by running
+        # one command, the second is not recoverable by the user at all.
+        note record_firewall_defaults
+        {$asUser}{$php} {$backend}/artisan firewall:record-defaults || echo "WARNING: firewall defaults not recorded; run 'artisan firewall:record-defaults' if the firewall screen shows no rules"
+
+        # jail.local is written at install and when the settings screen is
+        # saved, and nowhere else -- so a release that corrects how it renders
+        # reaches new installs only. It shipped with `backend = systemd` in
+        # `[DEFAULT]`, which applies to every jail and makes fail2ban ignore
+        # `logpath`, so `recidive` and every per-site application jail watched
+        # a file that was never opened and banned nobody while the panel
+        # reported them enabled. This is what carries the corrected render to a
+        # server that already exists.
+        #
+        # Non-fatal, and the `||` matters more here than above: the command
+        # writes a config the box validates with `fail2ban-client -t` and
+        # restores on failure, so the worst case is the configuration the
+        # server already had. Failing the update over it would take a panel
+        # down to fix a jail.
+        note resync_fail2ban
+        {$asUser}{$php} {$backend}/artisan fail2ban:resync || echo "WARNING: fail2ban config not resynced; run 'artisan fail2ban:resync' if site jails are not banning"
+
+        # Bug #35: new PostgreSQL databases let only their own users connect;
+        # this does the same for databases made before that fix, which would
+        # otherwise stay open to every site's user on every existing server.
+        # Non-fatal: a database it cannot change keeps the access it had.
+        note restrict_postgres_databases
+        {$asUser}{$php} {$backend}/artisan databases:restrict-postgres || echo "WARNING: PostgreSQL databases not restricted; run 'artisan databases:restrict-postgres'"
+
+        # The npm catalogue is what `npm_latest` is read from, and until it has
+        # a row the Node screen cannot tell "npm is current" from "we do not
+        # know" -- so it reports null, the panel correctly treats null as the
+        # second, and the Update button stays offered on a version that is
+        # already up to date. Only `runtimes:refresh-npm` writes that table and
+        # it was scheduled daily and called from nowhere, so every fresh
+        # install and every update spent up to a day in exactly that state.
+        #
+        # Non-fatal for the same reason as the backfill above, and with the
+        # same `||`: the npm registry is a third party, and a panel that
+        # refuses to finish updating because someone else's API was down is
+        # worse than one whose Update button is briefly over-eager. The daily
+        # schedule retries either way. (`refresh()` already keeps what is
+        # stored rather than blanking it on a network failure, so this guard is
+        # for the harder errors -- an older release with no such command, as
+        # happened above.)
+        note refresh_npm_catalogue
+        {$asUser}{$php} {$backend}/artisan runtimes:refresh-npm || echo "WARNING: npm catalogue not refreshed; the Node screen may offer an update that is not needed until the daily refresh runs"
+
+        # Same shape again, one table over. The Node picker stops offering
+        # versions the project has ended support for, and it reads "ended
+        # support" from `runtime_lifecycles` -- a table also written by one
+        # daily command and nothing else. An empty table means unknown, and
+        # unknown is deliberately treated as "keep offering it", so a panel
+        # that updates into this feature without the data keeps offering dead
+        # runtimes for up to a day. That is how a one-click n8n install ended
+        # in a C++ compiler error on Node 21.
+        #
+        # Non-fatal, same `||`, same reason: github is a third party.
+        note refresh_lifecycle_catalogue
+        {$asUser}{$php} {$backend}/artisan runtimes:refresh-lifecycle || echo "WARNING: runtime lifecycle catalogue not refreshed; end-of-life Node versions may be offered until the daily refresh runs"
+
+        # install.sh used to set fnm's default without linking node/npm/npx into
+        # /usr/local/bin, and versions added from the Node screen came out
+        # root-owned while npm updates run as the panel account. This puts an
+        # existing server where a fresh install now starts. Non-fatal: Node is
+        # not a reason to fail a panel update.
+        note repair_node_runtime
+        {$asUser}{$php} {$backend}/artisan runtimes:repair-node || echo "WARNING: Node runtime not repaired; run php artisan runtimes:repair-node"
+
+        # install.sh used to write `maxmemory-policy allkeys-lru`, which the
+        # Redis screen refuses while the queue is on Redis (an `allkeys-*`
+        # policy can evict queued jobs), so the screen could not be saved on a
+        # fresh install. This moves the installer's own line to volatile-lru;
+        # a policy the operator chose is left alone. Non-fatal: the old policy
+        # is what the server already had.
+        note repair_redis_policy
+        {$asUser}{$php} {$backend}/artisan redis:repair-installer-policy || echo "WARNING: Redis eviction policy not switched; run 'artisan redis:repair-installer-policy'"
+
+        note optimize
+        {$asUser}{$php} {$backend}/artisan optimize:clear
+        {$asUser}{$php} {$backend}/artisan optimize
+
+        # PATH is pinned because npm's shebang is `env node`: unpinned, the
+        # build silently uses whatever node is first on PATH.
+        #
+        # NODE_OPTIONS caps V8's old space, which it will not grow past no
+        # matter how much memory is free -- a large `next build` otherwise
+        # dies with "Reached heap limit ... JavaScript heap out of memory"
+        # while the box still has RAM spare. Sized from RAM the same way
+        # install.sh's build_frontend() does; the two must not disagree, or an
+        # update fails on a box its own installer built fine.
+        #
+        # This cap is not what saves a small box, though. Next 16 builds with
+        # Turbopack, whose working set is a Rust heap NODE_OPTIONS does not
+        # bound -- a 1.5 GB cgroup kills the native process with this set. The
+        # memory headroom comes from swap and from the build-worker cap in
+        # frontend/next.config.mjs; UpdatePreflight refuses the update before
+        # this line runs if the box cannot clear the measured floor.
+        note frontend_build
+        BUILD_RAM_MB=\$(awk '/MemTotal/ {printf "%d", \$2/1024}' /proc/meminfo)
+        if [ "\$BUILD_RAM_MB" -ge 7500 ]; then BUILD_HEAP_MB=4096
+        elif [ "\$BUILD_RAM_MB" -ge 3500 ]; then BUILD_HEAP_MB=3072
+        else BUILD_HEAP_MB=2048; fi
+        {$asUser}env "PATH={$this->nodeBinDir()}:/usr/local/bin:/usr/bin:/bin" npm --prefix {$frontend} ci --no-audit --no-fund
+        # A build the kernel killed for memory is named as such, so the panel can
+        # say "out of memory" rather than "could not be built". Only the reason
+        # changes: the rollback below is the same either way. npm exits 1, not
+        # 137, when its child is killed, so the proof is this cgroup's OOM
+        # count: memory.events counts kills by either OOM killer (the kernel's
+        # or a cgroup limit), anyone may read it, and it needs no pipe into grep,
+        # which a dry run would feed echoed text into.
+        BUILD_CGROUP=/sys/fs/cgroup\$(awk -F: '\$1 == "0" {print \$3}' /proc/self/cgroup 2>/dev/null)
+        oom_kills() { awk '\$1 == "oom_kill" {print \$2; found=1} END {if (!found) print 0}' "\$BUILD_CGROUP/memory.events" 2>/dev/null || echo 0; }
+        BUILD_OOM_BEFORE=\$(oom_kills)
+        {$asUser}env "PATH={$this->nodeBinDir()}:/usr/local/bin:/usr/bin:/bin" "NODE_OPTIONS=--max-old-space-size=\${BUILD_HEAP_MB}" npm --prefix {$frontend} run build || {
+            BUILD_RC=\$?
+            if [ "\$BUILD_RC" = 137 ] || [ "\$(oom_kills)" -gt "\$BUILD_OOM_BEFORE" ]; then
+                STEP=frontend_build_out_of_memory
+            fi
+            false
+        }
+
+        # Bug #15: servers installed before the unit pinned a loopback HOSTNAME
+        # serve the panel's interface on every address. Rewrites the unit and
+        # reloads systemd; the restart below applies it. Never fatal.
+        note configure_frontend_unit
+        {$run}{$php} {$backend}/artisan panel:frontend-unit || echo "WARNING: frontend unit not updated; run 'artisan panel:frontend-unit' as root"
+
+        # Review finding S5: OpenLiteSpeed's WebAdmin console answered on every
+        # address of servers installed before install.sh bound it to the
+        # loopback address. Rewrites its listener and restarts OpenLiteSpeed
+        # (graceful); nothing to do on nginx or Apache. Never fatal.
+        note configure_ols_webadmin
+        {$run}{$php} {$backend}/artisan panel:ols-webadmin || echo "WARNING: WebAdmin console still listens on every address; run 'artisan panel:ols-webadmin' as root"
+
+        note restart_services
+        # The checkout keeps the same backend path. A graceful reload can keep
+        # old workers and OPcache alive at that path, so only a restart proves
+        # the health endpoint is executing this release.
+        {$run}sudo systemctl restart {$this->service('php_fpm')}
+        {$run}sudo systemctl restart {$this->service('frontend')}
+
+        note maintenance_off
+        {$asUser}{$php} {$backend}/artisan up
+
+        # Verify the NEW code is what answered. Without asserting the version,
+        # a health check passes just as happily against the old release.
+        note health_check
+        {$this->healthCheck($healthUrl, $version, $dryRun)}
+
+        # Do not execute queued side effects until the new code is verified.
+        # The restart can complete a job BEFORE a failing ExecStartPost returns:
+        # commit to manual recovery BEFORE resumption, never rewind its ledger.
+        QUEUE_RESUMPTION_ATTEMPTED=1
+        STEP=restart_services
+        {$run}sudo systemctl restart {$this->service('queue')}
+
+        finish succeeded
+        BASH;
+    }
+
+    /**
+     * Outside the repository on purpose: the checkout would destroy a state file inside the tree.
+     */
+    public function statePath(PanelUpdate $update): string
+    {
+        return rtrim((string) config('panel_update.state_dir'), '/').'/update-'.$update->getKey().'.json';
+    }
+
+    public function scriptPath(PanelUpdate $update): string
+    {
+        return rtrim((string) config('panel_update.state_dir'), '/').'/update-'.$update->getKey().'.sh';
+    }
+
+    /**
+     * Beside the script, for the same reason: rollback must not depend on the tree's version.
+     */
+    public function restoreHelperPath(PanelUpdate $update): string
+    {
+        return rtrim((string) config('panel_update.state_dir'), '/').'/update-'.$update->getKey().'-restore.php';
+    }
+
+    /**
+     * Writes resources/panel-update/restore-database.php beside the script,
+     * as the running (pre-update) version has it. A quoted heredoc: nothing
+     * in the PHP is expanded by the shell.
+     */
+    private function writeRestoreHelper(PanelUpdate $update): string
+    {
+        $path = escapeshellarg($this->restoreHelperPath($update));
+        $source = rtrim((string) file_get_contents(resource_path('panel-update/restore-database.php')), "\n");
+
+        return "cat > {$path} <<'PANEL_RESTORE_PHP'\n{$source}\nPANEL_RESTORE_PHP\nchmod 0644 {$path}";
+    }
+
+    /**
+     * The rollback's database step, rendered for this install.
+     *
+     * SQLite only (the one database install.sh sets up; restoring is a file copy). Any other
+     * database is told it was not restored and where the backup is, rather than having a dump
+     * replayed into it unattended.
+     *
+     * Sets DB_SUFFIX, which ends up on the failure reason: `:db_restored`,
+     * `:db_not_restored`, or nothing when the database was not changed.
+     */
+    private function restoreDatabase(PanelUpdate $update, bool $dryRun): string
+    {
+        if ($dryRun) {
+            return '                echo "DRY-RUN: restore the panel database if this update changed it"';
+        }
+
+        $connection = (string) config('database.default');
+
+        if (config("database.connections.{$connection}.driver") !== 'sqlite') {
+            return '                DB_SUFFIX=":db_not_restored"';
+        }
+
+        $live = escapeshellarg((string) config("database.connections.{$connection}.database"));
+        $helper = escapeshellarg($this->restoreHelperPath($update));
+        $php = $this->php->path();
+        $user = (string) config('panel_update.app_user');
+
+        return <<<BASH
+                RESTORE_FORCE=""
+                if [ "\$failed_step" = "migrate" ]; then
+                    RESTORE_FORCE="--force"
+                fi
+                RESTORE_RC=3
+                if [ -n "\$DB_BACKUP" ] && [ -f "\$DB_BACKUP" ]; then
+                    sudo -u {$user} -H {$php} {$helper} {$live} "\$DB_BACKUP" "\${DB_BACKUP%.sqlite}-failed.sqlite" \$RESTORE_FORCE && RESTORE_RC=0 || RESTORE_RC=\$?
+                fi
+                if [ "\$RESTORE_RC" = "10" ]; then
+                    DB_SUFFIX=":db_restored"
+                elif [ "\$RESTORE_RC" != "0" ]; then
+                    DB_SUFFIX=":db_not_restored"
+                fi
+        BASH;
+    }
+
+    /**
+     * The health check cannot be prefixed with `echo` like the other steps: it is a pipeline,
+     * and echoing the left side feeds the printed text into grep, so a dry run would always fail.
+     */
+    private function healthCheck(string $url, string $version, bool $dryRun): string
+    {
+        if ($dryRun) {
+            return "echo 'DRY-RUN: health check skipped'";
+        }
+
+        $healthUrl = escapeshellarg($url);
+        $expected = $this->bareVersion($version); // bare "1.0.7" — used as fixed string, not regex
+
+        return <<<BASH
+        HEALTH_URL={$healthUrl}
+        EXPECTED_VERSION='{$expected}'
+        HEALTH_OK=0
+        for attempt in \$(seq 1 30); do
+            response="\$(curl -sS --max-time 5 "\$HEALTH_URL" 2>&1)" && curl_status=0 || curl_status=\$?
+            if [ "\$curl_status" = "0" ] && printf '%s' "\$response" | grep -qF "version\":\"\$EXPECTED_VERSION\""; then
+                echo "Health check passed on attempt \$attempt/30."
+                HEALTH_OK=1
+                break
+            fi
+            echo "Health check attempt \$attempt/30 failed (curl exit \$curl_status); expected version \$EXPECTED_VERSION."
+            printf 'Health response: %.1000s\\n' "\$response"
+            sleep 1
+        done
+        test "\$HEALTH_OK" = "1"
+        BASH;
+    }
+
+    private function bareVersion(string $version): string
+    {
+        return ltrim($version, 'vV');
+    }
+
+    private function service(string $key): string
+    {
+        return (string) config('panel_update.services.'.$key);
+    }
+
+    /**
+     * Directory holding the node binary install.sh put on the box. Pinned into
+     * PATH for the frontend build.
+     */
+    private function nodeBinDir(): string
+    {
+        return (string) config('panel_update.node_bin_dir');
+    }
+}

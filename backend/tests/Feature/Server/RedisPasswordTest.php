@@ -1,0 +1,524 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\User;
+use App\Services\Server\EnvFile;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Testing\TestResponse;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    $this->dir = sys_get_temp_dir().'/sv-oss-redis-'.getmypid();
+    File::deleteDirectory($this->dir);
+    File::makeDirectory($this->dir, 0755, true);
+
+    $this->redisCli = $this->dir.'/redis-cli';
+    File::put($this->redisCli, '');
+
+    $this->envPath = $this->dir.'/.env';
+    File::put($this->envPath, "APP_NAME=Panel\n# a comment operators edit by hand\nREDIS_PASSWORD=null\nQUEUE_CONNECTION=database\n");
+
+    config(['server.redis_cli' => $this->redisCli, 'database.redis.default.password' => null]);
+    app()->useEnvironmentPath($this->dir);
+});
+
+afterEach(function () {
+    app()->useEnvironmentPath(base_path());
+    File::deleteDirectory($this->dir);
+});
+
+/**
+ * @param  array<int, string>  $failing  redis-cli sub-commands that should fail
+ * @param  array<int, string>  $rejected  sub-commands Redis refuses the way the
+ *                                        real redis-cli reports it: the error
+ *                                        reply on stdout, and exit 0
+ */
+function fakeRedis(array $failing = [], array $rejected = []): ArrayObject
+{
+    $runs = new ArrayObject;
+
+    Process::fake(function ($process) use ($runs, $failing, $rejected) {
+        $runs[] = ['command' => $process->command, 'input' => $process->input, 'env' => $process->environment ?? []];
+        $command = implode(' ', $process->command);
+
+        foreach ($failing as $fail) {
+            if (str_contains($command, $fail)) {
+                return Process::result(exitCode: 1, errorOutput: 'NOAUTH Authentication required.');
+            }
+        }
+
+        foreach ($rejected as $reject) {
+            if (str_contains($command, $reject)) {
+                return Process::result(output: "NOAUTH Authentication required.\n", errorOutput: "AUTH failed: WRONGPASS invalid username-password pair or user is disabled.\n");
+            }
+        }
+
+        return match (true) {
+            str_contains($command, 'config get requirepass') => Process::result(output: "requirepass\n\n"),
+            str_contains($command, 'config get maxmemory-policy') => Process::result(output: "maxmemory-policy\nnoeviction\n"),
+            str_contains($command, 'config get maxmemory') => Process::result(output: "maxmemory\n0\n"),
+            str_contains($command, 'ping') => Process::result(output: "PONG\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    return $runs;
+}
+
+/**
+ * Only the calls that *change* the password — `config get requirepass` also
+ * mentions it, and counting that would make every assertion below off by one.
+ */
+function passwordWrites(ArrayObject $runs): Collection
+{
+    return collect($runs)
+        ->filter(fn (array $r) => in_array('set', $r['command'], true) && in_array('requirepass', $r['command'], true))
+        ->values();
+}
+
+/**
+ * The credential swap runs after the response, so the assertions have to run
+ * the terminating callbacks the request registered — the same thing php-fpm
+ * does once the response is flushed.
+ */
+function applyDeferred(): void
+{
+    app()->terminate();
+}
+
+function saveRedis(array $body): TestResponse
+{
+    return test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->putJson('/api/settings/redis', array_merge([
+            'maxmemory' => '0', 'maxmemory_policy' => 'noeviction',
+        ], $body));
+}
+
+function saveRedisAndApply(array $body): TestResponse
+{
+    $response = saveRedis($body);
+    applyDeferred();
+
+    return $response;
+}
+
+it('never puts the password in a command argument', function () {
+    $runs = fakeRedis();
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    // `ps` is world readable. Every argument of every redis-cli call is
+    // therefore public, so the secret goes on stdin instead.
+    foreach ($runs as $run) {
+        expect(implode(' ', $run['command']))->not->toContain('sup3r-secret-value');
+    }
+
+    $set = passwordWrites($runs)->first();
+    expect($set['command'])->toContain('-x')
+        ->and($set['input'])->toBe('sup3r-secret-value');
+});
+
+it('keeps the password off the command line when commands are elevated', function () {
+    // With sudo on, an elevated command carries its environment as `sudo -n env VAR=value`
+    // arguments, and sudo writes the whole command line to auth.log and the journal. redis-cli
+    // needs no root, so it must never be elevated.
+    config([
+        'server.privilege.sudo' => true,
+        'database.redis.default.password' => 'current-secret-value',
+    ]);
+    $runs = fakeRedis();
+
+    test()->withHeader('Authorization', 'Bearer '.test()->token)->getJson('/api/settings')->assertOk();
+    saveRedisAndApply(['maxmemory' => '0', 'maxmemory_policy' => 'noeviction', 'password' => 'sup3r-secret-value']);
+
+    $cli = array_filter((array) $runs->getArrayCopy(), fn (array $run) => in_array(test()->redisCli, $run['command'], true));
+    expect($cli)->not->toBeEmpty();
+
+    foreach ($cli as $run) {
+        expect($run['command'][0])->toBe(test()->redisCli);
+    }
+
+    foreach ($runs as $run) {
+        expect(implode(' ', $run['command']))->not->toContain('secret-value');
+    }
+});
+
+it('authenticates the rewrite from the environment, not from argv', function () {
+    $runs = fakeRedis();
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    // Two redis-cli processes mean two connections, and the second arrives after auth is required
+    // — so the rewrite failed and the password was never persisted to redis.conf.
+    // The memory settings are rewritten too; the one that matters is the new credential.
+    $rewrite = collect($runs)->last(fn (array $r) => in_array('rewrite', $r['command'], true));
+
+    expect($rewrite['env'])->toBe(['REDISCLI_AUTH' => 'sup3r-secret-value'])
+        ->and($rewrite['command'])->not->toContain('-a');
+});
+
+it('records the password in the panel own env file', function () {
+    fakeRedis();
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    // Without this the panel locks itself out of its own cache and session
+    // store the moment those live on Redis.
+    expect(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('sup3r-secret-value');
+});
+
+it('keeps the rest of the env file exactly as it was', function () {
+    fakeRedis();
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    $contents = File::get($this->envPath);
+
+    // Operators hand-edit this file. Rewriting it from a template would drop
+    // their comments and ordering without saying so.
+    expect($contents)->toContain('APP_NAME=Panel')
+        ->toContain('# a comment operators edit by hand')
+        ->toContain('QUEUE_CONNECTION=database');
+});
+
+it('refuses before touching redis when it cannot record the password', function () {
+    $runs = fakeRedis();
+    File::delete($this->envPath);
+
+    saveRedis(['password' => 'sup3r-secret-value'])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('password');
+
+    // Checked first, not after: setting a password we cannot write down is
+    // exactly how the panel locks itself out.
+    expect(passwordWrites($runs))->toBeEmpty();
+});
+
+it('tells the frontend when the password cannot be managed', function () {
+    fakeRedis();
+    File::delete($this->envPath);
+
+    $settings = $this->withHeader('Authorization', 'Bearer '.$this->token)
+        ->getJson('/api/settings')->json('settings.redis');
+
+    // Disable the control rather than offer it and then refuse.
+    expect($settings['password_manageable'])->toBeFalse();
+});
+
+it('puts the old password back when the change cannot be verified', function () {
+    $runs = fakeRedis(failing: ['ping']);
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value']);
+
+    // Redis is already on the new password at this point; leaving it there
+    // with nothing recorded is the lockout. So it goes back.
+    $rollback = passwordWrites($runs);
+
+    expect($rollback)->toHaveCount(2)
+        ->and($rollback[1]['input'])->toBe('')
+        ->and($rollback[1]['env'])->toBe(['REDISCLI_AUTH' => 'sup3r-secret-value']);
+
+    // And nothing was written, so the file still matches the live server.
+    expect(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('null');
+});
+
+it('rolls back when the password cannot be persisted to redis conf', function () {
+    $runs = fakeRedis(failing: ['rewrite']);
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value']);
+
+    // A password Redis forgets on restart is worse than no password: the
+    // panel would hold a credential the server stops asking for.
+    expect(passwordWrites($runs))->toHaveCount(2)
+        ->and(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('null');
+});
+
+it('logs a traceable failure, since nothing can reach the caller by then', function () {
+    // From config, not a hardcoded path: the suite writes this channel to its
+    // own file so it does not append to the real operations log.
+    $log = config('logging.channels.server-ops.path');
+    $before = is_file($log) ? (string) File::get($log) : '';
+
+    fakeRedis(failing: ['ping']);
+
+    // The response has already been sent when this runs, so a 500 is not
+    // available — the failure has to be findable afterwards instead.
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    $written = substr((string) File::get($log), strlen($before));
+
+    expect($written)->toContain('redis password could not be verified')
+        // The credential itself must never reach a log file.
+        ->and($written)->not->toContain('sup3r-secret-value');
+});
+
+it('answers 202 rather than claiming the password is already set', function () {
+    fakeRedis();
+
+    $response = saveRedis(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    // Returning the group here would report has_password from a Redis that
+    // has not been changed yet — true in a moment, false right now.
+    expect($response->json('message'))->not->toBeEmpty()
+        ->and($response->json())->not->toHaveKey('redis');
+});
+
+it('leaves the password alone when the field is absent', function () {
+    $runs = fakeRedis();
+
+    saveRedisAndApply([])->assertOk();
+
+    // Saving the memory settings must not clear the password: an unchanged
+    // form sends no `password` field, and absent must mean "leave it" rather
+    // than "set it to nothing".
+    expect(passwordWrites($runs))->toBeEmpty()
+        ->and(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('null');
+});
+
+it('returns the password to a caller who could change it', function () {
+    // The panel shows and copies this the way it already shows a system user's password. Redis
+    // backs this panel's sessions, cache and queue, so the credential unlocks the panel rather than
+    // one customer's account (see RedisSettings' class note).
+    fakeRedis();
+
+    $settings = $this->withHeader('Authorization', 'Bearer '.$this->token)
+        ->getJson('/api/settings')->json('settings.redis');
+
+    expect(array_keys($settings))->toContain('has_password', 'password');
+});
+
+it('withholds it from a role that can only look', function () {
+    // The half of the old behaviour worth keeping. A viewer cannot change the
+    // password, so handing it the value gives it nothing it can act on --
+    // `has_password` already tells it everything it can use.
+    fakeRedis();
+
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'setting', view: true, manage: false);
+
+    $settings = $this->withHeader('Authorization', 'Bearer '.$viewer->createToken('t')->plainTextToken)
+        ->getJson('/api/settings')->json('settings.redis');
+
+    expect($settings['password'])->toBeNull()
+        ->and(array_keys($settings))->toContain('has_password');
+});
+
+it('keeps the env file permissions it found', function () {
+    fakeRedis();
+    chmod($this->envPath, 0664);
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+
+    // Imposing a mode here is how the panel locks itself out of its own config: force 0640 on a
+    // group-writable file and the first write succeeds while every later write is refused.
+    expect(fileperms($this->envPath) & 0777)->toBe(0664)
+        ->and(is_writable($this->envPath))->toBeTrue();
+});
+
+it('can change the password twice in a row', function () {
+    fakeRedis();
+    chmod($this->envPath, 0664);
+
+    saveRedisAndApply(['password' => 'first-password-value'])->assertStatus(202);
+    expect(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('first-password-value');
+
+    // The regression this pins: the second attempt is what failed, because
+    // the first had quietly made the file unwritable.
+    saveRedisAndApply(['password' => 'second-password-val'])->assertStatus(202);
+    expect(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('second-password-val');
+});
+
+it('authenticates with the current password when replacing one', function () {
+    $runs = fakeRedis();
+    // A password is already in force.
+    config(['database.redis.default.password' => 'the-existing-password']);
+    Process::fake(function ($process) use ($runs) {
+        $runs[] = ['command' => $process->command, 'input' => $process->input, 'env' => $process->environment ?? []];
+        $command = implode(' ', $process->command);
+
+        return match (true) {
+            str_contains($command, 'config get requirepass') => Process::result(output: "requirepass\nthe-existing-password\n"),
+            str_contains($command, 'ping') => Process::result(output: "PONG\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    saveRedisAndApply(['password' => 'a-brand-new-password'])->assertStatus(202);
+
+    // Replacing a password needs the old one; unauthenticated, Redis answers NOAUTH and the change
+    // silently does nothing.
+    $set = passwordWrites($runs)->first();
+
+    expect($set['env'])->toBe(['REDISCLI_AUTH' => 'the-existing-password'])
+        ->and($set['input'])->toBe('a-brand-new-password');
+});
+
+it('clears the password only when explicitly asked', function () {
+    $runs = fakeRedis();
+    chmod($this->envPath, 0664);
+
+    // An empty string never reaches validation intact — ConvertEmptyStringsToNull rewrites it to
+    // null, the same shape as "field omitted". So removal needs its own flag or it cannot be
+    // expressed.
+    saveRedisAndApply(['password' => ''])->assertOk();
+    expect(passwordWrites($runs))->toBeEmpty();
+
+    $runs = fakeRedis();
+    saveRedisAndApply(['remove_password' => true])->assertStatus(202);
+
+    expect(passwordWrites($runs)->first()['input'])->toBe('')
+        ->and(app(EnvFile::class)->get('REDIS_PASSWORD'))->toBe('null');
+});
+
+it('refuses the change when the panel cannot reach Redis with its stored credential', function () {
+    // `.env`'s REDIS_PASSWORD can drift from the running server (a password set outside the panel, a
+    // restored redis.conf, an adopted server), so `CONFIG GET requirepass` answers NOAUTH.
+    // That used to read as `''` ("no password is set"): the change was authenticated with an empty
+    // credential, Redis rejected it, and since the apply runs after the response the user was told
+    // "the Redis password is being applied" while nothing changed.
+    $runs = fakeRedis(failing: ['config get requirepass']);
+
+    saveRedis(['password' => 'NewSecret123'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('password');
+
+    applyDeferred();
+
+    // Nothing was queued, so nothing was attempted: a refusal the user can see
+    // beats a success message that is not true.
+    expect(passwordWrites($runs))->toHaveCount(0);
+});
+
+it('does not present a stale credential as a working one', function () {
+    // The screen must never read as "all is well" about a Redis the panel cannot open.
+    // `has_password` answers "is the panel configured with one" (which .env can always answer);
+    // whether that value still opens Redis is `password_out_of_sync`, the field that must not lie.
+    config(['database.redis.default.password' => 'stale-value']);
+    fakeRedis(failing: ['ping']);
+
+    $redis = test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->getJson('/api/settings')
+        ->assertOk()
+        ->json('settings.redis');
+
+    expect($redis['password_out_of_sync'])->toBeTrue()
+        // And the value is still shown: it is what the panel is using, and
+        // seeing it is how someone notices it is not what Redis wants.
+        ->and($redis['has_password'])->toBeTrue();
+});
+
+it('still reports a password-less Redis as password-less', function () {
+    // The null must mean "could not ask" and nothing else — an empty
+    // requirepass is a real answer and has to stay `false`.
+    fakeRedis();
+
+    $response = test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->getJson('/api/settings')
+        ->assertOk();
+
+    expect($response->json('settings.redis.has_password'))->toBeFalse();
+});
+
+it('makes the panel itself use the new password', function () {
+    // Writing `.env` is not applying it: install.sh runs `config:cache`, so the old password stays
+    // compiled into bootstrap/cache/config.php, and `queue:work` loaded its configuration at start.
+    // Sessions, cache and the queue all point at Redis, so without this the panel keeps offering the
+    // old password and Redis answers NOAUTH: a successful change that takes the panel down.
+    $runs = fakeRedis();
+
+    saveRedis(['password' => 'NewSecret123'])->assertAccepted();
+    applyDeferred();
+
+    $commands = collect($runs)->map(fn (array $r) => implode(' ', $r['command']));
+
+    // The worker holds its config from when it started; a restart is the only
+    // way it learns anything.
+    expect($commands->contains(fn (string $c) => str_contains($c, 'systemctl restart')
+        && str_contains($c, (string) config('panel_update.services.queue'))))->toBeTrue();
+});
+
+it('does not refresh the panel for a change that did not stick', function () {
+    // Ordered strictly after the verify-and-record step: rebuilding the config
+    // cache around a credential Redis rejected would replace a working value
+    // with a broken one.
+    $runs = fakeRedis(failing: ['ping']);
+
+    saveRedis(['password' => 'NewSecret123'])->assertAccepted();
+    applyDeferred();
+
+    $commands = collect($runs)->map(fn (array $r) => implode(' ', $r['command']));
+
+    expect($commands->contains(fn (string $c) => str_contains($c, 'systemctl restart')))->toBeFalse();
+});
+
+/*
+ * redis-cli exits 0 when Redis refuses a command, with the error reply on stdout. A fake that
+ * exits 1 is not what the real tool does, so a wrong password was never reported.
+ */
+it('reports a stale credential as out of sync when redis-cli exits 0 on NOAUTH', function () {
+    config(['database.redis.default.password' => 'stale-value']);
+    fakeRedis(rejected: ['ping', 'config get', 'info']);
+
+    $redis = test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->getJson('/api/settings')->assertOk()->json('settings.redis');
+
+    expect($redis['running'])->toBeTrue()
+        ->and($redis['password_out_of_sync'])->toBeTrue();
+});
+
+it('still reports a working credential as in sync', function () {
+    config(['database.redis.default.password' => 'right-value']);
+    fakeRedis();
+
+    expect(test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->getJson('/api/settings')->assertOk()->json('settings.redis.password_out_of_sync'))->toBeFalse();
+});
+
+it('does not read a refused CONFIG GET requirepass as "no password"', function () {
+    // The real refusal (exit 0, NOAUTH on stdout) is one line, like the answer
+    // of a Redis with no password. Guarded twice: refused() and the reply-name
+    // check; this pins the behaviour with the realistic reply.
+    config(['database.redis.default.password' => 'stale-value']);
+    $runs = fakeRedis(rejected: ['config get requirepass']);
+
+    saveRedis(['password' => 'NewSecret123'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('password');
+
+    applyDeferred();
+    expect(passwordWrites($runs))->toHaveCount(0);
+});
+
+it('does not report memory settings as saved when Redis refused them', function () {
+    config(['database.redis.default.password' => 'stale-value']);
+    fakeRedis(rejected: ['config set maxmemory']);
+
+    saveRedisAndApply(['maxmemory' => '256mb'])->assertStatus(500)->assertJsonStructure(['message', 'reference']);
+});
+
+it('records a password change in the activity log without the password', function () {
+    fakeRedis();
+    chmod($this->envPath, 0664);
+
+    saveRedisAndApply(['password' => 'sup3r-secret-value'])->assertStatus(202);
+    $this->travel(1)->seconds(); // the log lists newest first, by the second
+    saveRedisAndApply(['remove_password' => true])->assertStatus(202);
+
+    $rows = ActivityLog::where('properties->group', 'redis')->oldest('id')->get();
+    expect($rows->pluck('properties.changes')->all())->toBe([
+        [['field' => 'password', 'secret' => true]],
+        [['field' => 'password', 'secret' => true, 'removed' => true]],
+    ])->and($rows->toJson())->not->toContain('sup3r-secret-value');
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/activity-log?filter[type]=setting')
+        ->assertDontSee('sup3r-secret-value')
+        ->assertJsonPath('activity_log.0.changes.0.text', 'Redis password removed')
+        ->assertJsonPath('activity_log.1.changes.0.text', 'Redis password changed');
+});

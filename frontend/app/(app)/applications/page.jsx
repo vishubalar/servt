@@ -1,0 +1,100 @@
+import { Globe2 } from "lucide-react";
+import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import { canOpenApplication } from "@/lib/permissions/app-screens";
+import { getApplications, getSiteTypes } from "@/lib/applications/get-applications";
+import { getDatabaseCounts } from "@/lib/databases/get-databases";
+import { getGitAccounts } from "@/lib/git/get-git";
+import { getBackupStanding } from "@/lib/backups/get-backups";
+import { providersByAccountId } from "@/lib/applications/git-provider";
+import { sitesMissingDatabase } from "@/lib/backups/database-availability";
+import { ApplicationsTable } from "@/components/applications/applications-table";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { redirectOutOfRange } from "@/lib/tables/redirect-out-of-range";
+import { PageHeader } from "@/components/ui/page-header";
+import { RefreshOnReturn } from "@/components/ui/refresh-on-return";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata() {
+  const t = await getTranslations("applications");
+  return { title: t("title") };
+}
+
+export default async function ApplicationsPage({ searchParams }) {
+  const sp = await searchParams;
+  const query = new URLSearchParams(
+    Object.entries(sp ?? {}).filter(([, v]) => typeof v === "string"),
+  ).toString();
+
+  // Fetched in parallel.
+  const [permissions, appPermissions, t, result, { siteTypes }] = await Promise.all([
+    getPermissions(),
+    getPermissions("application").catch(() => null),
+    getTranslations("applications"),
+    getApplications(query),
+    getSiteTypes(),
+  ]);
+
+  if (!can(permissions, "application", "view")) return <PermissionDenied title={t("title")} />;
+  const [dbCounts, backupStanding] = await Promise.all([
+    can(permissions, "database", "view") ? getDatabaseCounts() : { counts: null, known: false },
+    can(permissions, "backup", "view") ? getBackupStanding().catch(() => null) : null,
+  ]);
+
+  const needsGitAccounts =
+    can(permissions, "git", "view") &&
+    result.applications?.some(
+      (application) =>
+        application.site_type === "git" &&
+        application.git_account_id !== null &&
+        application.git_account_id !== undefined,
+    );
+  const gitProviders = needsGitAccounts
+    ? providersByAccountId(await getGitAccounts().then((r) => r.accounts ?? []).catch(() => []))
+    : new Map();
+  if (result.failed && result.status === 422 && (sp?.status || sp?.site_type || sp?.sort)) {
+    const kept = new URLSearchParams();
+    if (typeof sp.search === "string" && sp.search) kept.set("search", sp.search);
+    redirect(`/applications${kept.size ? `?${kept}` : ""}`);
+  }
+  if (result.failed) return <LoadFailed description={t("loadFailed")} status={result.status} failure={result.failure} message={result.message} debug={result.debug} />;
+
+  redirectOutOfRange("/applications", sp, result.meta, result.failed);
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("title")} />
+      <RefreshOnReturn />
+      {sp?.gone ? (
+        <div className="flex items-start gap-2.5 rounded-lg border bg-muted/40 p-3 text-sm">
+          <Globe2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+          <span>
+            <span className="font-medium">{t("missing.title")}</span>{" "}
+            <span className="text-muted-foreground">{t("missing.description")}</span>
+          </span>
+        </div>
+      ) : null}
+      <ApplicationsTable
+        applications={result.applications}
+        meta={result.meta}
+        siteTypes={siteTypes}
+        canManage={can(permissions, "application", "manage")}
+        canOpen={canOpenApplication(appPermissions)}
+        canMagicLogin={can(appPermissions, "app_magic_login", "manage", "application")}
+        canRemoveSystemUser={can(permissions, "system_user", "manage")}
+        canManageDocker={can(permissions, "docker", "manage")}
+        gitProviders={gitProviders}
+        backupStanding={backupStanding}
+        missingDatabase={sitesMissingDatabase(
+          result.applications,
+          siteTypes,
+          dbCounts.counts,
+          dbCounts.known,
+        )}
+      />
+    </div>
+  );
+}

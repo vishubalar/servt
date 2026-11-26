@@ -1,0 +1,520 @@
+<?php
+
+use App\Enums\ApplicationStatus;
+use App\Enums\CertificateStatus;
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\Certificate;
+use App\Models\Database;
+use App\Models\DatabaseUser;
+use App\Models\Permission;
+use App\Models\Role;
+use App\Models\ServerCapability;
+use App\Models\User;
+use App\Services\Server\Applications\PhpMyAdminSso;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Process;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    // Without the catalog there are no permissions to grant, so every
+    // authorisation check below would be testing an empty set.
+    $this->seed(PermissionSeeder::class);
+
+    // Issuing a link writes the sign-in script and the token file to the phpMyAdmin site, so every
+    // path runs commands. Recorded via the closure form: this fake has no Process::recorded().
+    $this->ranCommands = [];
+    $this->ranInput = [];
+
+    // What `cat config.inc.php` finds on the site: empty by default, other states set per test.
+    $this->configContents = '';
+
+    Process::fake(function ($process) {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+
+        $this->ranCommands[] = $command;
+        // Keyed by command so a test can look at what was piped into a
+        // particular `tee` — the file contents never appear in argv.
+        $this->ranInput[$command] = (string) $process->input;
+
+        // Every step runs as the phpMyAdmin site's user, so the read arrives as
+        // `runuser -u <user> -- cat …`. Matched after that prefix: a fake that only knew bare `cat`
+        // would return an empty config and let the "already configured" test pass unchecked.
+        $bare = preg_replace('/^runuser -u \S+ -- /', '', $command);
+
+        return str_starts_with($bare, 'cat ') && str_contains($bare, 'config.inc.php')
+            ? Process::result(output: $this->configContents)
+            : Process::result(exitCode: 0);
+    });
+
+    $this->user = User::factory()->create();
+    $this->actingAs($this->user);
+
+    // A non-MongoDB database for happy-path tests.
+    $this->database = Database::factory()->create(['engine' => 'mariadb']);
+
+    // A running phpMyAdmin application on the server. `isolated_at` matters:
+    // the token file is only private to this site when the site has its own
+    // PHP-FPM pool, so without it the endpoint refuses.
+    $this->pmaApp = Application::factory()->create([
+        'site_type' => 'phpmyadmin',
+        'domain' => 'pma.example.com',
+        'status' => ApplicationStatus::Active,
+        'isolated_at' => now(),
+    ]);
+    securePma($this->pmaApp);
+});
+
+/**
+ * A certificate the site can serve, for its own name. Sign-in links are
+ * refused over plain HTTP, so every happy path needs one.
+ */
+function securePma(Application $application): Application
+{
+    Certificate::factory()->create([
+        'application_id' => $application->id,
+        'status' => CertificateStatus::Active,
+        'domains' => [$application->domain],
+        'certificate_path' => "/etc/letsencrypt/live/{$application->domain}/fullchain.pem",
+        'private_key_path' => "/etc/letsencrypt/live/{$application->domain}/privkey.pem",
+    ]);
+
+    return $application->refresh();
+}
+
+/**
+ * Every command the endpoint ran, as a flat string.
+ *
+ * A free function, not a closure property: Pest shares helper names across the suite, and
+ * `ssoCommands` is specific enough not to collide.
+ *
+ * @return array<int, string>
+ */
+function ssoCommands(): array
+{
+    return test()->ranCommands;
+}
+
+/**
+ * The prefix every SSO file operation must carry: the phpMyAdmin site's own
+ * user. As root, `tee` and `chown` followed a link planted at `sso.php` or `config.inc.php`.
+ */
+function asPma(string $command): string
+{
+    return 'runuser -u '.test()->pmaApp->systemUser->username.' -- '.$command;
+}
+
+/**
+ * Permissions are role-based and the pivot carries `view`/`manage`: syncing a permission *name*
+ * where an id belongs attaches nothing (or trips the foreign key on SQLite).
+ */
+function grantDatabasePermission(User $user): void
+{
+    $role = Role::factory()->create(['is_system' => false]);
+    $permission = Permission::firstWhere('name', 'database');
+
+    $role->permissions()->attach($permission->id, ['view' => true, 'manage' => true]);
+    $user->roles()->sync([$role->id]);
+}
+
+describe('POST /databases/{database}/phpmyadmin-sso', function () {
+
+    /*
+     * The link scheme must follow the site: with no certificate there is no TLS listener, so an
+     * `https://` link is a connection refused that reads as a broken panel.
+     */
+    it('refuses a phpMyAdmin site without HTTPS (bug #98)', function () {
+        grantDatabasePermission($this->user);
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        // The link carries a live database session, and the cookie it buys rides along with every
+        // request. Over plain HTTP both cross the network in clear text.
+        $this->pmaApp->certificate()->delete();
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")
+            ->assertStatus(422)
+            ->assertJsonFragment(['message' => __('errors/database.phpmyadmin_requires_https')]);
+
+        // Refused before anything was written to the site.
+        expect(collect(ssoCommands())->filter(fn ($c) => str_contains($c, 'tee')))->toBeEmpty();
+    });
+
+    it('sends the user over https once the site has a servable certificate', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso");
+
+        expect($response->json('redirect_url'))
+            ->toStartWith("https://{$this->pmaApp->domain}/sso.php?token=");
+    });
+
+    it('returns redirect_url when a specific database_user_id is provided', function () {
+        grantDatabasePermission($this->user);
+
+        $dbUser = DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso?database_user_id={$dbUser->id}");
+
+        $response->assertOk()
+            ->assertJsonStructure(['redirect_url']);
+    });
+
+    /*
+     * The token must be written on the phpMyAdmin site itself, next to an `sso.php` that serves
+     * it: the panel's cache is not readable from there.
+     */
+    it('writes the sign-in script onto the phpMyAdmin site', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+
+        $shim = $this->pmaApp->rootPath().'/public_html/sso.php';
+
+        expect(ssoCommands())->toContain(asPma("tee {$shim}"))
+            ->and(collect(ssoCommands())->contains(fn (string $c) => str_starts_with($c, "tee {$shim}")))->toBeFalse();
+    });
+
+    it('drops the token in a private file above the document root', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso");
+
+        preg_match('/token=([a-zA-Z0-9]{64})/', (string) $response->json('redirect_url'), $matches);
+        $file = $this->pmaApp->panelPath()."/sso/{$matches[1]}.json";
+
+        // Above the document root, so no visitor can request it by name, and
+        // 0600 so no other account on the server can read the password in it.
+        expect($file)->not->toContain('/public_html/')
+            ->and(ssoCommands())->toContain(asPma("tee {$file}"))
+            ->and(ssoCommands())->toContain(asPma("chmod 0600 {$file}"));
+    });
+
+    it('never puts the credentials on a command line', function () {
+        grantDatabasePermission($this->user);
+
+        $dbUser = DatabaseUser::factory()->create([
+            'database_id' => $this->database->id,
+            'password' => 'sup3r-s3cret',
+        ]);
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+
+        // The payload travels over stdin. On argv it would be readable in `ps`
+        // by every account on the box for as long as `tee` runs.
+        foreach (ssoCommands() as $command) {
+            expect($command)->not->toContain('sup3r-s3cret')
+                ->and($command)->not->toContain($dbUser->username.':');
+        }
+    });
+
+    /*
+     * Without its own PHP-FPM pool the site runs as the same account as every
+     * other site on the server, and a file "only phpMyAdmin can read" is a file
+     * they can all read.
+     */
+    it('refuses to mint a link for a site sharing the server-wide PHP pool', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        // forceFill: `isolated_at` is written by the provisioner, not by a
+        // request, so it is not mass-assignable and update() would drop it.
+        $this->pmaApp->forceFill(['isolated_at' => null])->save();
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")
+            ->assertStatus(422);
+
+        expect(ssoCommands())->toBeEmpty();
+    });
+
+    /*
+     * The same site, on the stack where `isolated_at` is null for everything.
+     *
+     * `isolated_at` records an FPM *pool*, which LSPHP has none of (each vhost carries its own
+     * `extUser`), so the guard must not refuse with `phpmyadmin_not_isolated` on OpenLiteSpeed.
+     */
+    it('mints a link on OpenLiteSpeed, where no site ever has a pool', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        // A real OpenLiteSpeed server, not a config poke: PhpStackManager
+        // resolves the stack from the *recorded* web server, so setting the
+        // nginx driver's php_stack would not have changed the answer.
+        ServerCapability::query()->delete();
+        ServerCapability::query()->create([
+            'stack' => 'ols',
+            'web_server' => 'openlitespeed',
+            'capabilities' => ['php' => true, 'node' => false],
+            'source' => 'installer',
+            'verified_at' => now(),
+        ]);
+
+        // Exactly the state the refusal above tests — and here it must not
+        // refuse, because on this stack it means the opposite.
+        $this->pmaApp->forceFill(['isolated_at' => null])->save();
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")
+            ->assertOk()
+            ->assertJsonStructure(['redirect_url']);
+    });
+
+    /*
+     * A site created before this feature has one server entry, on cookie auth.
+     * Dropping sso.php next to it would hand a session to a server that does
+     * not exist, so the config has to come forward with it.
+     */
+    it('adds the signon server to a configuration written before this feature', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $this->configContents = <<<'PHP'
+        <?php
+        $cfg['blowfish_secret'] = sodium_hex2bin('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+        $i = 0;
+        $i++;
+        $cfg['Servers'][$i]['auth_type'] = 'cookie';
+        PHP;
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+
+        $write = asPma('tee '.$this->pmaApp->rootPath().'/public_html/config.inc.php');
+
+        expect(ssoCommands())->toContain($write)
+            // Read as the site user too: as root, `cat` followed a
+            // `config.inc.php` link to whatever it named.
+            ->and(ssoCommands())->toContain(asPma('cat '.$this->pmaApp->rootPath().'/public_html/config.inc.php'))
+            // The existing blowfish_secret is carried across. Generating a new
+            // one would silently sign out everyone already using phpMyAdmin.
+            ->and(test()->ranInput[$write])->toContain(str_repeat('a', 64))
+            ->and(test()->ranInput[$write])->toContain("'signon'");
+    });
+
+    it('leaves a configuration that already has the signon server alone', function () {
+        grantDatabasePermission($this->user);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $this->configContents = "<?php\n\$cfg['Servers'][\$i]['auth_type'] = 'signon';";
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+
+        // Rewriting would regenerate blowfish_secret, and a new secret cannot decrypt the old
+        // cookies: every signed-in user would be thrown out on each click.
+        expect(collect(ssoCommands())->contains(fn (string $c) => str_contains($c, 'tee '.$this->pmaApp->rootPath().'/public_html/config.inc.php')))->toBeFalse();
+    });
+
+    it('records who signed in to which database as which account', function () {
+        grantDatabasePermission($this->user);
+
+        $dbUser = DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+
+        $this->assertDatabaseHas('activity_logs', [
+            'user_id' => $this->user->id,
+            'type' => 'database',
+            'action' => 'phpmyadmin_signed_in',
+        ]);
+
+        expect(ActivityLog::latest('id')->first()->properties['username'])->toBe($dbUser->username);
+    });
+
+    it('returns 422 for a MongoDB database', function () {
+        grantDatabasePermission($this->user);
+
+        $mongoDb = Database::factory()->create(['engine' => 'mongodb']);
+
+        $response = $this->postJson("/api/databases/{$mongoDb->id}/phpmyadmin-sso");
+
+        $response->assertStatus(422)
+            ->assertJsonFragment(['message' => 'phpMyAdmin does not support MongoDB databases.']);
+    });
+
+    it('names the engine it is refusing, not whichever was the only one at the time', function () {
+        grantDatabasePermission($this->user);
+
+        // The message must name the actual engine: a hardcoded "MongoDB" text on a PostgreSQL
+        // database reads as a panel bug rather than an answer.
+        $postgres = Database::factory()->create(['engine' => 'postgresql']);
+
+        $this->postJson("/api/databases/{$postgres->id}/phpmyadmin-sso")
+            ->assertStatus(422)
+            ->assertJsonFragment(['message' => 'phpMyAdmin does not support PostgreSQL databases.']);
+    });
+
+    it('returns 422 when no phpMyAdmin site is deployed', function () {
+        grantDatabasePermission($this->user);
+
+        // The only phpMyAdmin site never finished provisioning: the record exists but nothing is
+        // served, so SSO has nowhere to send the user. (A site is Pending, Provisioning, Active
+        // or Failed; there is no "stopped".)
+        $this->pmaApp->update(['status' => ApplicationStatus::Failed]);
+
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso");
+
+        $response->assertStatus(422)
+            ->assertJsonFragment(['message' => 'No phpMyAdmin application is installed on this server.']);
+    });
+
+    it('returns 422 when the database has no users', function () {
+        grantDatabasePermission($this->user);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso");
+
+        $response->assertStatus(422)
+            ->assertJsonFragment(['message' => 'Create a database user before accessing phpMyAdmin.']);
+    });
+
+    it('returns 422 when the specified database_user_id does not belong to this database', function () {
+        grantDatabasePermission($this->user);
+
+        $otherDb = Database::factory()->create(['engine' => 'mariadb']);
+        $otherUser = DatabaseUser::factory()->create(['database_id' => $otherDb->id]);
+        $thisUser = DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso?database_user_id={$otherUser->id}");
+
+        $response->assertStatus(422)
+            ->assertJsonFragment(['message' => 'The specified database user does not belong to this database.']);
+    });
+
+    it('returns 403 when the user lacks the database permission', function () {
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $response = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso");
+
+        $response->assertForbidden();
+    });
+
+    it('refuses a view-only role, because the session it opens can write', function () {
+        // The sign-in lands as the database's own user, so a read-only role could run an INSERT.
+        grantPermission($this->user, 'database');
+        DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+
+        $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertForbidden();
+
+        // Refused before anything is written to the phpMyAdmin site.
+        expect($this->ranCommands)->toBe([]);
+    });
+
+    it('returns 404 for a non-existent database', function () {
+        grantDatabasePermission($this->user);
+
+        $response = $this->postJson('/api/databases/99999/phpmyadmin-sso');
+
+        $response->assertNotFound();
+    });
+});
+
+/*
+ * Both files are PHP the panel generates and never executes, so a syntax error would only show
+ * as a blank phpMyAdmin page on a customer's server. TOKEN_PARSE makes the tokeniser reject
+ * what it would otherwise skip past: as close to `php -l` as this gets in-process.
+ */
+describe('the generated files', function () {
+
+    it('writes a sign-in script that is valid PHP', function () {
+        $application = Application::factory()->create([
+            'site_type' => 'phpmyadmin',
+            'isolated_at' => now(),
+        ]);
+
+        $code = app(PhpMyAdminSso::class)->renderShim($application);
+
+        expect(fn () => token_get_all($code, TOKEN_PARSE))->not->toThrow(ParseError::class);
+
+        // The token directory is baked in rather than derived at request time:
+        // the script must not be able to be pointed somewhere else by whoever
+        // is calling it.
+        expect($code)->toContain($application->panelPath().'/sso');
+    });
+
+    it('writes a phpMyAdmin configuration that is valid PHP and offers both logins', function () {
+        $code = app(PhpMyAdminSso::class)->renderConfig(
+            str_repeat('a', 64),
+            '127.0.0.1',
+            '/home/site/app/tmp',
+        );
+
+        expect(fn () => token_get_all($code, TOKEN_PARSE))->not->toThrow(ParseError::class);
+
+        // Server 1 stays on cookie auth so typing your own credentials keeps
+        // working; server 2 is the panel's one-click entry. Losing either is a
+        // regression somebody would only notice in a browser.
+        expect($code)->toContain("\$cfg['Servers'][\$i]['auth_type'] = 'cookie';")
+            ->and($code)->toContain("\$cfg['Servers'][\$i]['auth_type'] = 'signon';")
+            ->and($code)->toContain(PhpMyAdminSso::SIGNON_SESSION);
+    });
+});
+
+it('opens the phpMyAdmin the caller asked for, not whichever came first', function () {
+    grantDatabasePermission($this->user);
+    DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+    // A second installation, created after the first. Without `application_id` the endpoint took
+    // an unordered `->first()`, so this one was unreachable.
+    $second = securePma(Application::factory()->create([
+        'site_type' => 'phpmyadmin',
+        'domain' => 'pma-two.example.com',
+        'status' => ApplicationStatus::Active,
+        'isolated_at' => now(),
+    ]));
+
+    $response = $this->postJson(
+        "/api/databases/{$this->database->id}/phpmyadmin-sso?application_id={$second->id}"
+    )->assertOk();
+
+    expect($response->json('redirect_url'))->toContain('pma-two.example.com')
+        ->and($response->json('redirect_url'))->not->toContain('pma.example.com');
+});
+
+it('refuses a site that is not an active phpMyAdmin', function () {
+    grantDatabasePermission($this->user);
+    DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+    // A different mistake from "none installed", and it gets a different
+    // message: telling someone to install phpMyAdmin when they named the wrong
+    // site sends them to install what they already have.
+    $wordpress = Application::factory()->create([
+        'site_type' => 'wordpress',
+        'domain' => 'blog.example.com',
+        'status' => ApplicationStatus::Active,
+    ]);
+
+    $this->postJson(
+        "/api/databases/{$this->database->id}/phpmyadmin-sso?application_id={$wordpress->id}"
+    )->assertStatus(422)
+        ->assertJsonFragment(['message' => 'The selected application is not an active phpMyAdmin installation.']);
+});
+
+it('falls back to the same installation every time when none is named', function () {
+    grantDatabasePermission($this->user);
+    DatabaseUser::factory()->create(['database_id' => $this->database->id]);
+    securePma(Application::factory()->create([
+        'site_type' => 'phpmyadmin',
+        'domain' => 'pma-two.example.com',
+        'status' => ApplicationStatus::Active,
+        'isolated_at' => now(),
+    ]));
+
+    // Ordered, so an unnamed choice is stable. `first()` on an unordered query
+    // is whatever the engine returns, which can differ between two identical
+    // requests.
+    $first = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+    $again = $this->postJson("/api/databases/{$this->database->id}/phpmyadmin-sso")->assertOk();
+
+    expect($first->json('redirect_url'))->toContain('pma.example.com')
+        ->and($again->json('redirect_url'))->toContain('pma.example.com');
+});

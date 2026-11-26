@@ -1,0 +1,243 @@
+<?php
+
+namespace App\Services\Server\Sync\Discoverers;
+
+use App\Actions\Server\SystemUser\ToggleSudo;
+use App\Contracts\Discoverable;
+use App\Enums\SyncMode;
+use App\Http\Requests\Server\SystemUser\StoreSystemUserRequest;
+use App\Models\SyncRun;
+use App\Models\SystemUser;
+use App\Services\Server\ServerOps;
+use App\Services\Server\SystemUsers\SshUsersGroup;
+
+/**
+ * Login accounts on the box that the panel does not know about.
+ *
+ * Read from `getent passwd` rather than by listing /home: a directory proves nothing about
+ * whether an account exists, and an account whose home was moved would be missed.
+ *
+ * The filter is conservative so root or www-data never land in a list the panel offers to
+ * delete: a real login UID, a home under the configured base, and a name the panel would
+ * itself accept.
+ */
+class SystemUserDiscoverer implements Discoverable
+{
+    /**
+     * Below this are system accounts on every Debian-derived distribution.
+     * `nobody` sits at 65534 and is not a person either.
+     */
+    private const MIN_UID = 1000;
+
+    private const MAX_UID = 60000;
+
+    /** Groups that grant sudo in a stock Debian/Ubuntu sudoers. */
+    private const SUDO_GROUPS = ToggleSudo::SUDO_GROUPS;
+
+    public function __construct(private ServerOps $serverOps) {}
+
+    public function resourceType(): string
+    {
+        return 'system_user';
+    }
+
+    public function dependsOn(): array
+    {
+        return [];
+    }
+
+    public function discover(SyncRun $run): array
+    {
+        $result = $this->serverOps->run(
+            ['getent', 'passwd'],
+            ['feature' => 'sync', 'op' => 'discover_system_users'],
+            timeout: 30,
+        );
+
+        if ($result->failed()) {
+            return [];
+        }
+
+        $sudoers = $this->sudoGroupMembers();
+
+        // Null means the groups could not be read. Correcting from that would switch every
+        // account's sudo off in the panel's record, so it is skipped.
+        if ($sudoers !== null && $run->mode === SyncMode::Apply) {
+            $this->correctTrackedSudo($sudoers);
+        }
+
+        $sudoers ??= [];
+
+        // SSH access is membership of the panel's own group (the one sshd's AllowGroups names).
+        // Read like sudo; null (group not created yet) means nobody is in it and corrects nothing.
+        $sshUsers = $this->groupMembers(SshUsersGroup::NAME);
+
+        if ($sshUsers !== null && $run->mode === SyncMode::Apply) {
+            $this->correctTrackedSshAccess($sshUsers);
+        }
+
+        $sshUsers ??= [];
+
+        $tracked = SystemUser::query()->pluck('username')->map('strtolower')->all();
+        $home = rtrim((string) config('server.home_base', '/home'), '/');
+        $found = [];
+
+        foreach (preg_split('/\r?\n/', trim($result->output())) ?: [] as $line) {
+            // name:x:uid:gid:gecos:home:shell
+            $parts = explode(':', $line);
+
+            if (count($parts) < 7) {
+                continue;
+            }
+
+            [$username, , $uid, , , $homePath, $shell] = $parts;
+            $uid = (int) $uid;
+
+            if ($uid < self::MIN_UID || $uid > self::MAX_UID) {
+                continue;
+            }
+
+            // Only accounts living where this panel puts them: a login under /root or /var/lib
+            // is not a site owner.
+            if (! str_starts_with($homePath, $home.'/')) {
+                continue;
+            }
+
+            if (in_array($username, StoreSystemUserRequest::RESERVED, true)) {
+                continue;
+            }
+
+            if (in_array(strtolower($username), $tracked, true)) {
+                continue;
+            }
+
+            $found[] = [
+                'key' => $username,
+                'label' => $username,
+                'confidence' => 100,
+                'evidence' => ['uid' => $uid, 'home_path' => $homePath, 'shell' => $shell, 'sudo' => in_array($username, $sudoers, true), 'ssh_access' => in_array($username, $sshUsers, true)],
+                'attributes' => ['username' => $username, 'home_path' => $homePath, 'shell' => $shell, 'sudo' => in_array($username, $sudoers, true), 'ssh_access' => in_array($username, $sshUsers, true)],
+            ];
+        }
+
+        return $found;
+    }
+
+    /**
+     * Who is in the groups that grant sudo on a Debian-derived server.
+     *
+     * `sudo` is the group the panel's toggle changes; `admin` is the older Ubuntu equivalent.
+     * Grants written straight into /etc/sudoers.d are not read: the panel cannot reproduce or
+     * revoke them, and guessing is worse than not claiming anything.
+     *
+     * Null when the answer did not include the `sudo` group: it exists on every Debian-derived
+     * install, so its absence means the command failed, not that nobody has sudo.
+     *
+     * @return array<int, string>|null
+     */
+    private function sudoGroupMembers(): ?array
+    {
+        $result = $this->serverOps->run(
+            ['getent', 'group', ...self::SUDO_GROUPS],
+            ['feature' => 'sync', 'op' => 'discover_sudo_members'],
+            timeout: 30,
+        );
+
+        // Exit 2 when one group does not exist (no `admin` on a new install); the rest still print.
+        $members = [];
+        $sawSudo = false;
+
+        foreach (preg_split('/\r?\n/', trim($result->output())) ?: [] as $line) {
+            $parts = explode(':', trim($line));
+
+            if (count($parts) !== 4 || ! in_array($parts[0], self::SUDO_GROUPS, true)) {
+                continue;
+            }
+
+            $sawSudo = $sawSudo || $parts[0] === 'sudo';
+
+            if ($parts[3] !== '') {
+                array_push($members, ...explode(',', $parts[3]));
+            }
+        }
+
+        return $sawSudo ? array_values(array_unique($members)) : null;
+    }
+
+    /**
+     * Members of one group, or null when the group does not exist.
+     *
+     * @return array<int, string>|null
+     */
+    private function groupMembers(string $group): ?array
+    {
+        $result = $this->serverOps->run(
+            ['getent', 'group', $group],
+            ['feature' => 'sync', 'op' => 'discover_group_members', 'group' => $group],
+            timeout: 30,
+            // 2 = no such group: an answer, not a fault.
+            expectedExitCodes: [2],
+        );
+
+        // The output decides, not the exit code: `getent group a b` exits 2 if either is missing.
+        foreach (preg_split('/\r?\n/', trim($result->output())) ?: [] as $line) {
+            $parts = explode(':', trim($line));
+
+            if (count($parts) === 4 && $parts[0] === $group) {
+                return $parts[3] === '' ? [] : array_values(array_unique(explode(',', $parts[3])));
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Same as correctTrackedSudo(), for SSH access.
+     *
+     * @param  array<int, string>  $members
+     */
+    private function correctTrackedSshAccess(array $members): void
+    {
+        SystemUser::query()->each(function (SystemUser $user) use ($members) {
+            $actual = in_array($user->username, $members, true);
+
+            if ($user->ssh_access !== $actual) {
+                $user->forceFill(['ssh_access' => $actual])->save();
+            }
+        });
+    }
+
+    /**
+     * Bring the recorded sudo flag of accounts already in the panel in line with the server.
+     *
+     * Apply runs only: a preview writes nothing. Only the panel's record moves, never the server.
+     *
+     * @param  array<int, string>  $sudoers
+     */
+    private function correctTrackedSudo(array $sudoers): void
+    {
+        SystemUser::query()->each(function (SystemUser $user) use ($sudoers) {
+            $actual = in_array($user->username, $sudoers, true);
+
+            if ($user->sudo !== $actual) {
+                $user->forceFill(['sudo' => $actual])->save();
+            }
+        });
+    }
+
+    public function adopt(array $item): ?object
+    {
+        $attributes = $item['attributes'] ?? [];
+
+        return SystemUser::create([
+            'username' => $attributes['username'] ?? $item['key'],
+            'home_path' => $attributes['home_path'] ?? null,
+            'shell' => $attributes['shell'] ?? '/bin/bash',
+            // What the server says, not a default: a hard-coded false would list an account with
+            // full sudo as having none.
+            'sudo' => (bool) ($attributes['sudo'] ?? false),
+            // Membership of the panel's SSH group, read from the server.
+            'ssh_access' => (bool) ($attributes['ssh_access'] ?? false),
+        ]);
+    }
+}

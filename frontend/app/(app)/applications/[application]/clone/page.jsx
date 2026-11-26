@@ -1,0 +1,76 @@
+import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
+import { PageHeader } from "@/components/ui/page-header";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { getCurrentUser } from "@/lib/auth/get-current-user";
+import { can } from "@/lib/permissions/can";
+import { getApplication, getAllApplications, getSiteTypes } from "@/lib/applications/get-applications";
+import { CloneApplicationPanel, CloneTypeNotSupported } from "@/components/applications/clone/clone-panel";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata({ params }) {
+  const { application } = await params;
+  const [t, result] = await Promise.all([
+    getTranslations("applications.clone"),
+    getApplication(application),
+  ]);
+  return { title: `${t("pageTitle")} — ${result.application?.name ?? ""}` };
+}
+
+export default async function CloneApplicationPage({ params }) {
+  const { application: id } = await params;
+  const [permissions, appPermissions, t, result] = await Promise.all([
+    getPermissions(),
+    getPermissions("application", id).catch(() => []),
+    getTranslations("applications.clone"),
+    getApplication(id),
+  ]);
+
+  if (!can(permissions, "application", "view")) return <PermissionDenied title={t("pageTitle")} />;
+  if (result.status === 404) redirect("/applications?gone=1");
+  if (result.failed || !result.application) return <LoadFailed description={t("loadFailed")} status={result.status} failure={result.failure} message={result.message} debug={result.debug} />;
+
+  if (!can(appPermissions, "app_clone", "view", "application")) {
+    if ((await getCurrentUser().catch(() => null))?.is_admin) return <TypeNotSupported application={result.application} t={t} />;
+    return <PermissionDenied title={t("pageTitle")} />;
+  }
+
+  const application = result.application;
+  const canManage = can(appPermissions, "app_clone", "manage", "application");
+
+  const [{ siteTypes }, { applications }] = await Promise.all([getSiteTypes(), getAllApplications()]);
+  const siteType = siteTypes.find((type) => type.name === application.site_type) ?? null;
+
+  const copies = applications.filter(
+    (candidate) => Number(candidate.cloned_from_application_id) === Number(id),
+  );
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("pageTitle")} />
+
+      <CloneApplicationPanel
+        application={application}
+        siteType={siteType}
+        copies={copies}
+        takenDomains={applications.map((a) => a.domain).filter(Boolean)}
+        takenNames={applications.map((a) => a.name).filter(Boolean)}
+        canManage={canManage}
+      />
+    </div>
+  );
+}
+
+async function TypeNotSupported({ application, t }) {
+  const { siteTypes } = await getSiteTypes();
+  const type = siteTypes.find((candidate) => candidate.name === application.site_type);
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("pageTitle")} />
+      <CloneTypeNotSupported typeTitle={type?.title ?? application.site_type} />
+    </div>
+  );
+}

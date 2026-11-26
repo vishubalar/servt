@@ -1,0 +1,102 @@
+"use client";
+
+import { ScrollText, SearchX, History } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { useSetQuery } from "@/hooks/use-set-query";
+import { typeLabel } from "@/lib/activity-log/labels";
+import { HoverHint } from "@/components/ui/hover-hint";
+
+function WhenCell({ row }) {
+  return (
+    <span className="whitespace-nowrap text-muted-foreground">
+      {row.original.created_at_human}
+    </span>
+  );
+}
+
+function UserCell({ row }) {
+  const t = useTranslations("activity");
+  const u = row.original.user;
+  return u ? (
+    <HoverHint content={`@${u.username}`}><span className="block truncate">@{u.username}</span></HoverHint>
+  ) : (
+    <span className="text-muted-foreground">{t("system")}</span>
+  );
+}
+
+function TypeCell({ row }) {
+  const t = useTranslations("activity");
+  return row.original.type ? (
+    <Badge variant="outline" className="font-normal">
+      {typeLabel(t, row.original.type)}
+    </Badge>
+  ) : (
+    <span className="text-muted-foreground">—</span>
+  );
+}
+
+function DescriptionCell({ row }) {
+  const t = useTranslations("activity");
+  const { description, user, created_at_human } = row.original;
+  return (
+    <>
+      <span>{description || "—"}</span>
+      <span className="mt-0.5 block text-xs text-muted-foreground sm:hidden">
+        {user ? `@${user.username}` : t("system")} · {created_at_human}
+      </span>
+    </>
+  );
+}
+
+export function ActivityTable({ data, hasFilters }) {
+  const t = useTranslations("activity");
+  const setQuery = useSetQuery();
+
+  if (data.length === 0) {
+    return hasFilters ? (
+      <EmptyState
+        icon={SearchX}
+        subject={History}
+        title={t("empty.filteredTitle")}
+        description={t("empty.filteredDesc")}
+        action={
+          <Button
+            variant="outline"
+            onClick={() =>
+              setQuery(
+                { search: undefined, type: undefined, action: undefined },
+                { resetPage: true },
+              )
+            }
+          >
+            {t("empty.clear")}
+          </Button>
+        }
+      />
+    ) : (
+      <EmptyState
+        icon={ScrollText}
+        title={t("empty.title")}
+        description={t("empty.desc")}
+      />
+    );
+  }
+
+  const columns = [
+    { accessorKey: "created_at_human", header: t("columns.when"), cell: WhenCell, meta: { className: "hidden w-44 sm:table-cell" } },
+    { id: "user", header: t("columns.user"), cell: UserCell, meta: { className: "hidden w-44 sm:table-cell" } },
+    { id: "type", header: t("table.type"), cell: TypeCell, meta: { className: "hidden w-68 xl:table-cell" } },
+    {
+      accessorKey: "description",
+      header: t("columns.description"),
+      cell: DescriptionCell,
+      meta: { className: "whitespace-normal" },
+    },
+  ];
+
+  return <DataTable bare columns={columns} data={data} fixedLayout />;
+}

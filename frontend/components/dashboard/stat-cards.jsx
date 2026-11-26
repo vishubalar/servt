@@ -1,0 +1,176 @@
+import { useTranslations, useFormatter } from "next-intl";
+import { cn } from "@/lib/utils";
+import { pct, usageStatus } from "@/lib/metrics/usage-level";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import { formatBytes, localizeSizeText } from "@/lib/format/bytes";
+
+const STATUS_VARIANT = {
+  normal: "success",
+  watch: "warning",
+  high: "destructive",
+  off: "muted",
+  unknown: "muted",
+};
+const BAR_FILL = {
+  normal: "bg-success",
+  watch: "bg-warning",
+  high: "bg-destructive",
+};
+
+function UsageTile({ label, value, ringValue, hint, sub, percent, loading, status = null }) {
+  const width = Math.max(0, Math.min(100, Number(percent) || 0));
+  return (
+    <div className="min-w-0 bg-card p-4 shadow-[inset_-1px_0_0_var(--border),inset_0_-1px_0_var(--border)]">
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+        <p className="text-[13px] font-medium break-words text-muted-foreground">{label}</p>
+        {status && !loading && status.key !== "normal" && status.key !== "unknown" ? (
+          <Badge variant={STATUS_VARIANT[status.key] ?? "muted"}>
+            <span aria-hidden className="size-1.5 bg-current" />
+            {status.label}
+          </Badge>
+        ) : null}
+      </div>
+      {loading ? (
+        <Skeleton className="mt-2 h-[22px] w-14" />
+      ) : (
+        <p className="mt-2 text-[22px] leading-none font-semibold tracking-tight tabular-nums"><BigValue text={ringValue ?? value} /></p>
+      )}
+      <div className={cn("mt-3 h-1 bg-muted", SEGMENTS)} aria-hidden>
+        {status && BAR_FILL[status.key] && !loading ? (
+          <div className={cn("h-full transition-[width] duration-500", BAR_FILL[status.key], SEGMENTS)} style={{ width: `${width}%` }} />
+        ) : null}
+      </div>
+      {loading ? (
+        <Skeleton className="mt-2.5 h-3.5 w-24" />
+      ) : hint || sub ? (
+        <p className="mt-2.5 font-mono text-xs break-words tabular-nums text-muted-foreground">
+          {hint ? keepUnits(hint) : null}
+          {hint && sub ? " · " : null}
+          {sub ? keepUnits(sub) : null}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+const SEGMENTS = "[mask-image:repeating-linear-gradient(90deg,#000_0_6px,transparent_6px_8px)]";
+
+function BigValue({ text }) {
+  const match = typeof text === "string" ? /^(.*?\d)(\s?%)$/u.exec(text) : null;
+  if (!match) return text;
+  return (
+    <>
+      {match[1]}
+      <span className="ms-0.5 text-sm font-medium text-muted-foreground">%</span>
+    </>
+  );
+}
+
+function keepUnits(value) {
+  return typeof value === "string" ? value.replace(/(\d)\s+(?=[A-Za-z%])/g, "$1\u00A0") : value;
+}
+
+export function StatCards({ metrics, stale = false, ratesReady = true }) {
+  const t = useTranslations("serverDashboard");
+  const format = useFormatter();
+  const loading = !metrics;
+  const size = (value, human) => formatBytes(value, format) ?? localizeSizeText(human, format);
+
+  const statusFor = (percent, fallback = null) => {
+    const key = usageStatus(percent) ?? fallback;
+    return key ? { key, label: t(`status.${key}`) } : null;
+  };
+
+  const percentText = (value, decimals = 0) =>
+    format.number(pct(value) / 100, {
+      style: "percent",
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    });
+  const decimal = (value) =>
+    Number.isFinite(Number(value))
+      ? format.number(Number(value), {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })
+      : "—";
+
+  const cpu = metrics?.cpu;
+  const memory = metrics?.memory;
+  const swap = metrics?.swap;
+  const disk = metrics?.disk;
+  const load = metrics?.load;
+  const cores = Number(cpu?.cores) || 0;
+  const loadPercent =
+    cores > 0 && Number.isFinite(Number(load?.[15]))
+      ? (Number(load[15]) / cores) * 100
+      : null;
+
+  return (
+    <div
+      aria-busy={loading}
+      className={cn(
+        "-mr-px -mb-px grid transition-opacity sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5",
+        stale && "opacity-60",
+      )}
+    >
+      <UsageTile
+        label={t("cpu")}
+        value={ratesReady ? percentText(cpu?.percent, 1) : t("measuring")}
+        ringValue={ratesReady ? percentText(cpu?.percent, 0) : "—"}
+        percent={ratesReady ? cpu?.percent : null}
+        status={ratesReady ? statusFor(cpu?.percent) : null}
+        hint={ratesReady ? (cpu?.cores ? t("cores", { count: cpu.cores }) : "") : t("measuring")}
+        loading={loading}
+      />
+      <UsageTile
+        label={t("memory")}
+        value={percentText(memory?.percent)}
+        percent={memory?.percent}
+        status={statusFor(memory?.percent)}
+        hint={
+          memory?.total_human
+            ? t("usedOf", { used: size(memory.used, memory.used_human), total: size(memory.total, memory.total_human) })
+            : ""
+        }
+        loading={loading}
+      />
+      <UsageTile
+        label={t("swap")}
+        value={
+          Number(swap?.total) > 0 ? percentText(swap?.percent) : "—"
+        }
+        percent={Number(swap?.total) > 0 ? swap?.percent : null}
+        status={Number(swap?.total) > 0 ? statusFor(swap?.percent) : statusFor(null, "off")}
+        hint={
+          Number(swap?.total) > 0 && swap?.used_human && swap?.total_human
+            ? t("usedOf", { used: size(swap.used, swap.used_human), total: size(swap.total, swap.total_human) })
+            : t("swapOff")
+        }
+        loading={loading}
+      />
+      <UsageTile
+        label={t("disk")}
+        value={Number(disk?.total) > 0 ? percentText(disk?.percent) : "—"}
+        percent={Number(disk?.total) > 0 ? disk?.percent : null}
+        status={Number(disk?.total) > 0 ? statusFor(disk?.percent) : statusFor(null, "unknown")}
+        hint={
+          Number(disk?.total) > 0 && disk?.total_human
+            ? t("usedOf", { used: size(disk.used, disk.used_human), total: size(disk.total, disk.total_human) })
+            : t("diskUnknown")
+        }
+        loading={loading}
+      />
+      <UsageTile
+        label={t("load")}
+        value={decimal(load?.[15])}
+        percent={loadPercent}
+        status={statusFor(loadPercent)}
+        hint={cores ? t("ofCores", { count: cores }) : ""}
+        sub={load ? `${t("loadHint")}: ${decimal(load[5])}` : ""}
+        loading={loading}
+      />
+    </div>
+  );
+}

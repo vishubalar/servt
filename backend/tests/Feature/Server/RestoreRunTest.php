@@ -1,0 +1,769 @@
+<?php
+
+use App\Actions\Server\Backup\DeleteBackup;
+use App\Contracts\DatabaseEngine;
+use App\Enums\BackupStatus;
+use App\Enums\RestoreStatus;
+use App\Http\Resources\RestoreResource;
+use App\Models\Application;
+use App\Models\Backup;
+use App\Models\BackupTarget;
+use App\Models\Database;
+use App\Models\DatabaseUser;
+use App\Models\Restore;
+use App\Models\StorageDestination;
+use App\Models\SystemUser;
+use App\Services\Server\Backups\Storage\DestinationDisk;
+use App\Services\Server\Backups\Storage\LocalBackupFolder;
+use App\Services\Server\Backups\Storage\StorageDriverFactory;
+use App\Services\Server\Databases\DatabaseManager;
+use App\Services\Server\Restores\RestoreContext;
+use App\Services\Server\Restores\RestoreRunner;
+use App\Services\Server\Restores\Steps\RestoreDatabase;
+use App\Services\Server\ServerOps;
+use App\Services\Server\SystemUsers\HomeDirectoryAccess;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+
+/*
+ * Restore is the only operation in the panel that destroys data, so the tests
+ * that matter are the ones about failure: what the site looks like when the
+ * download is truncated, when the safety backup cannot be taken, when the
+ * archive turns out to hold something else. In every one of those the correct
+ * answer is "exactly as it was before the button was pressed".
+ */
+
+beforeEach(function () {
+    $this->fakeDisk = Storage::fake('destination');
+
+    $this->app->bind(DestinationDisk::class, fn () => new DestinationDisk(
+        app(StorageDriverFactory::class),
+        fn (array $config) => $this->fakeDisk,
+    ));
+
+    $this->home = storage_path('framework/testing/home-'.uniqid());
+    $this->domain = 'restore-me.test';
+    // `{home}/{slug}/public_html`, which is where the panel resolves a document root — not
+    // `{home}/{domain}`. Otherwise every restore here fails at the first step for want of a
+    // directory.
+    $this->siteRoot = $this->home.'/restore-me/public_html';
+
+    File::ensureDirectoryExists($this->siteRoot);
+    File::put($this->siteRoot.'/index.php', '<?php echo "live";');
+
+    $systemUser = SystemUser::create(['username' => 'restoreuser', 'home_path' => $this->home]);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Restore Me',
+        'slug' => 'restore-me',
+        'domain' => $this->domain,
+        'site_type' => 'php',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+    ]);
+
+    $this->destination = StorageDestination::create([
+        'name' => 'Backups',
+        'provider' => 's3',
+        'config' => ['endpoint' => '', 'region' => 'us-east-1', 'bucket' => 'backups', 'access_key' => 'key', 'secret_key' => 'secret'],
+    ]);
+
+    // Not `$this->target`: HigherOrderTapProxy (what `test()` returns inside a
+    // plain function) has its own `target` property, so `test()->target` would
+    // silently hand back the test case instead of this row.
+    $this->backupTarget = BackupTarget::create([
+        'application_id' => $this->application->id,
+        'storage_destination_id' => $this->destination->id,
+        'type' => 'filesystem',
+        'retention_count' => 3,
+        'enabled' => true,
+        'frequency' => 'daily',
+    ]);
+});
+
+afterEach(function () {
+    File::deleteDirectory($this->home);
+});
+
+/**
+ * A backup whose artefact really is on the fake destination, at the size the
+ * row claims — the state a restore starts from.
+ */
+function storedBackup(int $bytes = 2048, string $status = 'verified'): Backup
+{
+    $key = 'backups/restore-me.test/2026-08-04/1.tar.gz';
+    test()->fakeDisk->put($key, str_repeat('x', $bytes));
+
+    return Backup::create([
+        'backup_target_id' => test()->backupTarget->id,
+        'application_id' => test()->application->id,
+        'type' => 'filesystem',
+        'status' => $status,
+        'size_bytes' => $bytes,
+        'manifest' => ['key' => $key],
+        'verified_at' => now(),
+    ]);
+}
+
+function restoreFor(Backup $backup, string $type = 'filesystem'): Restore
+{
+    return Restore::create([
+        'backup_id' => $backup->id,
+        'application_id' => test()->application->id,
+        'type' => $type,
+        'status' => RestoreStatus::Pending,
+        'reference' => (string) Str::uuid(),
+    ]);
+}
+
+/**
+ * Stand in for tar and mv. `tar -xzf` produces the site directory the real one
+ * would; `mv` actually moves, so the swap is exercised rather than mocked away.
+ */
+function fakeRestoreCommands(bool $tarFails = false): void
+{
+    Process::fake(function ($process) use ($tarFails) {
+        $command = $process->command;
+        $binary = $command[0] === 'sudo' ? ($command[2] ?? '') : $command[0];
+        $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+
+        if ($binary === 'tar' && in_array('-xzf', $args, true)) {
+            if ($tarFails) {
+                return Process::result(errorOutput: 'tar: unexpected end of file', exitCode: 2);
+            }
+
+            $into = $args[4] ?? null;
+            if (is_string($into)) {
+                $site = $into.'/'.basename(test()->siteRoot);
+                File::ensureDirectoryExists($site);
+                File::put($site.'/index.php', '<?php echo "restored";');
+            }
+        }
+
+        if ($binary === 'mv') {
+            @rename($args[1], $args[2]);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+/** Make the safety backup succeed by giving tar something to produce. */
+function fakeSafetyBackupTar(): void
+{
+    Process::fake(function ($process) {
+        $command = $process->command;
+        $binary = $command[0] === 'sudo' ? ($command[2] ?? '') : $command[0];
+        $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+
+        // Matched by flag presence, not argv position: compression moved to
+        // `--use-compress-program`, so `$args[1]` is no longer the mode, and a fixture keyed on position
+        // stops recognising "create".
+        if ($binary === 'tar' && (in_array('-czf', $args, true) || in_array('-cf', $args, true))) {
+            file_put_contents(tarArchivePath($args) ?? $args[2], str_repeat('s', 4096));
+        }
+
+        if ($binary === 'tar' && in_array('-xzf', $args, true)) {
+            $into = $args[4] ?? null;
+            if (is_string($into)) {
+                $site = $into.'/'.basename(test()->siteRoot);
+                File::ensureDirectoryExists($site);
+                File::put($site.'/index.php', '<?php echo "restored";');
+            }
+        }
+
+        if ($binary === 'mv') {
+            @rename($args[1], $args[2]);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+it('restores the files, and removes the old site it moved aside once it worked', function () {
+    fakeSafetyBackupTar();
+    $restore = restoreFor(storedBackup());
+    $copy = dirname($this->siteRoot).'/.rollback-'.$restore->id;
+
+    $restore = app(RestoreRunner::class)->run($restore);
+
+    expect($restore->status)->toBe(RestoreStatus::Succeeded)
+        ->and($restore->reason)->toBeNull()
+        ->and(File::get($this->siteRoot.'/index.php'))->toContain('restored');
+
+    // No copy the user never asked for stays on the server. The way back after a restore is its
+    // safety backup.
+    Process::assertRan(fn ($p) => in_array('rm', $p->command, true) && in_array($copy, $p->command, true));
+    expect($restore->rollback_path)->toBeNull()
+        ->and($restore->safety_backup_id)->not->toBeNull();
+});
+
+it('takes a safety backup before it overwrites anything', function () {
+    fakeSafetyBackupTar();
+
+    $restore = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+    $safety = Backup::find($restore->safety_backup_id);
+
+    expect($safety)->not->toBeNull()
+        ->and($safety->is_safety)->toBeTrue()
+        ->and($safety->status)->toBe(BackupStatus::Verified);
+});
+
+describe('nothing is touched when it fails early', function () {
+    it('stops when the download does not match the recorded size', function () {
+        fakeSafetyBackupTar();
+
+        // The row says 2048; the bucket holds far less. A truncated artefact
+        // discovered after the swap would mean the site is simply gone.
+        $backup = storedBackup();
+        $this->fakeDisk->put($backup->manifest['key'], 'truncated');
+
+        $restore = app(RestoreRunner::class)->run(restoreFor($backup));
+
+        expect($restore->status)->toBe(RestoreStatus::Failed)
+            ->and($restore->reason)->toBe('verify_download')
+            ->and(File::get($this->siteRoot.'/index.php'))->toContain('live')
+            // Not even a safety backup: nothing had to be protected.
+            ->and($restore->safety_backup_id)->toBeNull();
+    });
+
+    it('stops when the artefact is missing from the destination', function () {
+        $backup = storedBackup();
+        $this->fakeDisk->delete($backup->manifest['key']);
+
+        $restore = app(RestoreRunner::class)->run(restoreFor($backup));
+
+        expect($restore->status)->toBe(RestoreStatus::Failed)
+            ->and($restore->reason)->toBe('download_artifact')
+            ->and(File::get($this->siteRoot.'/index.php'))->toContain('live');
+    });
+
+    it('stops when the safety backup cannot be taken', function () {
+        // tar fails, so the safety backup fails. Continuing here would remove
+        // the only way back at the exact moment it was about to be needed.
+        Process::fake(function ($process) {
+            $command = $process->command;
+            $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+
+            if (($args[0] ?? '') === 'tar' && ($args[1] ?? '') === '-tzf') {
+                return Process::result(exitCode: 0);
+            }
+
+            return Process::result(errorOutput: 'no space left on device', exitCode: 2);
+        });
+
+        $restore = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+        expect($restore->status)->toBe(RestoreStatus::Failed)
+            ->and($restore->reason)->toBe('safety_backup')
+            ->and(File::get($this->siteRoot.'/index.php'))->toContain('live');
+    });
+
+    it('stops when the archive does not contain the site directory', function () {
+        // Extraction succeeds but produces nothing we recognise. Swapping an
+        // empty directory over a working site is the failure this prevents.
+        Process::fake(function ($process) {
+            $command = $process->command;
+            $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+
+            if (($args[0] ?? '') === 'tar' && (in_array('-czf', $args, true) || in_array('-cf', $args, true))) {
+                file_put_contents(tarArchivePath($args) ?? $args[2], str_repeat('s', 4096));
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        $restore = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+        expect($restore->status)->toBe(RestoreStatus::Failed)
+            ->and($restore->reason)->toBe('extract_archive')
+            ->and(File::get($this->siteRoot.'/index.php'))->toContain('live');
+    });
+});
+
+it('puts the site back when the swap fails half way', function () {
+    // The move aside succeeds, the move into place does not — the window in
+    // which the site does not exist at all.
+    Process::fake(function ($process) {
+        $command = $process->command;
+        $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+
+        if (($args[0] ?? '') === 'tar' && (in_array('-czf', $args, true) || in_array('-cf', $args, true))) {
+            file_put_contents(tarArchivePath($args) ?? $args[2], str_repeat('s', 4096));
+        }
+
+        if (($args[0] ?? '') === 'tar' && in_array('-xzf', $args, true)) {
+            $site = $args[4].'/'.basename(test()->siteRoot);
+            File::ensureDirectoryExists($site);
+            File::put($site.'/index.php', '<?php echo "restored";');
+        }
+
+        if (($args[0] ?? '') === 'mv') {
+            // Only the staged copy refuses to move into place. The move aside
+            // and the rollback back must both work, or this would be testing
+            // a filesystem where nothing can move rather than the one failure
+            // that matters.
+            if (str_contains((string) $args[1], '.restore-')) {
+                return Process::result(errorOutput: 'permission denied', exitCode: 1);
+            }
+
+            @rename($args[1], $args[2]);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $restore = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+    expect($restore->status)->toBe(RestoreStatus::Failed)
+        ->and($restore->reason)->toBe('swap_files')
+        // Back where it started, with the original content.
+        ->and(File::get($this->siteRoot.'/index.php'))->toContain('live');
+});
+
+/*
+ * Every file restore moves the live site aside to `.rollback-{id}`. None is kept once the restore
+ * has worked, or repeated restores of a large site would fill the disk.
+ */
+describe('old copies of the site', function () {
+    /**
+     * fakeSafetyBackupTar(), plus an `rm` that really removes, so what is left
+     * on disk is what the code asked for.
+     */
+    function fakeRestoreThatRemoves(Collection $removed): void
+    {
+        Process::fake(function ($process) use ($removed) {
+            $command = $process->command;
+            $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+            $binary = $args[0] ?? '';
+
+            // The archive is the argument after the mode flag. Read here
+            // rather than through tarArchivePath(), which lives in another
+            // file and is not defined when this one runs alone.
+            foreach (['-czf', '-cf'] as $flag) {
+                $at = array_search($flag, $args, true);
+                if ($binary === 'tar' && $at !== false) {
+                    file_put_contents($args[$at + 1], str_repeat('s', 4096));
+                }
+            }
+
+            if ($binary === 'tar' && in_array('-xzf', $args, true)) {
+                $site = $args[4].'/'.basename(test()->siteRoot);
+                File::ensureDirectoryExists($site);
+                File::put($site.'/index.php', '<?php echo "restored";');
+            }
+
+            if ($binary === 'mv') {
+                @rename($args[1], $args[2]);
+            }
+
+            if ($binary === 'rm') {
+                $target = end($args);
+                $removed->push($target);
+                File::deleteDirectory($target);
+            }
+
+            return Process::result(exitCode: 0);
+        });
+    }
+
+    // scandir, not File::directories(): Finder skips dot-directories, and
+    // every copy is one.
+    function rollbackCopies(): array
+    {
+        return array_values(array_filter(
+            scandir(dirname(test()->siteRoot)),
+            fn (string $name) => str_starts_with($name, '.rollback-'),
+        ));
+    }
+
+    it('leaves no copy after several restores', function () {
+        fakeRestoreThatRemoves(collect());
+
+        $restores = [];
+        foreach (range(1, 3) as $_) {
+            $restores[] = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+        }
+
+        expect(collect($restores)->map(fn ($r) => $r->status->value)->unique()->values()->all())->toBe(['succeeded'])
+            ->and(rollbackCopies())->toBe([])
+            // No row points at a directory that is gone.
+            ->and(Restore::whereNotNull('rollback_path')->count())->toBe(0);
+    });
+
+    it('still clears a copy an earlier restore left, from before this rule', function () {
+        fakeRestoreThatRemoves(collect());
+        $earlier = restoreFor(storedBackup());
+        $earlierCopy = dirname($this->siteRoot).'/.rollback-'.$earlier->id;
+        File::ensureDirectoryExists($earlierCopy);
+        $earlier->update(['status' => RestoreStatus::Succeeded, 'rollback_path' => $earlierCopy]);
+
+        app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+        expect(rollbackCopies())->toBe([]);
+    });
+
+    it('keeps the copy and its path, and still succeeds, when it cannot be removed', function () {
+        fakeRestoreThatRemoves(collect());
+        $restore = restoreFor(storedBackup());
+        $copy = dirname($this->siteRoot).'/.rollback-'.$restore->id;
+        Process::fake(function ($process) use ($copy) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+            if (($args[0] ?? '') === 'rm' && end($args) === $copy) {
+                return Process::result(exitCode: 1, errorOutput: 'Operation not permitted');
+            }
+
+            foreach (['-czf', '-cf'] as $flag) {
+                $at = array_search($flag, $args, true);
+                if (($args[0] ?? '') === 'tar' && $at !== false) {
+                    file_put_contents($args[$at + 1], str_repeat('s', 4096));
+                }
+            }
+            if (($args[0] ?? '') === 'tar' && in_array('-xzf', $args, true)) {
+                $site = $args[4].'/'.basename(test()->siteRoot);
+                File::ensureDirectoryExists($site);
+                File::put($site.'/index.php', '<?php echo "restored";');
+            }
+            if (($args[0] ?? '') === 'mv') {
+                @rename($args[1], $args[2]);
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        $restore = app(RestoreRunner::class)->run($restore);
+
+        expect($restore->status)->toBe(RestoreStatus::Succeeded)
+            ->and($restore->rollback_path)->toBe($copy)
+            ->and(is_dir($copy))->toBeTrue();
+    });
+
+    it('never removes the copy a failed restore left behind', function () {
+        $removed = collect();
+        fakeRestoreThatRemoves($removed);
+
+        // A failed restore whose move back did not happen: its copy *is* the
+        // site, and must survive anything a later restore does.
+        $failed = restoreFor(storedBackup());
+        $failedCopy = dirname($this->siteRoot).'/.rollback-'.$failed->id;
+        File::ensureDirectoryExists($failedCopy);
+        $failed->update(['status' => RestoreStatus::Failed, 'rollback_path' => $failedCopy]);
+
+        app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+        expect(is_dir($failedCopy))->toBeTrue()
+            ->and($removed->all())->not->toContain($failedCopy)
+            ->and($failed->fresh()->rollback_path)->toBe($failedCopy);
+    });
+
+    it('removes nothing but the copy the panel itself made', function () {
+        $removed = collect();
+        fakeRestoreThatRemoves($removed);
+
+        // A row whose path is not `.rollback-{its own id}` beside the site —
+        // however it got there, it is not ours to delete.
+        $odd = restoreFor(storedBackup());
+        $elsewhere = $this->home.'/somewhere-else';
+        File::ensureDirectoryExists($elsewhere);
+        $odd->update(['status' => RestoreStatus::Succeeded, 'rollback_path' => $elsewhere]);
+
+        app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+        expect(is_dir($elsewhere))->toBeTrue()
+            ->and($removed->all())->not->toContain($elsewhere);
+    });
+});
+
+/*
+ * Safety backups are kept to the newest two. Older ones used to be deleted as rows only, leaving a
+ * full copy of the site in the bucket that nothing in the panel could see or remove.
+ */
+describe('old safety backups', function () {
+    it('removes the archive of a safety backup it prunes, not only the row', function () {
+        fakeSafetyBackupTar();
+
+        $safeties = [];
+        foreach (range(1, 3) as $_) {
+            $restore = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+            expect($restore->status)->toBe(RestoreStatus::Succeeded);
+
+            $safety = Backup::findOrFail($restore->safety_backup_id);
+            $safeties[] = ['id' => $safety->id, 'key' => $safety->manifest['key']];
+        }
+
+        [$oldest, $middle, $newest] = $safeties;
+
+        // Two kept, rows and archives both.
+        expect(Backup::where('is_safety', true)->pluck('id')->sort()->values()->all())->toBe([$middle['id'], $newest['id']])
+            ->and($this->fakeDisk->exists($middle['key']))->toBeTrue()
+            ->and($this->fakeDisk->exists($newest['key']))->toBeTrue();
+
+        // The pruned one is gone from the bucket too, which is the whole fix.
+        expect(Backup::find($oldest['id']))->toBeNull()
+            ->and($this->fakeDisk->exists($oldest['key']))->toBeFalse();
+    });
+
+    it('keeps the row of a safety backup whose archive will not delete, and still restores', function () {
+        fakeSafetyBackupTar();
+
+        foreach (range(1, 2) as $_) {
+            app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+        }
+
+        $this->mock(DeleteBackup::class)
+            ->shouldReceive('execute')
+            ->andThrow(new RuntimeException('the bucket is unreachable'));
+
+        $before = Backup::where('is_safety', true)->count();
+
+        $restore = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+        // Nothing was pruned, so nothing is orphaned: the row that could not be
+        // removed stays visible and is retried by the next restore.
+        expect($restore->status)->toBe(RestoreStatus::Succeeded)
+            ->and(Backup::where('is_safety', true)->count())->toBe($before + 1);
+    });
+
+    it('never prunes the safety backup it is restoring from (FS-C4)', function () {
+        fakeSafetyBackupTar();
+
+        $first = app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+        app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+        $oldest = Backup::findOrFail($first->safety_backup_id);
+
+        // Undo back to the oldest of the two. Its own safety backup makes
+        // three, and the oldest is the one the prune would have taken.
+        $undo = app(RestoreRunner::class)->run(restoreFor($oldest));
+
+        expect($undo->status)->toBe(RestoreStatus::Succeeded)
+            ->and(Backup::find($oldest->id))->not->toBeNull()
+            ->and($this->fakeDisk->exists($oldest->manifest['key']))->toBeTrue();
+    });
+});
+
+it('leaves no staging directory beside the site, whatever happened', function () {
+    fakeSafetyBackupTar();
+
+    app(RestoreRunner::class)->run(restoreFor(storedBackup()));
+
+    $leftovers = array_filter(
+        File::directories($this->home),
+        fn (string $path) => str_contains(basename($path), '.restore-'),
+    );
+
+    // A half-unpacked copy of a site sitting next to the live one is both
+    // confusing and expensive.
+    expect($leftovers)->toBe([]);
+});
+
+describe('restoring a database', function () {
+    /** A step wired to an engine that records what it was asked to do. */
+    function restoreDatabaseStep(array &$calls): RestoreDatabase
+    {
+        // Mocked rather than hand-written: the engine contract is large, and a stub of it would be a
+        // maintenance burden that proves nothing about this step.
+        $engine = Mockery::mock(DatabaseEngine::class);
+        $engine->shouldIgnoreMissing();
+
+        foreach (['dropDatabase' => 'drop', 'createDatabase' => 'create', 'restore' => 'restore'] as $method => $label) {
+            $engine->shouldReceive($method)->andReturnUsing(function (string $name) use (&$calls, $label) {
+                $calls[] = $label.':'.$name;
+            });
+        }
+
+        $engine->shouldReceive('reattachUsers')->andReturnUsing(function (string $name, array $users) use (&$calls) {
+            $calls[] = 'reattach:'.$name.':'.implode(',', $users);
+        });
+
+        $manager = Mockery::mock(DatabaseManager::class);
+        $manager->shouldReceive('engine')->andReturn($engine);
+        $manager->shouldReceive('driver')->andReturn('sql');
+
+        return new RestoreDatabase($manager);
+    }
+
+    function databaseRestoreContext(string $staging): RestoreContext
+    {
+        $backup = Backup::create([
+            'backup_target_id' => test()->backupTarget->id,
+            'application_id' => test()->application->id,
+            'type' => 'database', 'status' => 'verified', 'reference' => (string) Str::uuid(),
+        ]);
+
+        $restore = Restore::create([
+            'backup_id' => $backup->id,
+            'application_id' => test()->application->id,
+            'type' => 'database', 'status' => 'running', 'reference' => (string) Str::uuid(),
+        ]);
+
+        $context = new RestoreContext($restore, $backup, test()->application, $staging);
+        $context->stagingDirectory = $staging;
+
+        return $context;
+    }
+
+    it('does not drop a live database to import an empty dump', function () {
+        Database::create([
+            'application_id' => $this->application->id,
+            'name' => 'shop', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
+        ]);
+
+        $staging = $this->home.'/staging-empty';
+        File::ensureDirectoryExists($staging);
+        // A truncated archive produces exactly this.
+        File::put($staging.'/db-shop.sql', '');
+
+        $calls = [];
+
+        expect(fn () => restoreDatabaseStep($calls)->run(databaseRestoreContext($staging)))
+            ->toThrow(RuntimeException::class, 'the dump for shop is empty');
+
+        // The point of the guard: the live database is still there.
+        expect($calls)->toBe([]);
+    });
+
+    it('drops nothing when a later dump has no database left to restore into', function () {
+        Database::create([
+            'application_id' => $this->application->id,
+            'name' => 'kept', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
+        ]);
+
+        $staging = $this->home.'/staging-partial';
+        File::ensureDirectoryExists($staging);
+        File::put($staging.'/db-kept.sql', "INSERT INTO t VALUES (1);\n-- Dump completed on 2026-08-15  3:00:00\n");
+        // Detached since the backup was taken — and sorted after `kept`, so
+        // the old code reached it only once `kept` had been dropped.
+        File::put($staging.'/db-zzz-gone.sql', "INSERT INTO t VALUES (2);\n-- Dump completed on 2026-08-15  3:00:00\n");
+
+        $calls = [];
+
+        expect(fn () => restoreDatabaseStep($calls)->run(databaseRestoreContext($staging)))
+            ->toThrow(RuntimeException::class, 'zzz-gone is no longer attached');
+
+        expect($calls)->toBe([]);
+    });
+
+    it('does not drop a live database for a dump that was cut off', function () {
+        Database::create([
+            'application_id' => $this->application->id,
+            'name' => 'shop', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
+        ]);
+
+        $staging = $this->home.'/staging-truncated';
+        File::ensureDirectoryExists($staging);
+        // Plausible size, real SQL, no end: a download cut off part way, or an
+        // archive that unpacked incompletely. Size checks cannot see this.
+        File::put($staging.'/db-shop.sql', str_repeat("INSERT INTO t VALUES (1);\n", 400));
+
+        $calls = [];
+
+        expect(fn () => restoreDatabaseStep($calls)->run(databaseRestoreContext($staging)))
+            ->toThrow(RuntimeException::class, 'the dump for shop is incomplete');
+
+        expect($calls)->toBe([]);
+    });
+
+    it('restores every database once the whole plan checks out', function () {
+        Database::create([
+            'application_id' => $this->application->id,
+            'name' => 'shop', 'engine' => 'mysql', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci',
+        ]);
+
+        $staging = $this->home.'/staging-ok';
+        File::ensureDirectoryExists($staging);
+        File::put($staging.'/db-shop.sql', "INSERT INTO t VALUES (1);\n-- Dump completed on 2026-08-15  3:00:00\n");
+
+        $calls = [];
+        restoreDatabaseStep($calls)->run(databaseRestoreContext($staging));
+
+        expect($calls)->toBe(['drop:shop', 'create:shop', 'reattach:shop:', 'restore:shop']);
+    });
+
+    it('gives the recreated database back to its users before loading it', function () {
+        // PostgreSQL: the database came back owned by the panel, and every one of its users was
+        // refused at connect.
+        $database = Database::create([
+            'application_id' => $this->application->id,
+            'name' => 'shop', 'engine' => 'postgresql',
+        ]);
+        DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_one', 'password' => 'x', 'host' => 'localhost']);
+        DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_two', 'password' => 'x', 'host' => 'localhost']);
+
+        $staging = $this->home.'/staging-pg';
+        File::ensureDirectoryExists($staging);
+        // The mocked manager reports every engine as `sql`, so the dump needs
+        // the end marker that check looks for.
+        File::put($staging.'/db-shop.sql', "CREATE TABLE t (i int);\n-- Dump completed on 2026-10-04  3:00:00\n");
+
+        $calls = [];
+        restoreDatabaseStep($calls)->run(databaseRestoreContext($staging));
+
+        expect($calls)->toBe(['drop:shop', 'create:shop', 'reattach:shop:shop_one,shop_two', 'restore:shop']);
+    });
+});
+
+describe('the user may restore without a safety copy (2026-10-29)', function () {
+    it('skips the copy, still restores, and leaves no copy of the old site behind', function () {
+        fakeRestoreCommands();
+        $restore = restoreFor(storedBackup());
+        $restore->update(['safety_copy' => false]);
+        $before = Backup::where('is_safety', true)->count();
+
+        $restore = app(RestoreRunner::class)->run($restore);
+
+        expect($restore->status)->toBe(RestoreStatus::Succeeded)
+            ->and($restore->safety_backup_id)->toBeNull()
+            ->and(Backup::where('is_safety', true)->count())->toBe($before)
+            ->and(File::get($this->siteRoot.'/index.php'))->toContain('restored')
+            // The old site was moved aside while the restore ran, and is gone
+            // now that it worked: nothing stays that the user did not ask for.
+            ->and($restore->rollback_path)->toBeNull();
+    });
+
+    it('does not fail on a copy it was told not to take', function () {
+        // The same failure that stops a restore with a copy at its first
+        // step ("stops when the safety backup cannot be taken"): without the
+        // copy, that step is not what stops it.
+        Process::fake(function ($process) {
+            $command = $process->command;
+            $args = $command[0] === 'sudo' ? array_slice($command, 2) : $command;
+
+            if (($args[0] ?? '') === 'tar' && ($args[1] ?? '') === '-tzf') {
+                return Process::result(exitCode: 0);
+            }
+
+            return Process::result(errorOutput: 'no space left on device', exitCode: 2);
+        });
+        $restore = restoreFor(storedBackup());
+        $restore->update(['safety_copy' => false]);
+
+        expect(app(RestoreRunner::class)->run($restore)->reason)->not->toBe('safety_backup');
+    });
+});
+
+describe('a safety copy that does not fit on the disk (2026-10-29)', function () {
+    it('stops before anything is overwritten, and says it was the disk', function () {
+        fakeRestoreCommands();
+        $backup = storedBackup(bytes: 4096);
+        // The safety copy is estimated from this target's last backup, 4096
+        // bytes; 4095 of headroom cannot take it.
+        $folder = Mockery::mock(LocalBackupFolder::class, [app(ServerOps::class), app(HomeDirectoryAccess::class)])->makePartial();
+        $folder->shouldReceive('space')->andReturn(['free' => 1024 ** 3, 'total' => 100 * 1024 ** 3]);
+        app()->instance(LocalBackupFolder::class, $folder);
+        config(['server.backups.local.min_free_percent' => 0, 'server.backups.local.min_free_bytes' => 1024 ** 3 - 4095]);
+
+        $restore = app(RestoreRunner::class)->run(restoreFor($backup));
+
+        expect($restore->status)->toBe(RestoreStatus::Failed)
+            ->and($restore->reason)->toBe('not_enough_space')
+            ->and(RestoreResource::make($restore)->resolve()['reason_title'])->toBe(__('backup.restore_errors.not_enough_space'))
+            ->and(__('backup.restore_errors.not_enough_space'))->not->toBe('backup.restore_errors.not_enough_space')
+            ->and(File::get($this->siteRoot.'/index.php'))->toContain('live');
+    });
+});

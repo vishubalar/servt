@@ -1,0 +1,216 @@
+"use client";
+
+import { HeadIcon } from "@/components/ui/head-icon";
+import { useState } from "react";
+import Link from "@/components/ui/app-link";
+import { useTranslations } from "next-intl";
+import { ArrowDownToLine, ArrowUpFromLine, ExternalLink, FlaskConical, Trash2, TriangleAlert } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { CreateStagingDialog } from "@/components/applications/staging/create-staging-dialog";
+import { PushStagingDialog } from "@/components/applications/staging/push-staging-dialog";
+import { PullStagingDialog } from "@/components/applications/staging/pull-staging-dialog";
+import { DeleteApplicationDialog } from "@/components/applications/delete-application-dialog";
+import { ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { SafetyCopiesCard } from "@/components/applications/staging/safety-copies-card";
+import { StagingRunStatus } from "@/components/applications/staging/staging-run-status";
+import { stagingRunActive } from "@/lib/schemas/application-staging";
+
+export function StagingPanel({ appId, production, staging, latestRun = null, canManage, canDelete = false, canBackUp = false, safetyCopies = [] }) {
+  const t = useTranslations("applications.staging");
+  const [creating, setCreating] = useState(false);
+  const [pushing, setPushing] = useState(false);
+  const [pulling, setPulling] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const ready = staging?.status === "active";
+  const busyReason = stagingRunActive(latestRun) ? t("run.busy") : null;
+
+  const hasCopy = Boolean(staging);
+  const [seenCopy, setSeenCopy] = useState(hasCopy);
+  if (seenCopy !== hasCopy) {
+    setSeenCopy(hasCopy);
+    setCreating(false);
+    setRemoving(false);
+    setPushing(false);
+    setPulling(false);
+  }
+
+  if (production?.is_staging) {
+    return (
+      <div className="space-y-4">
+        <Card className="gap-0 overflow-hidden py-0">
+          <CardContent className="flex flex-wrap items-center gap-3 px-5 py-4">
+            <div className="min-w-60 flex-1 space-y-1">
+              <p className="font-semibold">{t("isCopy.title")}</p>
+              <p className="text-sm text-muted-foreground">{t("isCopy.body")}</p>
+            </div>
+            {production.production_application_id ? (
+              <Button asChild variant="outline">
+                <Link href={`/applications/${production.production_application_id}`}>
+                  {t("isCopy.action")}
+                </Link>
+              </Button>
+            ) : null}
+          </CardContent>
+        </Card>
+        {canManage && safetyCopies.length ? (
+          <SafetyCopiesCard appId={appId} copies={safetyCopies} ns="stagingSafetyCopies" />
+        ) : null}
+      </div>
+    );
+  }
+
+  if (!staging) {
+    return (
+      <div >
+        <Card className="gap-0 overflow-hidden py-0">
+          <CardContent className="flex flex-col items-center gap-3 px-6 py-10 text-center">
+            <span className="flex size-11 items-center justify-center rounded-lg bg-muted">
+              <FlaskConical className="size-5 text-muted-foreground" />
+            </span>
+            <div className="space-y-1.5">
+              <p className="font-medium">{t("empty.title")}</p>
+              <p className="mx-auto max-w-md text-sm text-muted-foreground">{t("empty.body")}</p>
+            </div>
+            {canManage ? (
+              <Button className="mt-1" onClick={() => setCreating(true)}>
+                {t("empty.action")}
+              </Button>
+            ) : null}
+          </CardContent>
+        </Card>
+
+        <CreateStagingDialog
+          key={String(creating)}
+          appId={appId}
+          production={production}
+          open={creating}
+          onOpenChange={setCreating}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <StagingRunStatus run={latestRun} production={production} staging={staging} />
+
+      <Card className="gap-0 overflow-hidden py-0">
+        <CardContent className="flex flex-wrap items-center gap-3 px-5 py-4">
+          <div className="min-w-60 flex-1 space-y-1">
+            <p className="flex flex-wrap items-center gap-2 font-semibold">
+              {staging.name}
+              <Badge variant={staging.status === "active" ? "success" : "muted"}>
+                {staging.status_title ?? staging.status}
+              </Badge>
+            </p>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground">
+              <a
+                href={staging.url ?? `https://${staging.domain}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 underline-offset-4 hover:text-foreground hover:underline"
+              >
+                {staging.domain}
+                <ExternalLink className="size-3.5" />
+              </a>
+              {staging.created_at_human ? (
+                <span>{t("copyAge", { age: staging.created_at_human })}</span>
+              ) : null}
+            </div>
+          </div>
+          <Button asChild variant="outline">
+            <Link href={`/applications/${staging.id}`}>{t("manageAction")}</Link>
+          </Button>
+        </CardContent>
+
+        {canManage ? (
+        <>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t bg-muted/20 px-5 py-4">
+          <div className="min-w-60 flex-1 space-y-1">
+            <h2 className="text-[15px] font-semibold tracking-tight">{t("pull.title")}</h2>
+            <p className="text-sm text-muted-foreground">{t("pull.body", { domain: production.domain })}</p>
+          </div>
+          {ready ? (
+            <ReasonTooltip reason={busyReason}>
+              <Button variant="outline" disabled={Boolean(busyReason)} onClick={() => setPulling(true)}>
+                <ArrowDownToLine className="size-4" />
+                {t("pull.action")}
+              </Button>
+            </ReasonTooltip>
+          ) : null}
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t bg-muted/20 px-5 py-4">
+          <div className="min-w-60 flex-1 space-y-1">
+            <h2 className="text-[15px] font-semibold tracking-tight">{t("push.title")}</h2>
+            <p className="text-sm text-muted-foreground">
+              {t("push.body", { domain: production.domain })}
+            </p>
+            {!ready ? (
+              <p className="flex items-start gap-2 pt-1 text-sm text-warning">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />
+                <span>{t("push.notReady")}</span>
+              </p>
+            ) : null}
+          </div>
+          {ready ? (
+            <ReasonTooltip reason={busyReason}>
+              <Button variant="destructive" disabled={Boolean(busyReason)} onClick={() => setPushing(true)}>
+                <ArrowUpFromLine className="size-4" />
+                {t("push.action")}
+              </Button>
+            </ReasonTooltip>
+          ) : null}
+        </div>
+        </>
+        ) : null}
+      </Card>
+
+      {canManage && safetyCopies.length ? <SafetyCopiesCard appId={appId} copies={safetyCopies} /> : null}
+
+      {canDelete ? (
+      <Card className="gap-0 overflow-hidden py-0">
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+          <div className="flex min-w-60 flex-1 items-start gap-3">
+            <HeadIcon icon={Trash2} tone="destructive" />
+            <div className="min-w-0 flex-1 space-y-1">
+              <h2 className="text-[15px] font-semibold tracking-tight">{t("remove.title")}</h2>
+              <p className="text-sm break-words text-muted-foreground">
+                {t("remove.body", { domain: staging.domain, production: production.domain })}
+              </p>
+            </div>
+          </div>
+          <Button variant="destructive" className="shrink-0" onClick={() => setRemoving(true)}>
+            <Trash2 className="size-4" />
+            {t("remove.action")}
+          </Button>
+        </CardContent>
+      </Card>
+      ) : null}
+
+      <DeleteApplicationDialog application={staging} open={removing} onOpenChange={setRemoving} closeWhenGone />
+
+      <PullStagingDialog
+        key={`pull-${pulling}`}
+        appId={appId}
+        production={production}
+        staging={staging}
+        open={pulling}
+        onOpenChange={setPulling}
+      />
+
+      {/* Remounted on open: the typed domain is the safeguard and must never be prefilled. */}
+      <PushStagingDialog
+        key={String(pushing)}
+        appId={appId}
+        production={production}
+        staging={staging}
+        open={pushing}
+        onOpenChange={setPushing}
+        canBackUp={canBackUp}
+      />
+    </div>
+  );
+}

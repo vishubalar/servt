@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'sync_failed' => 'Failed to apply the cron job on the server.',
+    // One sentence per privileged step. They all used to share
+    // `sync_failed`, so a full disk and a missing group read the same.
+    'step' => [
+        'log_dir' => 'The cron job log directory could not be created. Check there is free disk space and that /var/log is writable.',
+        'log_touch' => 'The cron job\'s log file could not be created in /var/log/cronjobs. Check there is free disk space and that the folder is writable.',
+        'log_chown' => 'The log file could not be handed to the account this job runs as. Check that account still exists.',
+        'log_chmod' => "The log file's permissions could not be set.",
+        'rotation' => 'The log rotation policy could not be installed, so the job was not scheduled — its output would grow without limit.',
+        'write' => 'The cron file could not be written. Check there is free disk space.',
+        'chmod' => "The cron file's permissions could not be set. Cron ignores a file it does not trust, so the job was not scheduled.",
+        'remove' => 'The cron file could not be removed, so the job is still scheduled on the server.',
+        'remove_stale' => 'The old cron file could not be removed after the rename. Nothing was changed, so the job is not scheduled twice.',
+        'detach_source' => 'The original cron file this job was imported from could not be removed. Nothing was changed, so the command does not run twice.',
+        'run_now' => 'The job could not be started. Check the server\'s system log for the reference below.',
+        'read_history' => 'The job\'s log could not be read, so its runs cannot be shown.',
+    ],
+    'invalid_expression' => 'The schedule is not a valid cron expression.',
+    'invalid_user' => 'The selected user does not exist on the server.',
+    'user_not_allowed' => 'Only the panel administrator can run a cron job as an account that is not one of the panel\'s System Users.',
+    'unresolved_placeholder' => 'The command still contains the {path} or {php} placeholder — replace it with the application directory and its PHP binary.',
+    'no_newline' => 'This value may not contain line breaks.',
+    'reserved_name' => 'This name is reserved and cannot be used.',
+    'shell_comment' => 'The command contains a shell comment (a # at the start of a word). Cron would cut the line there and the job would not run properly. Remove the comment, or put the # inside quotes.',
+    'run_paused' => 'This cron job is paused. Turn it on before running it.',
+    'run_already_running' => 'This cron job is already running from "Run now". Wait for that run to finish.',
+    'switch_not_this_site' => 'This cron job does not belong to this site.',
+    'switch_unknown_php' => 'Cron job :name does not name a PHP the panel can switch. Edit its command instead.',
+    'switch_too_long' => 'Cron job :name would be longer than 1000 characters with the new PHP path. Edit its command instead.',
+];

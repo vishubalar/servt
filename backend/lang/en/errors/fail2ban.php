@@ -1,0 +1,23 @@
+<?php
+
+return [
+    'not_installed' => 'fail2ban is not installed on this server.',
+    'already_installed' => 'fail2ban is already installed.',
+    'already_installing' => 'fail2ban is already being installed. Wait for that install to finish.',
+    'not_running' => 'fail2ban is installed but not running.',
+    'foreign_jail_local' => 'The panel did not write :path, so it will not overwrite it. Fail2ban is already configured there by hand or by another panel — move or remove that file if you want the panel to manage these settings.',
+    'jail_not_active' => 'The :jail jail is not active.',
+    'not_banned' => 'That IP address is not currently banned.',
+    'lockout_risk' => 'Enabling the SSH jail can lock you out of this server. Add your IP address to the ignore list, or confirm that you accept the risk.',
+    'ip_ignored' => 'That IP address is on your ignore list. Remove it there first if you really want to ban it.',
+    'ip_own_address' => 'That is this server\'s own address. Blocking it can cut the panel off from its database and leave it unreachable, so it cannot be banned.',
+    'ip_your_address' => 'That is the address you are connected from. Banning it would lock you out of this server, and on the recidive jail out of this panel too, so it cannot be banned from here.',
+    'operation_failed' => 'The fail2ban operation failed.',
+    'bantime_too_short' => 'Ban time must be at least 60 seconds, or -1 for a permanent ban.',
+    // FS-C45: the application's own ban list, ban and unban.
+    'app_jail_not_enabled' => 'Fail2ban is not running a jail for this application. Turn its fail2ban protection on first.',
+    // One ignore-list entry at a time (2026-10-16).
+    'ignore_ip_exists' => 'That address is already on the ignore list.',
+    'ignore_ip_missing' => 'That address is not on the ignore list. Reload the page to see the current list.',
+    'ignore_list_full' => 'The ignore list is full (100 entries). Remove one, or use a range that covers several.',
+];

@@ -1,0 +1,61 @@
+import { Check, CircleAlert, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+function Marker({ tone, children }) {
+  return (
+    <span
+      className={cn(
+        "flex size-5 shrink-0 items-center justify-center rounded-full border",
+        tone === "done" && "border-success bg-success/10 text-success",
+        tone === "working" && "border-primary bg-primary/10 text-[color-mix(in_oklch,var(--primary)_80%,var(--foreground))] dark:text-primary",
+        tone === "failed" && "border-destructive bg-destructive/10 text-destructive",
+      )}
+      aria-hidden
+    >
+      {children}
+    </span>
+  );
+}
+
+export function StepList({
+  steps = [],
+  working = false,
+  workingLabel,
+  failedStep = null,
+  label,
+  className,
+}) {
+  const done =
+    failedStep && steps[steps.length - 1] === failedStep ? steps.slice(0, -1) : steps;
+
+  return (
+    <ol className={cn("space-y-2.5", className)} aria-live="polite">
+      {done.map((step, index) => (
+        <li key={`${step}-${index}`} className="flex items-center gap-3 text-sm">
+          <Marker tone="done">
+            <Check className="size-3" />
+          </Marker>
+          <span className="text-muted-foreground">{label(step)}</span>
+        </li>
+      ))}
+
+      {working ? (
+        <li className="flex items-center gap-3 text-sm">
+          <Marker tone="working">
+            <Loader2 className="size-3 animate-spin" />
+          </Marker>
+          <span className="font-medium">{workingLabel}</span>
+        </li>
+      ) : null}
+
+      {failedStep ? (
+        <li className="flex items-center gap-3 text-sm">
+          <Marker tone="failed">
+            <CircleAlert className="size-3" />
+          </Marker>
+          <span className="font-medium text-destructive">{label(failedStep)}</span>
+        </li>
+      ) : null}
+    </ol>
+  );
+}

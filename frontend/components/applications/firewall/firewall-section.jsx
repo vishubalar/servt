@@ -1,0 +1,324 @@
+"use client";
+
+import { useState } from "react";
+import { useWatchUnsaved } from "@/components/ui/unsaved-guard";
+import { CardSaveFooter } from "@/components/ui/card-save-footer";
+import { useRefresh } from "@/hooks/use-refresh";
+import { toast } from "sonner";
+import { useTranslations } from "next-intl";
+import { DENIED, DisabledReasonProvider } from "@/components/ui/reason-tooltip";
+import { ChevronDown, Lightbulb, ShieldCheck, Sliders } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { Note } from "@/components/ui/note";
+import { updateApplicationWaf } from "@/lib/api/applications";
+import { apiMessage } from "@/lib/api/error-message";
+import { isReloadFailed } from "@/lib/applications/reload-pending";
+import { useReloadPending, useReloadPendingActions } from "@/components/applications/reload-pending-provider";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { Card, CardContent } from "@/components/ui/card";
+import { ChoiceField } from "@/components/ui/choice-field";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { RuleList } from "@/components/applications/firewall/rule-list";
+
+const DESCRIBED_CATEGORIES = new Set([
+  "query_string",
+  "request_uri",
+  "user_agent",
+  "referrer",
+  "cookie",
+  "method",
+]);
+
+const COLLAPSIBLE_ANIMATION =
+  "overflow-hidden data-[state=closed]:animate-collapsible-up data-[state=open]:animate-collapsible-down";
+
+function sameList(a, b) {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+export function FirewallSection({ appId, application, categories: catalog, modes, canManage, detectCount = 0, detectFailed = false }) {
+  const t = useTranslations("applications.firewall");
+  const tPending = useTranslations("applications.reloadPending");
+  const { refreshAndWait } = useRefresh();
+  const pending = useReloadPending(appId);
+  const { mark, stillPending } = useReloadPendingActions();
+
+  const server = {
+    enabled: application.waf_enabled ?? false,
+    mode: application.waf_mode ?? "detect",
+    categories: application.waf_categories ?? [],
+    exceptions: application.waf_exceptions ?? [],
+    blocks: application.waf_custom_rules ?? [],
+  };
+  const [justSaved, setJustSaved] = useState(null);
+  if (
+    justSaved &&
+    justSaved.enabled === server.enabled &&
+    justSaved.mode === server.mode &&
+    sameList(justSaved.categories, server.categories) &&
+    sameList(justSaved.exceptions, server.exceptions) &&
+    sameList(justSaved.blocks, server.blocks)
+  ) {
+    setJustSaved(null);
+  }
+  const saved = justSaved ?? server;
+
+  const [enabled, setEnabled] = useState(saved.enabled);
+  const [mode, setMode] = useState(saved.mode);
+  const [active, setActive] = useState(saved.categories);
+  const [exceptions, setExceptions] = useState(saved.exceptions);
+  const [blocks, setBlocks] = useState(saved.blocks);
+  const [saving, setSaving] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(
+    saved.exceptions.length > 0 || saved.blocks.length > 0,
+  );
+
+  const isDirty =
+    enabled !== saved.enabled ||
+    mode !== saved.mode ||
+    !sameList(active, saved.categories) ||
+    !sameList(exceptions, saved.exceptions) ||
+    !sameList(blocks, saved.blocks);
+
+  useWatchUnsaved("app-firewall", isDirty);
+
+  const saveReason = !canManage ? DENIED : !isDirty ? t("nothingToSave") : null;
+
+  const blocking = !pending && saved.enabled && saved.mode === "enforce";
+  const caution = pending || (saved.enabled && !blocking);
+  const statusVariant = blocking ? "success" : caution ? "warning" : "muted";
+  const statusLabel = pending
+    ? tPending("badge")
+    : blocking
+      ? t("statusBlocking")
+      : saved.enabled
+        ? t("statusWatching")
+        : t("statusOff");
+  const showDetectLog = !pending && saved.enabled && saved.mode === "detect";
+
+  function toggleCategory(value, checked) {
+    setActive((prev) => {
+      if (checked) return catalog.map((item) => item.value).filter((v) => prev.includes(v) || v === value);
+      return prev.filter((v) => v !== value);
+    });
+  }
+
+  async function save() {
+    setSaving(true);
+    // Never send []: the backend reads it as all six.
+    const categories = active.length > 0 ? active : catalog.map((item) => item.value);
+    const sent = { enabled, mode, categories, exceptions, blocks };
+    try {
+      await updateApplicationWaf(appId, { enabled, mode, categories, exceptions, custom_rules: blocks });
+      setJustSaved(sent);
+      setActive(categories);
+      await refreshAndWait();
+      if (stillPending(appId)) toast.warning(tPending("stillPendingToast"));
+      else toast.success(t("saved"));
+    } catch (error) {
+      if (isReloadFailed(error)) {
+        mark(appId, error);
+        setJustSaved(sent);
+        setActive(categories);
+        await refreshAndWait();
+        toast.warning(tPending("toast"));
+      } else toast.error(apiMessage(error, t("saveFailed")));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function discard() {
+    setEnabled(saved.enabled);
+    setMode(saved.mode);
+    setActive(saved.categories);
+    setExceptions(saved.exceptions);
+    setBlocks(saved.blocks);
+  }
+
+  const locked = !canManage || saving;
+
+  return (
+    <DisabledReasonProvider denied={!canManage}>
+      <div className="space-y-4">
+        <Card className="gap-0 overflow-hidden py-0">
+          <CardContent className="space-y-5 p-5">
+            <label
+              className={cn(
+                "flex flex-col gap-3 rounded-xl border p-4 transition-colors sm:flex-row sm:items-center sm:justify-between sm:gap-4",
+                blocking && "border-success/30 bg-success/5",
+                caution && "border-warning/30 bg-warning/5",
+                !blocking && !caution && "bg-muted/40",
+                locked ? "cursor-not-allowed" : "cursor-pointer",
+              )}
+            >
+              <div className={cn("flex min-w-0 flex-1 gap-3", pending || saved.enabled ? "items-start" : "items-center")}>
+                <span
+                  className={cn(
+                    "hidden size-9 shrink-0 items-center justify-center rounded-full sm:flex",
+                    (pending || saved.enabled) && "mt-0.5",
+                    blocking && "bg-success/15 text-success",
+                    caution && "bg-warning/15 text-warning",
+                    !blocking && !caution && "bg-muted-foreground/10 text-muted-foreground",
+                  )}
+                >
+                  <ShieldCheck className="size-4" />
+                </span>
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{t("enable")}</span>
+                    <Badge variant={statusVariant}>{statusLabel}</Badge>
+                  </div>
+                  {pending || saved.enabled ? (
+                    <p className="text-sm text-muted-foreground">
+                      {pending ? tPending("hint") : blocking ? t("blockingHint") : t("watchingHint")}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+              {canManage ? (
+                <div className="flex h-5 shrink-0 items-center">
+                  <Switch
+                    checked={enabled}
+                    onCheckedChange={setEnabled}
+                    disabled={locked}
+                    aria-label={t("enable")}
+                  />
+                </div>
+              ) : null}
+            </label>
+  
+            <Collapsible open={!enabled}>
+              <CollapsibleContent className={COLLAPSIBLE_ANIMATION}>
+                <Note icon={Lightbulb} title={t("whenToUseTitle")}>
+                  {t("whenToUseBody")}
+                </Note>
+              </CollapsibleContent>
+            </Collapsible>
+  
+            <Collapsible open={enabled}>
+              <CollapsibleContent className={cn("-mx-1 px-1", COLLAPSIBLE_ANIMATION)}>
+                <div className="space-y-5 border-t pt-5">
+                  <div className="space-y-2">
+                    <p className="text-sm font-medium">{t("modeLabel")}</p>
+                    <ChoiceField
+                      value={mode}
+                      onChange={setMode}
+                      disabled={locked}
+                      name="waf-mode"
+                      options={modes.map((option) => ({
+                        value: option.value,
+                        label: option.title,
+                        hint: option.value === "enforce" ? t("modeEnforceHint") : t("modeDetectHint"),
+                        tone: option.value === "enforce" ? "warning" : undefined,
+                      }))}
+                    />
+                    {showDetectLog ? (
+                      <p className="pt-1 text-xs text-muted-foreground">
+                        {detectFailed
+                          ? t("detectUnknown")
+                          : detectCount > 0
+                            ? t("detectCaught", { count: detectCount })
+                            : t("detectNothingYet")}
+                      </p>
+                    ) : null}
+                  </div>
+  
+                  <div className="space-y-2 border-t pt-5">
+                    <p className="text-sm font-medium">{t("categoriesLabel")}</p>
+                    <p className="text-xs text-muted-foreground">{t("categoriesHint")}</p>
+                    <div className="divide-y rounded-xl border">
+                      {catalog.map((category) => {
+                        const checked = active.includes(category.value);
+                        const lastOne = checked && active.length === 1;
+                        return (
+                          <label
+                            key={category.value}
+                            className={cn(
+                              "flex flex-col gap-1 p-3.5 transition-colors",
+                              locked || lastOne ? "cursor-not-allowed" : "cursor-pointer hover:bg-muted/40",
+                            )}
+                          >
+                            <div className="flex items-center justify-between gap-4">
+                              <span className="min-w-0 text-sm font-medium">{category.title}</span>
+                              <ReasonTooltip reason={lastOne ? t("lastCategory") : null}>
+                                <div className="flex h-5 shrink-0 items-center">
+                                  <Switch
+                                    checked={checked}
+                                    onCheckedChange={(value) => toggleCategory(category.value, value)}
+                                    disabled={locked || lastOne}
+                                    aria-label={category.title}
+                                  />
+                                </div>
+                              </ReasonTooltip>
+                            </div>
+                            {DESCRIBED_CATEGORIES.has(category.value) ? (
+                              <span className="block text-xs leading-relaxed text-muted-foreground">
+                                {t(`categoryHints.${category.value}`)}
+                              </span>
+                            ) : null}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+  
+                  <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen} className="border-t pt-5">
+                    <CollapsibleTrigger asChild>
+                      <Button type="button" variant="ghost" size="sm" className="-ml-2">
+                        <Sliders className="size-3.5" />
+                        {t("advanced")}
+                        <ChevronDown className={cn("size-3.5 transition-transform", advancedOpen && "rotate-180")} />
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className={cn("-mx-1 px-1", COLLAPSIBLE_ANIMATION)}>
+                      <div className="mt-3 space-y-5">
+                        <div className="space-y-2">
+                          <p className="text-sm font-medium">{t("exceptionsTitle")}</p>
+                          <p className="text-xs leading-relaxed text-muted-foreground">{t("exceptionsHint")}</p>
+                          <RuleList
+                            items={exceptions}
+                            onChange={setExceptions}
+                            disabled={locked}
+                            placeholder={t("exceptionsPlaceholder")}
+                            emptyText={t("exceptionsEmpty")}
+                            minLength={4}
+                          />
+                        </div>
+  
+                        <div className="space-y-2">
+                          <p className="text-sm font-medium">{t("blocksTitle")}</p>
+                          <p className="text-xs leading-relaxed text-muted-foreground">{t("blocksHint")}</p>
+                          <RuleList
+                            items={blocks}
+                            onChange={setBlocks}
+                            disabled={locked}
+                            placeholder={t("blocksPlaceholder")}
+                            emptyText={t("blocksEmpty")}
+                            warnShort
+                          />
+                        </div>
+                      </div>
+                    </CollapsibleContent>
+                  </Collapsible>
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
+          </CardContent>
+  
+          <CardSaveFooter
+            saving={saving}
+            dirty={isDirty}
+            saveReason={saveReason}
+            onSave={save}
+            onDiscard={discard}
+            savingNote={t("savingNote")}
+          />
+        </Card>
+      </div>
+    </DisabledReasonProvider>
+  );
+}

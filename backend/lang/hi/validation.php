@@ -1,0 +1,293 @@
+<?php
+
+return [
+
+    'accepted' => ':attribute को स्वीकार किया जाना चाहिए।',
+    'accepted_if' => 'जब :other, :value हो तो :attribute को स्वीकार किया जाना चाहिए।',
+    'active_url' => ':attribute एक मान्य URL होना चाहिए।',
+    'after' => ':attribute :date के बाद की तारीख होनी चाहिए।',
+    'after_or_equal' => ':attribute :date के बाद या उसके बराबर की तारीख होनी चाहिए।',
+    'alpha' => ':attribute में केवल अक्षर होने चाहिए।',
+    'alpha_dash' => ':attribute में केवल अक्षर, संख्याएँ, हाइफ़न और अंडरस्कोर होने चाहिए।',
+    'alpha_num' => ':attribute में केवल अक्षर और संख्याएँ होनी चाहिए।',
+    'array' => ':attribute एक सरणी होनी चाहिए।',
+    'ascii' => ':attribute में केवल सिंगल-बाइट अल्फ़ान्यूमेरिक अक्षर और चिह्न होने चाहिए।',
+    'before' => ':attribute :date से पहले की तारीख होनी चाहिए।',
+    'before_or_equal' => ':attribute :date से पहले या उसके बराबर की तारीख होनी चाहिए।',
+    'between' => [
+        'array' => ':attribute में :min और :max के बीच आइटम होने चाहिए।',
+        'file' => ':attribute का आकार :min और :max किलोबाइट के बीच होना चाहिए।',
+        'numeric' => ':attribute :min और :max के बीच होना चाहिए।',
+        'string' => ':attribute :min और :max वर्णों के बीच होना चाहिए।',
+    ],
+    'boolean' => ':attribute सही या गलत होना चाहिए।',
+    'can' => ':attribute में एक अनधिकृत मान है।',
+    'confirmed' => ':attribute की पुष्टि मेल नहीं खाती।',
+    'current_password' => 'पासवर्ड गलत है।',
+    'date' => ':attribute एक मान्य तारीख होनी चाहिए।',
+    'date_equals' => ':attribute :date के बराबर की तारीख होनी चाहिए।',
+    'date_format' => ':attribute :format प्रारूप से मेल खाना चाहिए।',
+    'decimal' => ':attribute में :decimal दशमलव स्थान होने चाहिए।',
+    'declined' => ':attribute को अस्वीकार किया जाना चाहिए।',
+    'declined_if' => 'जब :other, :value हो तो :attribute को अस्वीकार किया जाना चाहिए।',
+    'different' => ':attribute और :other अलग-अलग होने चाहिए।',
+    'digits' => ':attribute में :digits अंक होने चाहिए।',
+    'digits_between' => ':attribute में :min और :max के बीच अंक होने चाहिए।',
+    'dimensions' => ':attribute के चित्र के आयाम अमान्य हैं।',
+    'distinct' => ':attribute में एक डुप्लिकेट मान है।',
+    'doesnt_end_with' => ':attribute निम्न में से किसी के साथ समाप्त नहीं होना चाहिए: :values।',
+    'doesnt_start_with' => ':attribute निम्न में से किसी के साथ शुरू नहीं होना चाहिए: :values।',
+    'email' => ':attribute एक मान्य ईमेल पता होना चाहिए।',
+    'ends_with' => ':attribute निम्न में से किसी के साथ समाप्त होना चाहिए: :values।',
+    'enum' => 'चयनित :attribute अमान्य है।',
+    'exists' => 'चयनित :attribute अमान्य है।',
+    'extensions' => ':attribute में निम्न में से एक एक्सटेंशन होना चाहिए: :values।',
+    'file' => ':attribute एक फ़ाइल होनी चाहिए।',
+    'filled' => ':attribute में एक मान होना चाहिए।',
+    'gt' => [
+        'array' => ':attribute में :value से अधिक आइटम होने चाहिए।',
+        'file' => ':attribute का आकार :value किलोबाइट से अधिक होना चाहिए।',
+        'numeric' => ':attribute :value से अधिक होना चाहिए।',
+        'string' => ':attribute :value वर्णों से अधिक होना चाहिए।',
+    ],
+    'gte' => [
+        'array' => ':attribute में :value या अधिक आइटम होने चाहिए।',
+        'file' => ':attribute का आकार :value किलोबाइट या अधिक होना चाहिए।',
+        'numeric' => ':attribute :value से अधिक या उसके बराबर होना चाहिए।',
+        'string' => ':attribute :value वर्ण या अधिक होना चाहिए।',
+    ],
+    'hex_color' => ':attribute एक मान्य हेक्साडेसिमल रंग होना चाहिए।',
+    'image' => ':attribute एक चित्र होना चाहिए।',
+    'in' => 'चयनित :attribute अमान्य है।',
+    'in_array' => ':attribute :other में मौजूद होना चाहिए।',
+    'integer' => ':attribute एक पूर्णांक होना चाहिए।',
+    'ip' => ':attribute एक मान्य IP पता होना चाहिए।',
+    'ipv4' => ':attribute एक मान्य IPv4 पता होना चाहिए।',
+    'ipv6' => ':attribute एक मान्य IPv6 पता होना चाहिए।',
+    'json' => ':attribute एक मान्य JSON स्ट्रिंग होनी चाहिए।',
+    'lowercase' => ':attribute लोअरकेस में होना चाहिए।',
+    'lt' => [
+        'array' => ':attribute में :value से कम आइटम होने चाहिए।',
+        'file' => ':attribute का आकार :value किलोबाइट से कम होना चाहिए।',
+        'numeric' => ':attribute :value से कम होना चाहिए।',
+        'string' => ':attribute :value वर्णों से कम होना चाहिए।',
+    ],
+    'lte' => [
+        'array' => ':attribute में :value से अधिक आइटम नहीं होने चाहिए।',
+        'file' => ':attribute का आकार :value किलोबाइट या कम होना चाहिए।',
+        'numeric' => ':attribute :value से कम या उसके बराबर होना चाहिए।',
+        'string' => ':attribute :value वर्ण या कम होना चाहिए।',
+    ],
+    'mac_address' => ':attribute एक मान्य MAC पता होना चाहिए।',
+    'max' => [
+        'array' => ':attribute में :max से अधिक आइटम नहीं होने चाहिए।',
+        'file' => ':attribute का आकार :max किलोबाइट से अधिक नहीं होना चाहिए।',
+        'numeric' => ':attribute :max से अधिक नहीं होना चाहिए।',
+        'string' => ':attribute :max वर्णों से अधिक नहीं होना चाहिए।',
+    ],
+    'max_digits' => ':attribute में :max से अधिक अंक नहीं होने चाहिए।',
+    'mimes' => ':attribute इस प्रकार की फ़ाइल होनी चाहिए: :values।',
+    'mimetypes' => ':attribute इस प्रकार की फ़ाइल होनी चाहिए: :values।',
+    'min' => [
+        'array' => ':attribute में कम से कम :min आइटम होने चाहिए।',
+        'file' => ':attribute का आकार कम से कम :min किलोबाइट होना चाहिए।',
+        'numeric' => ':attribute कम से कम :min होना चाहिए।',
+        'string' => ':attribute कम से कम :min वर्णों का होना चाहिए।',
+    ],
+    'min_digits' => ':attribute में कम से कम :min अंक होने चाहिए।',
+    'missing' => ':attribute अनुपस्थित होना चाहिए।',
+    'missing_if' => 'जब :other, :value हो तो :attribute अनुपस्थित होना चाहिए।',
+    'missing_unless' => 'जब तक :other, :value न हो, :attribute अनुपस्थित होना चाहिए।',
+    'missing_with' => 'जब :values मौजूद हो तो :attribute अनुपस्थित होना चाहिए।',
+    'missing_with_all' => 'जब :values मौजूद हों तो :attribute अनुपस्थित होना चाहिए।',
+    'multiple_of' => ':attribute :value का गुणज होना चाहिए।',
+    'not_in' => 'चयनित :attribute अमान्य है।',
+    'not_regex' => ':attribute का प्रारूप अमान्य है।',
+    'numeric' => ':attribute एक संख्या होनी चाहिए।',
+    'password' => [
+        'letters' => ':attribute में कम से कम एक अक्षर होना चाहिए।',
+        'mixed' => ':attribute में कम से कम एक बड़ा और एक छोटा अक्षर होना चाहिए।',
+        'numbers' => ':attribute में कम से कम एक संख्या होनी चाहिए।',
+        'symbols' => ':attribute में कम से कम एक चिह्न होना चाहिए।',
+        'uncompromised' => 'दिया गया :attribute एक डेटा लीक में दिखाई दिया है। कृपया एक अलग :attribute चुनें।',
+    ],
+    'present' => ':attribute मौजूद होना चाहिए।',
+    'present_if' => 'जब :other, :value हो तो :attribute मौजूद होना चाहिए।',
+    'present_unless' => 'जब तक :other, :value न हो, :attribute मौजूद होना चाहिए।',
+    'present_with' => 'जब :values मौजूद हो तो :attribute मौजूद होना चाहिए।',
+    'present_with_all' => 'जब :values मौजूद हों तो :attribute मौजूद होना चाहिए।',
+    'prohibited' => ':attribute निषिद्ध है।',
+    'prohibited_if' => 'जब :other, :value हो तो :attribute निषिद्ध है।',
+    'prohibited_unless' => 'जब तक :other, :values में न हो, :attribute निषिद्ध है।',
+    'prohibits' => ':attribute :other की मौजूदगी को निषिद्ध करता है।',
+    'regex' => ':attribute का प्रारूप अमान्य है।',
+    'required' => ':attribute आवश्यक है।',
+    'required_array_keys' => ':attribute में :values के लिए प्रविष्टियाँ होनी चाहिए।',
+    'required_if' => 'जब :other, :value हो तो :attribute आवश्यक है।',
+    'required_if_accepted' => 'जब :other स्वीकार किया जाए तो :attribute आवश्यक है।',
+    'required_unless' => 'जब तक :other, :values में न हो, :attribute आवश्यक है।',
+    'required_with' => 'जब :values मौजूद हो तो :attribute आवश्यक है।',
+    'required_with_all' => 'जब :values मौजूद हों तो :attribute आवश्यक है।',
+    'required_without' => 'जब :values मौजूद न हो तो :attribute आवश्यक है।',
+    'required_without_all' => 'जब :values में से कोई भी मौजूद न हो तो :attribute आवश्यक है।',
+    'same' => ':attribute और :other मेल खाने चाहिए।',
+    'size' => [
+        'array' => ':attribute में :size आइटम होने चाहिए।',
+        'file' => ':attribute का आकार :size किलोबाइट होना चाहिए।',
+        'numeric' => ':attribute :size होना चाहिए।',
+        'string' => ':attribute :size वर्णों का होना चाहिए।',
+    ],
+    'starts_with' => ':attribute निम्न में से किसी के साथ शुरू होना चाहिए: :values।',
+    'string' => ':attribute एक स्ट्रिंग होनी चाहिए।',
+    'timezone' => ':attribute एक मान्य समय क्षेत्र होना चाहिए।',
+    'unique' => ':attribute पहले ही लिया जा चुका है। कृपया कोई दूसरा चुनें।',
+    'uploaded' => ':attribute अपलोड होने में विफल रहा।',
+    'uppercase' => ':attribute अपरकेस में होना चाहिए।',
+    'url' => ':attribute एक मान्य URL होना चाहिए।',
+    'ulid' => ':attribute एक मान्य ULID होना चाहिए।',
+    'uuid' => ':attribute एक मान्य UUID होना चाहिए।',
+
+    'any_of' => ':attribute अमान्य है।',
+    'base64' => ':attribute एक मान्य Base64 स्ट्रिंग होनी चाहिए।',
+    'contains' => ':attribute में एक आवश्यक मान गायब है।',
+    'doesnt_contain' => ':attribute में निम्न में से कोई भी मान नहीं होना चाहिए: :values।',
+    'encoding' => ':attribute :encoding में एन्कोड किया जाना चाहिए।',
+    'in_array_keys' => ':attribute में निम्न में से कम से कम एक कुंजी होनी चाहिए: :values।',
+    'list' => ':attribute एक सूची होनी चाहिए।',
+    'prohibited_if_accepted' => 'जब :other स्वीकार किया जाए तो :attribute निषिद्ध है।',
+    'prohibited_if_declined' => 'जब :other अस्वीकार किया जाए तो :attribute निषिद्ध है।',
+    'required_if_declined' => 'जब :other अस्वीकार किया जाए तो :attribute आवश्यक है।',
+
+    'custom' => [
+
+        // Docker accepts a CPU quota larger than the machine and silently
+        // clamps it, so the refusal has to come from here — and it names what
+        // the server actually has rather than saying "invalid".
+        'cpu_limit' => [
+            'format' => 'CPU की संख्या दें, अधिकतम दो दशमलव स्थान तक — 1, 1.5, 0.5।',
+            'positive' => 'Docker द्वारा स्वीकार की जाने वाली सबसे छोटी CPU सीमा :minimum है। कोई सीमा न रखने के लिए फ़ील्ड खाली छोड़ें।',
+            'too_many' => 'इस सर्वर में :cores CPU हैं, और इससे अधिक माँगने वाला कंटेनर Docker शुरू नहीं करेगा। :cores या उससे कम चुनें।',
+        ],
+
+        'memory_limit' => [
+            'format' => 'इकाई के साथ आकार दें — 512m या 2g। केवल संख्या का मतलब Docker के लिए बाइट्स है, मेगाबाइट नहीं।',
+            'too_small' => 'Docker 6m से कम मेमोरी वाला कंटेनर शुरू नहीं करेगा।',
+        ],
+
+        // A registry address Docker cannot interpret is silently IGNORED at
+        // pull time — the credential simply never applies and the error is
+        // identical to having none. So these are refusals at the form, and each
+        // one names the specific mistake rather than saying "invalid".
+        'registry' => [
+            'empty' => 'रजिस्ट्री का पता दर्ज करें — Docker Hub के लिए `docker.io`, या `ghcr.io`, या आपका स्वयं का होस्ट।',
+            'path' => 'यह नेमस्पेस या रिपॉज़िटरी जैसा लगता है, रजिस्ट्री जैसा नहीं। केवल होस्ट दर्ज करें — `ghcr.io`, `ghcr.io/your-org` नहीं।',
+            'credentials' => 'पते में उपयोगकर्ता नाम या पासवर्ड न डालें। केवल होस्ट दर्ज करें; क्रेडेंशियल नीचे के फ़ील्ड में जाते हैं।',
+            'host' => 'यह रजिस्ट्री का पता नहीं है। होस्टनेम दर्ज करें, चाहें तो पोर्ट के साथ — `registry.example.com` या `registry.example.com:5000`।',
+            'port' => 'पोर्ट 1 और 65535 के बीच होना चाहिए।',
+        ],
+        'attribute-name' => [
+            'rule-name' => 'custom-message',
+        ],
+
+        // Laravel's default reads "The docker network new field prohibits docker
+        // network from being present" — raw attribute names at a user.
+        'docker_network_new' => [
+            'prohibits' => 'सूची से कोई नेटवर्क चुनें या नए का नाम दें — दोनों नहीं। ये एक ही प्रश्न के दो उत्तर हैं।',
+        ],
+
+        'volume_path' => [
+            'required_with' => 'वह पथ दें जहाँ यह वॉल्यूम कंटेनर के अंदर दिखे, उदाहरण के लिए /var/lib/mysql।',
+        ],
+
+        'volume_new' => [
+            'required_with' => 'बनाने वाले वॉल्यूम का नाम दें, या यदि नहीं चाहिए तो पथ खाली कर दें।',
+        ],
+    ],
+
+    // i18n-v: the web firewall's own words for what it refuses.
+    'waf_exception_characters' => 'अपवाद किसी पाथ का हिस्सा होता है, जैसे /wp-json/। इसमें “..”, “?” या नई पंक्ति नहीं हो सकती।',
+    'waf_rule_characters' => 'कस्टम नियम एक ही पंक्ति में होना चाहिए, बिना कंट्रोल कैरेक्टर के।',
+
+    // FS-B6: an application admin password's policy, named.
+    'admin_password_strength' => 'पासवर्ड में एक छोटा अक्षर, एक बड़ा अक्षर, एक अंक और एक चिह्न होना चाहिए।',
+    'admin_password_strength_no_symbol' => 'पासवर्ड में एक छोटा अक्षर, एक बड़ा अक्षर और एक अंक होना चाहिए।',
+
+    'attributes' => [
+        'system_user.username' => 'उपयोगकर्ता नाम',
+        'system_user.password' => 'पासवर्ड',
+        'name' => 'नाम',
+        'username' => 'उपयोगकर्ता नाम',
+        'password' => 'पासवर्ड',
+        'current_password' => 'वर्तमान पासवर्ड',
+        'role' => 'भूमिका',
+        'label' => 'लेबल',
+        'exceptions.*' => 'अपवाद',
+        'custom_rules.*' => 'कस्टम नियम',
+        'create_user.username' => 'डेटाबेस उपयोगकर्ता नाम',
+        'create_user.password' => 'डेटाबेस उपयोगकर्ता पासवर्ड',
+        'create_user.host' => 'रिमोट पता',
+        'create_user.connection_preference' => 'कनेक्शन का प्रकार',
+    ],
+
+    'start_command_shell' => 'स्टार्ट कमांड में ":token" नहीं हो सकता — यह सीधे चलता है, शेल के माध्यम से नहीं।',
+    'start_command_wrapper' => 'ऐप को उसकी एंट्री फ़ाइल से शुरू करें, जैसे "node server.js", :binary से नहीं। पैकेज मैनेजर असली प्रक्रिया को फ़ोर्क करता है, इसलिए सिग्नल उस तक नहीं पहुँचते।',
+    'start_command_shell' => 'स्टार्ट कमांड में ":token" नहीं हो सकता — यह सीधे चलता है, शेल के माध्यम से नहीं।',
+    'process_instances_entrypoint' => 'एक से अधिक प्रोसेस चलाने के लिए स्टार्ट कमांड में किसी स्क्रिप्ट का नाम होना चाहिए — जैसे "node server.js"। PM2 उसी फ़ाइल को fork करके क्लस्टर बनाता है; कुछ और देने पर वह चुपचाप केवल एक ही प्रोसेस चलाता है।',
+    'start_command_wrapper' => 'ऐप को उसकी एंट्री फ़ाइल से शुरू करें, जैसे "node server.js", :binary से नहीं। पैकेज मैनेजर असली प्रक्रिया को फ़ोर्क करता है, इसलिए सिग्नल उस तक नहीं पहुँचते।',
+
+    'port_in_use_by_app' => 'पोर्ट :port इस सर्वर पर पहले से किसी अन्य एप्लिकेशन द्वारा उपयोग में है।',
+
+    // A network the panel created, named by a site that will join it.
+    'docker_network_invalid' => 'नेटवर्क का नाम अक्षर या अंक से शुरू करें, उसके बाद अक्षर, अंक, बिंदु, डैश या अंडरस्कोर का उपयोग करें।',
+    'docker_network_missing' => 'इस सर्वर पर \':name\' नाम का कोई Docker नेटवर्क नहीं है। यह पेज लोड होने के बाद इसे हटाया जा सकता है।',
+
+    // Mounting a panel-created volume into a container site.
+    'docker_volume_invalid' => 'वॉल्यूम का नाम अक्षर या अंक से शुरू करें, उसके बाद अक्षर, अंक, बिंदु, डैश या अंडरस्कोर का उपयोग करें।',
+    'docker_volume_missing' => 'इस सर्वर पर \':name\' नाम का कोई Docker वॉल्यूम नहीं है। यह पेज लोड होने के बाद इसे हटाया जा सकता है।',
+    'docker_mount_duplicate' => 'दो वॉल्यूम :path पर माउंट नहीं हो सकते। Docker केवल एक रखेगा, और यह नहीं बताएगा कि कौन सा।',
+    'docker_mount_root' => 'कंटेनर के अंदर का कोई पथ चुनें, उदाहरण के लिए /var/lib/mysql।',
+    'docker_mount_site_root' => 'उस पथ पर एप्लिकेशन की अपनी फ़ाइलें माउंट होती हैं (:path)। वहाँ वॉल्यूम लगाने से वे कंटेनर से छिप जाती हैं — फ़ाइलें सर्वर पर रहती हैं, पर एप्लिकेशन खाली वॉल्यूम दिखाती है।',
+    'docker_mount_reserved' => ':path उस इमेज का हिस्सा है जिससे कंटेनर बूट होता है। उसके ऊपर खाली वॉल्यूम लगाने से कंटेनर शुरू नहीं हो पाएगा।',
+    'docker_mount_characters' => 'केवल अक्षर, अंक, बिंदु, डैश, अंडरस्कोर और स्लैश का उपयोग करें, / से शुरू करते हुए, उदाहरण के लिए /var/lib/mysql।',
+
+    // A name the panel is about to create, so the inverse rule: not taken.
+    'docker_network_taken' => 'इस सर्वर पर \':name\' नाम का नेटवर्क पहले से मौजूद है। दूसरा बनाने के बजाय उसे ऊपर की सूची से चुनें।',
+    'docker_volume_taken' => 'इस सर्वर पर \':name\' नाम का वॉल्यूम पहले से मौजूद है। दूसरा बनाने के बजाय एप्लिकेशन के कंटेनर कार्ड से मौजूदा वॉल्यूम माउंट करें।',
+    'node_version_unsupported' => ':type एप्लिकेशन Node :range पर चलता है। इसी रेंज में कोई संस्करण चुनें — इसके बाहर एप्लिकेशन शुरू होने से इनकार कर देता है और एप्लिकेशन कुछ भी सर्व नहीं करती।',
+    'php_version_unsupported' => ':type एप्लिकेशन PHP :range पर चलता है। इसी रेंज में कोई संस्करण चुनें — इसके बाहर इंस्टॉल एप्लिकेशन के अपने कोड के भीतर बीच में ही विफल हो जाता है और साफ़ करने के लिए एक एप्लिकेशन छोड़ जाता है।',
+    'php_version_default_unsupported' => ':type एप्लिकेशन PHP :range पर चलता है। इस फ़ील्ड को खाली छोड़ने पर सर्वर का डिफ़ॉल्ट (:default) इस्तेमाल होता है, जो इस रेंज के बाहर है — इसके बजाय रेंज के भीतर कोई संस्करण चुनें।',
+    'web_root_fixed' => ':type :web_root से सर्व होता है और उसी पथ के चारों ओर स्थापित होता है, इसलिए यहाँ वेब रूट नहीं बदला जा सकता। कोई अन्य मान एप्लिकेशन को अनुपलब्ध कर देता है और उसका स्रोत सार्वजनिक कर देता है।',
+    'web_root_missing' => 'फ़ोल्डर :path मौजूद नहीं है, इसलिए एप्लिकेशन के पास दिखाने को कुछ नहीं होगा। पहले इसे बनाएँ या अपनी फ़ाइलें वहाँ अपलोड करें, फिर इसे वेब रूट के रूप में सेट करें।',
+    'web_root_symlink' => 'उस पथ का एक हिस्सा, :path, एक सिम्बॉलिक लिंक है, इसलिए एप्लिकेशन कहीं और की फ़ाइलें दिखा सकती है। एप्लिकेशन के अंदर का असली फ़ोल्डर इस्तेमाल करें।',
+    'port_in_use' => 'इस सर्वर पर कुछ पहले से पोर्ट :port सुन रहा है। दूसरा चुनें, या जो उसे उपयोग कर रहा है उसे रोकें।',
+
+    'port_registered' => 'पोर्ट :port आमतौर पर :service द्वारा उपयोग होता है। यदि इस सर्वर पर कुछ भी इसका उपयोग नहीं कर रहा, तो आप इसे उपयोग कर सकते हैं।',
+    'application_name_immutable' => 'एप्लिकेशन का नाम बनने के बाद तय हो जाता है — सर्वर पर उसकी कॉन्फ़िगरेशन फ़ाइलें इसी नाम से बनती हैं। दूसरा नाम चाहिए तो नई एप्लिकेशन बनाएँ।',
+    'application_domain_use_endpoint' => 'डोमेन Domains पेज (/applications/{id}/domains) पर बदलें, जो वेब सर्वर कॉन्फ़िगरेशन और सर्टिफ़िकेट भी अपडेट करता है।',
+    'site_name_taken_pool' => 'इस सर्वर पर पहले से «:name.conf» नाम की एक PHP पूल फ़ाइल है जो पैनल ने नहीं बनाई। कोई दूसरा नाम चुनें।',
+    'site_name_taken_vhost' => 'इस सर्वर पर पहले से «:name» नाम का एक वेब सर्वर कॉन्फ़िगरेशन है जो पैनल ने नहीं बनाया — पैनल का अपना भी उनमें से एक है। कोई दूसरा नाम चुनें।',
+    'site_name_taken_vhost_order' => 'इस सर्वर पर «:name» नाम की साइट Apache की डिफ़ॉल्ट साइट से पहले आ जाएगी और हर अनजान डोमेन का जवाब देगी। ऐसा नाम चुनें जो किसी अक्षर से या 0 के अलावा किसी अंक से शुरू हो।',
+
+    'webhook_secret_min' => 'webhook सीक्रेट में कम से कम 16 अक्षर होने चाहिए।',
+
+    // Per-app fail2ban thresholds
+    'fail2ban.validation.maxretry_min' => 'कम से कम 1 विफल प्रयास के बाद प्रतिबंध लगाना चाहिए।',
+    'fail2ban.validation.maxretry_max' => '100 से अधिक विफल प्रयासों के बाद प्रतिबंध नहीं लगाया जा सकता।',
+    'fail2ban.validation.findtime_min' => 'गणना अवधि कम से कम 60 सेकंड होनी चाहिए।',
+    'fail2ban.validation.findtime_max' => 'गणना अवधि 24 घंटे (86400 सेकंड) से अधिक नहीं हो सकती।',
+    'fail2ban.validation.bantime_min' => 'प्रतिबंध समय कम से कम 0 सेकंड होना चाहिए (स्थायी प्रतिबंध की अनुमति है)।',
+    'fail2ban.validation.bantime_max' => 'प्रतिबंध समय 7 दिन (604800 सेकंड) से अधिक नहीं हो सकता।',
+    'ip_or_cidr' => 'एक मान्य IP पता (जैसे 1.2.3.4) या CIDR नोटेशन (जैसे 10.0.0.0/8) होना चाहिए।',
+
+    'jail_content_required' => 'jail कॉन्फ़िगरेशन आवश्यक है।',
+    'jail_content_string' => 'jail कॉन्फ़िगरेशन टेक्स्ट होना चाहिए।',
+    'jail_content_max' => 'jail कॉन्फ़िगरेशन बहुत बड़ा है (अधिकतम 65535 अक्षर)।',
+    'filter_content_required' => 'फ़िल्टर कॉन्फ़िगरेशन आवश्यक है।',
+    'filter_content_string' => 'फ़िल्टर कॉन्फ़िगरेशन टेक्स्ट होना चाहिए।',
+    'filter_content_max' => 'फ़िल्टर कॉन्फ़िगरेशन बहुत बड़ा है (अधिकतम 65535 अक्षर)।',
+    'basic_auth_conflicts' => ':type के साथ पासवर्ड सुरक्षा का उपयोग नहीं किया जा सकता। इसका अपना इंटरफ़ेस Authorization हेडर से साइन इन करता है, जिसे HTTP प्रति अनुरोध केवल एक बार अनुमति देता है — Basic Auth उसे ले लेगा और एप्लिकेशन तक पहुँच नहीं रहेगी। :type पहले से ही अपने क्रेडेंशियल्स माँगता है।',
+    'basic_auth_username' => 'उपयोगकर्ता नाम में केवल अंग्रेज़ी अक्षर, अंक और चिह्न हो सकते हैं, बिना स्पेस और कोलन (:) के। ब्राउज़र अन्य अक्षर भरोसेमंद ढंग से नहीं भेज सकते।',
+    'git_repository_unreachable' => 'रिपॉज़िटरी तक नहीं पहुँचा जा सका। पता जाँचें, और यह कि अकाउंट (या सार्वजनिक होने पर रिपॉज़िटरी) एक्सेस की अनुमति देता है।',
+    'git_host_unreachable' => 'सर्वर git होस्ट तक नहीं पहुँच सका। उसका नेटवर्क कनेक्शन जाँचें और फिर से कोशिश करें।',
+    'git_branch_missing' => 'इस रिपॉज़िटरी में ":branch" ब्रांच मौजूद नहीं है।',
+];

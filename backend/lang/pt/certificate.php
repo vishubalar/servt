@@ -1,0 +1,42 @@
+<?php
+
+return [
+
+    // Where a certificate came from. Shown as a badge, so these read as nouns.
+    'type' => [
+        'letsencrypt' => 'Let\'s Encrypt',
+        'custom' => 'Enviado',
+        'self_signed' => 'Autoassinado',
+    ],
+
+    // Issuance failures, keyed by the code the panel classifies certbot's
+    // output into. Each says what to do about it, because 'it failed' is the
+    // least useful sentence a panel can produce about a certificate.
+    'failed' => [
+        'rate_limited' => 'O Let\'s Encrypt emitiu certificados demais para este domínio recentemente. O limite é reposto uma semana após o mais antigo — tente então, ou envie um certificado.',
+        'rate_limited_failures' => 'Tentativas falhadas demais para este domínio na última hora. O Let\'s Encrypt permite cinco; aguarde uma hora.',
+        'unreachable' => 'O pedido de validação nunca chegou a este servidor. Verifique se a porta 80 está aberta e se nada mais responde nela.',
+        'dns_not_pointing' => 'O domínio não aponta para este servidor. Configure o registo DNS aqui, aguarde a propagação e tente de novo.',
+        'challenge_not_served' => 'O ficheiro de validação não foi servido corretamente. A aplicação pode estar a redirecionar /.well-known, ou um proxy como a Cloudflare responde em vez deste servidor.',
+        'certbot_missing' => 'O certbot não está instalado neste servidor.',
+        'no_certifiable_domains' => 'Nenhum domínio desta aplicação está pronto para um certificado. Verifique primeiro o DNS.',
+        'self_sign_failed' => 'Não foi possível gerar o certificado autoassinado.',
+        'file_taken' => 'O nome de arquivo do certificado desta aplicação já é usado por outro arquivo neste servidor, então nada foi sobrescrito.',
+        'file_missing' => 'O ficheiro do certificado não existe neste servidor. Emita-o de novo.',
+        'dry_run_skipped' => 'O certbot decidiu que o certificado existente não precisava de renovação, pelo que nada foi validado. Esta execução não prova nada — é um erro, não um veredicto sobre o seu domínio.',
+        'unknown' => 'Não foi possível emitir o certificado.',
+    ],
+
+    // Why a certificate type is not on offer for this site. Each names the
+    // thing the user would have to change, or says plainly that nothing can
+    // be changed and points at the option that does work.
+    'unavailable' => [
+        'dns_unverified' => 'Nenhum domínio desta aplicação aponta ainda para este servidor. Adicione um registo DNS A, aguarde a propagação e tente novamente.',
+        'self_signed_warning' => 'Cifra o tráfego de imediato e funciona em qualquer domínio, incluindo de teste e internos. Os navegadores mostrarão um aviso, porque nada fora deste servidor o garante.',
+    ],
+
+    // A custom certificate goes to /etc/ssl/certs/{app}.crt (v7's layout);
+    // refused when that file is already something else's.
+    'file_taken' => 'O certificado seria salvo como :path, mas esse arquivo já existe neste servidor e não é o certificado desta aplicação, então nada foi sobrescrito.',
+
+];

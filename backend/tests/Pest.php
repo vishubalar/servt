@@ -1,0 +1,402 @@
+<?php
+
+use App\Models\DatabaseConnection;
+use App\Models\Permission;
+use App\Models\Role;
+use App\Models\User;
+use Illuminate\Contracts\Process\ProcessResult;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\FakeProcessResult;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Str;
+use Tests\TestCase;
+
+/*
+|--------------------------------------------------------------------------
+| Test Case
+|--------------------------------------------------------------------------
+|
+| The closure you provide to your test functions is always bound to a specific PHPUnit test
+| case class. By default, that class is "PHPUnit\Framework\TestCase". Of course, you may
+| need to change it using the "pest()" function to bind different classes or traits.
+|
+*/
+
+pest()->extend(TestCase::class)
+    ->use(RefreshDatabase::class)
+    ->in('Feature');
+
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Build a valid POST /admin/users payload for the RBAC model
+ * (is_admin + role_ids). Ensures a role exists to satisfy the
+ * "every user >= 1 role" rule.
+ *
+ * @param  array<string, mixed>  $overrides
+ * @return array<string, mixed>
+ */
+function userPayload(array $overrides = []): array
+{
+    $role = Role::firstOrCreate(['slug' => 'test-staff'], ['name' => 'Test Staff']);
+
+    return array_merge([
+        'name' => 'New User',
+        'username' => 'newuser',
+        'password' => 'Password123',
+        'password_confirmation' => 'Password123',
+        'is_admin' => false,
+        'role_ids' => [$role->id],
+    ], $overrides);
+}
+
+/**
+ * A database client's answer to a query a fake would otherwise leave silent.
+ *
+ * `null` for anything that is not a database client, so a fake falls through to its own
+ * handling. A bare `Process::result(exitCode: 0)` answers the "is this generated name free"
+ * probe with an empty string, which reads as "taken": the allocator walks twenty candidates
+ * and fails the install.
+ */
+function fakeDatabaseAnswer(mixed $process): ?FakeProcessResult
+{
+    if (! in_array($process->command[0] ?? '', ['mysql', 'mariadb'], true)) {
+        return null;
+    }
+
+    return fakeEngineVersionAnswer($process) ?? Process::result(output: '1');
+}
+
+/**
+ * A version query's answer, for the fakes that otherwise reply `1` to everything.
+ *
+ * 🔴 `1` is not a version: applications with a minimum engine version would read as unusable.
+ * SQL reaches these clients on **stdin**, not argv, so this reads `input` rather than the command.
+ */
+function fakeEngineVersionAnswer(mixed $process): ?FakeProcessResult
+{
+    $sql = (string) $process->input;
+
+    if (str_contains($sql, 'server_version')) {
+        // The shape Ubuntu's build reports, parenthetical and all, so the
+        // parsing is exercised rather than assumed.
+        return Process::result(output: '16.4 (Ubuntu 16.4-0ubuntu0.24.04.2)');
+    }
+
+    if (! str_contains($sql, 'VERSION()')) {
+        return null;
+    }
+
+    // Per client, because the two number their releases apart: `8.0.36` from MariaDB would be a
+    // MariaDB 8, below every MariaDB floor. MySQL answers 8.4 (Ubuntu 26.04's) because Moodle 5.0
+    // and Mautic need it; a test about 24.04's 8.0 says so explicitly.
+    return Process::result(output: ($process->command[0] ?? '') === 'mariadb'
+        ? '10.11.14-MariaDB-0ubuntu0.24.04.1'
+        : '8.4.6-0ubuntu0.26.04.1');
+}
+
+/**
+ * An apt-get command as ServerOps::apt() runs it: with apt's own lock wait switched off, so a
+ * held lock fails and is retried on the panel's budget instead of hanging until the timeout.
+ *
+ * @return list<string>
+ */
+function aptCommand(string ...$args): array
+{
+    return ['apt-get', ...$args, '-o', 'DPkg::Lock::Timeout=0'];
+}
+
+/**
+ * Move the panel's connection for an engine onto a port the application does not assume, as
+ * `PUT /databases/connections/{engine}` does when someone points the panel at a managed database.
+ *
+ * Tests that do not call this describe a stock local server on the default port.
+ */
+function moveDatabasePort(string $engine, int $port): void
+{
+    DatabaseConnection::updateOrCreate(
+        ['engine' => $engine],
+        ['connection_type' => 'tcp', 'host' => '127.0.0.1', 'port' => $port, 'username' => 'root'],
+    );
+}
+
+/**
+ * A database client's answer on a server whose only SQL engine is PostgreSQL.
+ *
+ * MySQL and MariaDB are made to *fail* rather than fall through, so an installer that ignored
+ * the chosen engine cannot be handed a MySQL database unnoticed.
+ *
+ * `psql` answers `1` because `available()` wants a successful query and `identifierAvailable()`
+ * treats any output but `1` as "name taken" (twenty times, then the install fails).
+ */
+function fakePostgresOnlyAnswer(mixed $process): ?FakeProcessResult
+{
+    $binary = $process->command[0] ?? '';
+
+    if ($binary === 'psql') {
+        return fakeEngineVersionAnswer($process) ?? Process::result(output: '1');
+    }
+
+    return in_array($binary, ['mysql', 'mariadb'], true)
+        ? Process::result(exitCode: 1)
+        : null;
+}
+
+/**
+ * Answer as a server whose SQL engine is reachable.
+ *
+ * The catalog asks `available()` (a live query) before offering any type that needs a database,
+ * so a fixture that fakes nothing describes a server with no engine, where creating WordPress
+ * is correctly refused.
+ *
+ * Everything else *fails*: falling through to an empty success turns "this command could not be
+ * run" into "it ran and printed nothing", and a config reader then sees an empty file instead of
+ * an absent one, far from the fake that caused it.
+ */
+function fakeUsableSqlEngine(): void
+{
+    Process::fake(fn (mixed $process) => fakeDatabaseAnswer($process) ?? fakeGitRemoteAnswer($process) ?? Process::result(exitCode: 1));
+}
+
+/**
+ * Answer `git ls-remote --heads <url> refs/heads/<branch>` as a reachable repository that has
+ * the branch.
+ *
+ * Creating a git site and changing its branch ask the repository first; an empty success means
+ * a repository WITHOUT the branch.
+ */
+function fakeGitRemoteAnswer(mixed $process): ?FakeProcessResult
+{
+    $command = (array) $process->command;
+
+    if (! in_array('ls-remote', $command, true)) {
+        return null;
+    }
+
+    return Process::result(output: "0123456789abcdef0123456789abcdef01234567\t".end($command)."\n");
+}
+
+/**
+ * Answer the PHP package index as a server offering 8.2 – 8.4.
+ *
+ * `POST /php/versions` refuses a version the index does not have, so a test that installs one
+ * must say what the index holds. Everything else fails, as {@see fakeUsableSqlEngine()} explains.
+ */
+function fakePhpPackageIndex(): void
+{
+    Process::fake(fn (mixed $process) => ($process->command[0] ?? '') === 'apt-cache'
+        ? Process::result(output: "php8.2-fpm - server-side scripting\nphp8.3-fpm - server-side scripting\nphp8.4-fpm - server-side scripting\n")
+        : Process::result(exitCode: 1));
+}
+
+/**
+ * Grant a permission to a user via a one-off role (permissions are role-based
+ * only — there are no direct per-user grants). Creates a role holding the
+ * given permission with the requested abilities and assigns it to the user.
+ */
+function grantPermission(User $user, string $permissionName, bool $view = true, bool $manage = false): void
+{
+    $permission = Permission::firstWhere('name', $permissionName);
+    $suffix = $permissionName.'-'.($manage ? 'm' : 'v').'-'.$user->id;
+
+    $role = Role::create([
+        'name' => 'Grant '.$suffix,
+        'slug' => Str::slug('grant-'.$suffix),
+    ]);
+    $role->permissions()->attach($permission->id, ['view' => $view || $manage, 'manage' => $manage]);
+
+    $user->roles()->syncWithoutDetaching([$role->id]);
+}
+
+/**
+ * `install.sh`, for the tests that assert on it as source text.
+ *
+ * Shared: a second file redeclaring it was a fatal error that took the whole suite down.
+ * Skips rather than fails when the file is absent: the backend is also checked out on its own.
+ */
+function installerSource(): string
+{
+    $path = base_path('../install.sh');
+
+    if (! is_file($path)) {
+        test()->markTestSkipped('install.sh is not in this checkout');
+    }
+
+    return (string) file_get_contents($path);
+}
+
+/** One function out of install.sh, as source. */
+function installerFn(string $name): string
+{
+    preg_match('/^'.preg_quote($name, '/').'\(\) \{\n.*?^\}\n/ms', installerSource(), $m);
+
+    expect($m)->not->toBeEmpty("install.sh has no {$name}()");
+
+    return $m[0];
+}
+
+/**
+ * Functions out of install.sh, to run for real under `bash -c`.
+ *
+ * Shared with installerFn for the reason installerSource is: the Central
+ * install tests and the Redis tests both run the installer's own functions.
+ */
+function installerFunctions(string ...$names): string
+{
+    return implode("\n", array_map(fn (string $name) => installerFn($name), $names));
+}
+
+/** install.sh without its whole-line comments — what it runs, not what it says. */
+function installerCode(): string
+{
+    return implode("\n", array_filter(
+        preg_split('/\R/', installerSource()) ?: [],
+        fn (string $line): bool => ! str_starts_with(ltrim($line), '#'),
+    ));
+}
+
+/**
+ * What `systemctl show` replies for the units named in $command.
+ *
+ * One blank-line separated block per unit asked about, in the order asked, as systemd does,
+ * including a block for units that do not exist. The panel inspects its whole service catalog
+ * in one call, so a one-block fake would hand every later unit someone else's state.
+ *
+ * Shared because three test files had each hand-rolled a single-block version.
+ *
+ * @param  array<int, string>  $command  the faked process command
+ * @param  array<string, array{load?: string, active?: string, file?: string, id?: string, reload?: bool}>  $units
+ * @param  array<string, mixed>|null  $default  state for units not in $units; null means not-found
+ */
+function systemctlShowOutput(array $command, array $units = [], ?array $default = null): string
+{
+    $asked = array_values(array_filter(
+        array_slice($command, 2),
+        fn (string $arg): bool => ! str_starts_with($arg, '--'),
+    ));
+
+    $blocks = array_map(function (string $unit) use ($units, $default): string {
+        $s = $units[$unit] ?? $default ?? ['load' => 'not-found', 'active' => 'inactive', 'file' => 'disabled'];
+
+        return implode("\n", [
+            'Id='.($s['id'] ?? "{$unit}.service"),
+            'LoadState='.($s['load'] ?? 'not-found'),
+            'ActiveState='.($s['active'] ?? 'inactive'),
+            'UnitFileState='.($s['file'] ?? 'disabled'),
+            'CanReload='.(($s['reload'] ?? false) ? 'yes' : 'no'),
+        ])."\n";
+    }, $asked);
+
+    return implode("\n", $blocks);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Expectations
+|--------------------------------------------------------------------------
+|
+| When you're writing tests, you often need to check that values meet certain conditions. The
+| "expect()" function gives you access to a set of "expectations" methods that you can use
+| to assert different things. Of course, you may extend the Expectation API at any time.
+|
+*/
+
+/**
+ * Answer a disk-cleaner `find <dir> -maxdepth 1 -type f -name <pattern>
+ * -printf "%s\t%T@\t%p\n"` from the real filesystem, the way the command would.
+ *
+ * The log cleaners list files through the server, not PHP's glob() (the directories are
+ * root-only), so a test with real temp files needs its Process fake to list them. Null for any
+ * other command, so a fake can fall through to its own answers.
+ */
+function answerFind($process): ?ProcessResult
+{
+    $cmd = (array) $process->command;
+
+    if (($cmd[0] ?? null) === 'sudo' && ($cmd[1] ?? null) === '-n') {
+        $cmd = array_slice($cmd, 2);
+    }
+
+    // Only the log cleaners' listing — the journal target runs its own
+    // recursive find, which its tests fake themselves.
+    if (($cmd[0] ?? null) !== 'find' || ! in_array("%s\t%T@\t%p\n", $cmd, true)) {
+        return null;
+    }
+
+    $directory = $cmd[1];
+    $pattern = $cmd[array_search('-name', $cmd, true) + 1];
+
+    if (! is_dir($directory)) {
+        return Process::result(errorOutput: "find: '{$directory}': No such file or directory", exitCode: 1);
+    }
+
+    $lines = [];
+
+    foreach (glob(rtrim($directory, '/').'/'.$pattern) ?: [] as $path) {
+        if (is_file($path) && ! is_link($path)) {
+            $lines[] = filesize($path)."\t".filemtime($path)."\t".$path;
+        }
+    }
+
+    return Process::result(output: implode("\n", $lines).($lines ? "\n" : ''));
+}
+
+/**
+ * The archive path in a tar argv, found by name rather than position.
+ *
+ * `$command[2]` only held the path while the command was exactly `tar -czf <path>`; with
+ * `tar --use-compress-program='pigz -1' -cf <path>` a position-2 fixture wrote a file literally
+ * named `-cf`. Shared by BackupRunTest and RestoreRunTest.
+ */
+function tarArchivePath(array $command): ?string
+{
+    foreach ($command as $argument) {
+        if (is_string($argument) && str_ends_with($argument, '.tar.gz')) {
+            return $argument;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * `test -e` on a custom-certificate path. A blanket fake answers 0 by
+ * default, which to the guard means "something is already there" — so the
+ * probe answers "nothing there" unless a test says otherwise.
+ */
+function certPathProbe($process): bool
+{
+    $command = (array) $process->command;
+
+    return ($command[0] ?? null) === 'test' && in_array('-e', $command, true)
+        && str_starts_with((string) ($command[2] ?? ''), '/etc/ssl/');
+}
+
+/**
+ * One worker, `high` before `default`: a certificate must not wait behind queued installs. The
+ * danger is the opposite mistake, a job on a queue no worker reads never runs, so a job goes to
+ * `high` only when the running worker is seen to read it.
+ *
+ * Here because AutoIssueCertificateTest calls it too, and a helper declared in another test file
+ * exists only when that file happens to load first.
+ */
+function fakeRunningWorker(?string $commandLine, string $pid = '4242'): void
+{
+    Process::fake(function ($process) use ($commandLine, $pid) {
+        $command = $process->command;
+
+        if (($command[0] ?? '') === 'systemctl' && in_array('MainPID', $command, true)) {
+            return Process::result(output: $commandLine === null ? "0\n" : "{$pid}\n");
+        }
+
+        if (($command[0] ?? '') === 'ps') {
+            return Process::result(output: (string) $commandLine."\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}

@@ -1,0 +1,23 @@
+<?php
+
+return [
+    'not_installed' => 'O fail2ban não está instalado neste servidor.',
+    'already_installed' => 'O fail2ban já está instalado.',
+    'already_installing' => 'O fail2ban já está a ser instalado. Aguarde até essa instalação terminar.',
+    'not_running' => 'O fail2ban está instalado mas não está em execução.',
+    'foreign_jail_local' => 'O painel não escreveu :path, portanto não vai sobrescrevê-lo. O fail2ban já está configurado ali manualmente ou por outro painel — mova ou remova esse arquivo se quiser que o painel gerencie estas configurações.',
+    'jail_not_active' => 'A prisão :jail não está ativa.',
+    'not_banned' => 'Esse endereço IP não está bloqueado neste momento.',
+    'lockout_risk' => 'Ativar a prisão SSH pode impedi-lo de aceder a este servidor. Adicione o seu endereço IP à lista de exceções ou confirme que aceita o risco.',
+    'ip_ignored' => 'Esse endereço IP está na sua lista de exceções. Remova-o de lá primeiro se quiser mesmo bloqueá-lo.',
+    'ip_own_address' => 'Esse é o endereço do próprio servidor. Bloqueá-lo pode isolar o painel da sua base de dados e torná-lo inacessível, por isso não é permitido.',
+    'ip_your_address' => 'Esse é o endereço a partir do qual está ligado. Bani-lo deixá-lo-ia sem acesso a este servidor e, na jail recidive, também a este painel, por isso não pode ser banido aqui.',
+    'operation_failed' => 'A operação do fail2ban falhou.',
+    'bantime_too_short' => 'O tempo de bloqueio deve ser de pelo menos 60 segundos, ou -1 para um bloqueio permanente.',
+    // FS-C45: the application's own ban list, ban and unban.
+    'app_jail_not_enabled' => 'O fail2ban não está a executar uma jail para esta aplicação. Ative primeiro a proteção fail2ban dela.',
+    // One ignore-list entry at a time (2026-10-16).
+    'ignore_ip_exists' => 'Esse endereço já está na lista de ignorados.',
+    'ignore_ip_missing' => 'Esse endereço não está na lista de ignorados. Recarregue a página para ver a lista atual.',
+    'ignore_list_full' => 'A lista de ignorados está cheia (100 entradas). Remova uma ou use um intervalo que cubra várias.',
+];

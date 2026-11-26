@@ -1,0 +1,137 @@
+<?php
+
+namespace App\Services\Git;
+
+use App\Models\GitAccount;
+
+/**
+ * Bitbucket, via a scoped Access Token (workspace, project, or repository
+ * level) — the modern replacement for App Passwords.
+ *
+ * These tokens authenticate as the *token*, not as a user, so `/2.0/user` answers 401. Identity
+ * and verification go through the workspace's repository listing instead; a repository-scoped
+ * token verifies fine and lists just that repository, which is intended.
+ */
+class BitbucketProvider extends AbstractGitProvider
+{
+    public function key(): string
+    {
+        return 'bitbucket';
+    }
+
+    /**
+     * Bitbucket Access Tokens authenticate as `x-token-auth`.
+     */
+    public function credentialUsername(): string
+    {
+        return 'x-token-auth';
+    }
+
+    public function verify(GitAccount $account): array
+    {
+        // A cheap call that any scoped token can make within its workspace.
+        $this->send($account, fn ($client) => $client->get("/2.0/repositories/{$account->workspace}", [
+            'pagelen' => 1,
+        ]));
+
+        return [
+            'identifier' => (string) $account->workspace,
+            'scopes' => [],
+        ];
+    }
+
+    /**
+     * Access Tokens have no expiry and no introspection endpoint, so the only answer is reachable
+     * or not; `expires_at` is always null ("no expiry" in the UI).
+     */
+    public function status(GitAccount $account): array
+    {
+        $probe = $this->probe($account, fn ($client) => $client->get("/2.0/repositories/{$account->workspace}", [
+            'pagelen' => 1,
+        ]));
+
+        return ['status' => $probe['status'], 'expires_at' => null];
+    }
+
+    public function repositories(GitAccount $account, ?string $search, int $page): array
+    {
+        $query = [
+            'pagelen' => $this->perPage(),
+            'page' => $page,
+            'sort' => '-updated_on',
+        ];
+
+        if ($search !== null && $search !== '') {
+            // Bitbucket's filter language; the value is quoted, the request builder encodes it.
+            $query['q'] = 'name~"'.str_replace('"', '', $search).'"';
+        }
+
+        $response = $this->send($account, fn ($client) => $client->get("/2.0/repositories/{$account->workspace}", $query));
+
+        $items = (array) $response->json('values', []);
+
+        return [
+            'repositories' => array_values(array_map(fn (array $repo) => $this->repository(
+                (string) ($repo['full_name'] ?? ''),
+                (string) ($repo['name'] ?? ''),
+                (bool) ($repo['is_private'] ?? true),
+                $repo['mainbranch']['name'] ?? null,
+                $repo['links']['html']['href'] ?? null,
+            ), $items)),
+            'page' => $page,
+            'has_more' => $response->json('next') !== null,
+        ];
+    }
+
+    public function branches(GitAccount $account, string $repository): array
+    {
+        $response = $this->send($account, fn ($client) => $client->get("/2.0/repositories/{$repository}/refs/branches", [
+            'pagelen' => 100,
+        ]));
+
+        return array_values(array_map(fn (array $branch) => [
+            'name' => (string) ($branch['name'] ?? ''),
+            'protected' => false, // Bitbucket exposes branch restrictions separately
+        ], (array) $response->json('values', [])));
+    }
+
+    public function createWebhook(GitAccount $account, string $repository, string $url, string $secret): string
+    {
+        $response = $this->send($account, fn ($client) => $client->post("/2.0/repositories/{$repository}/hooks", $this->hookBody($url, $secret)));
+
+        return (string) $response->json('uuid');
+    }
+
+    public function updateWebhook(GitAccount $account, string $repository, string $id, string $url, string $secret): bool
+    {
+        $response = $this->send(
+            $account,
+            fn ($client) => $client->put("/2.0/repositories/{$repository}/hooks/".rawurlencode($id), $this->hookBody($url, $secret)),
+            missingOk: true,
+        );
+
+        return $response->status() !== 404;
+    }
+
+    public function deleteWebhook(GitAccount $account, string $repository, string $id): void
+    {
+        $this->send($account, fn ($client) => $client->delete("/2.0/repositories/{$repository}/hooks/".rawurlencode($id)), missingOk: true);
+    }
+
+    /**
+     * `secret` makes Bitbucket sign each delivery (`X-Hub-Signature`), which
+     * is what BitbucketWebhook verifies.
+     *
+     * @return array<string, mixed>
+     */
+    private function hookBody(string $url, string $secret): array
+    {
+        return [
+            'description' => 'Deploy on push',
+            'url' => $url,
+            'active' => true,
+            'events' => ['repo:push'],
+            'secret' => $secret,
+        ];
+    }
+}

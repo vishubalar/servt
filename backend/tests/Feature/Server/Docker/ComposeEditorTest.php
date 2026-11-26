@@ -1,0 +1,781 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\Permission;
+use App\Models\Role;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Applications\SiteTypeManager;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+
+/**
+ * Editing a container site's compose file after it exists.
+ *
+ * What these tests are mostly about:
+ *
+ *  - **Rollback.** This path hands over the whole file, so a save can stop the site in ways no
+ *    validator predicts; leaving the site down with the panel holding the text that broke it is
+ *    worse than refusing the save.
+ *  - **The vhost.** With a pasted compose the FILE chooses the published port. Change it
+ *    without re-rendering the vhost and nginx proxies to a port nothing listens on (a 502
+ *    after a save that reported success).
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    ServerCapability::query()->delete();
+    ServerCapability::create([
+        'stack' => 'docker', 'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => false, 'serving_profiles' => ['docker']],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    $this->systemUser = SystemUser::create(['username' => 'shop', 'home_path' => '/home/shop']);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Shop', 'slug' => 'shop', 'domain' => 'shop.test',
+        'site_type' => 'docker', 'serving_profile' => 'docker', 'web_root' => 'public_html',
+        'image' => 'nginx:1.27-alpine', 'container_port' => 80, 'app_port' => 20001,
+        'status' => 'active',
+    ]);
+});
+
+/** This suite's beforeEach already records a docker box; this names that fact. */
+function dockerStack(): void
+{
+    // Deliberately a no-op: the capability row is written in `beforeEach`, and the
+    // permission tests read better saying which stack they assume.
+}
+
+/**
+ * Every command that ran, with the `sudo -n`/`env` wrapper stripped so assertions
+ * are about the real command rather than about ServerOps' prefixing.
+ *
+ * @param  list<list<string>>  $ran
+ */
+function recordCompose(array &$ran): void
+{
+    Process::fake(function ($process) use (&$ran) {
+        $args = $process->command;
+
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+
+        $ran[] = $args;
+
+        if (($args[0] ?? '') === 'docker' && in_array('ps', $args, true)) {
+            return Process::result(output: "abc123\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function composeHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->admin->createToken('t')->plainTextToken];
+}
+
+function composeUrl(): string
+{
+    return '/api/applications/'.test()->application->id.'/container/compose';
+}
+
+/** A valid file publishing one loopback port. */
+function validCompose(int $hostPort = 20001, int $containerPort = 80): string
+{
+    return "services:\n  app:\n    image: nginx:1.27-alpine\n    ports:\n      - \"127.0.0.1:{$hostPort}:{$containerPort}\"\n";
+}
+
+/**
+ * Faked per command. `compose config` is how the validator reads the file, so it has to
+ * answer with the resolved document: a blanket fake makes the validator report every file
+ * unparsable.
+ *
+ * @param  callable|null  $onUp  return a failure to make `compose up` fail.
+ */
+function fakeComposeBox(string $resolved, ?callable $onUp = null): void
+{
+    Process::fake(function ($process) use ($resolved, $onUp) {
+        $args = $process->command;
+
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+
+        if (($args[0] ?? '') === 'docker' && in_array('config', $args, true)) {
+            return Process::result(output: $resolved);
+        }
+
+        if (($args[0] ?? '') === 'docker' && in_array('up', $args, true) && $onUp !== null) {
+            return $onUp();
+        }
+
+        if (($args[0] ?? '') === 'docker' && in_array('ps', $args, true)) {
+            return Process::result(output: "abc123\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+/**
+ * What `docker compose config` prints for {@see validCompose()}.
+ *
+ * **JSON, not YAML.** The validator asks for `--format json` and `json_decode`s the answer, so a
+ * YAML fixture reads back as null and every file is reported unparsable.
+ */
+function resolvedCompose(int $hostPort = 20001, int $containerPort = 80): string
+{
+    return json_encode([
+        'name' => 'sv-app-1',
+        'services' => [
+            'app' => [
+                'image' => 'nginx:1.27-alpine',
+                'ports' => [[
+                    'mode' => 'ingress',
+                    // The field the loopback rule reads. Omit it and the file is
+                    // published to every address, which is the refusal below.
+                    'host_ip' => '127.0.0.1',
+                    'target' => $containerPort,
+                    'published' => (string) $hostPort,
+                    'protocol' => 'tcp',
+                ]],
+            ],
+        ],
+    ]);
+}
+
+/** The same document with no `host_ip` — published to 0.0.0.0. */
+function publicResolvedCompose(): string
+{
+    return json_encode([
+        'name' => 'sv-app-1',
+        'services' => [
+            'app' => [
+                'image' => 'nginx',
+                'ports' => [[
+                    'mode' => 'ingress',
+                    'target' => 80,
+                    'published' => '20001',
+                    'protocol' => 'tcp',
+                ]],
+            ],
+        ],
+    ]);
+}
+
+/*
+ * Reading it.
+ */
+
+it('hands back the generated file for a site that has no stored one', function () {
+    // Simple mode: the panel renders the file from the fields on every deploy, so nothing is
+    // stored. An empty editor would invite writing one from scratch instead of changing one line.
+    $response = $this->withHeaders(composeHeaders())->getJson(composeUrl())->assertOk();
+
+    expect($response->json('generated'))->toBeTrue()
+        ->and($response->json('compose'))->toContain('nginx:1.27-alpine')
+        // The panel's own guarantees are in the rendered file; somebody taking the file over
+        // should see what they are taking responsibility for.
+        ->and($response->json('compose'))->toContain('127.0.0.1:20001:80')
+        ->and($response->json('compose'))->toContain('mem_limit');
+});
+
+it('hands back the stored file once there is one', function () {
+    $this->application->forceFill(['compose' => validCompose()])->save();
+
+    $this->withHeaders(composeHeaders())
+        ->getJson(composeUrl())
+        ->assertOk()
+        ->assertJsonPath('generated', false)
+        ->assertJsonPath('compose', validCompose());
+});
+
+it('does not touch the server when the file is only read', function () {
+    // The pasted-file path records the published port as a side effect; a GET that reached it
+    // would rewrite a row on a read.
+    $this->application->forceFill(['compose' => validCompose(30500)])->save();
+    $ran = [];
+    Process::fake(function ($process) use (&$ran) {
+        $ran[] = $process->command;
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeaders(composeHeaders())->getJson(composeUrl())->assertOk();
+
+    expect($ran)->toBeEmpty()
+        ->and($this->application->fresh()->app_port)->toBe(20001);
+});
+
+/*
+ * Writing it.
+ */
+
+it('writes the file and recreates the container', function () {
+    fakeComposeBox(resolvedCompose());
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose()])
+        ->assertOk();
+
+    expect($this->application->fresh()->compose)->toBe(validCompose());
+});
+
+it('refuses a file that publishes to every address', function () {
+    // The reason the editor cannot be a plain file write: a container published on 0.0.0.0 is
+    // reachable past the firewall. Answered the same whatever is sent, so the loopback rewrite's
+    // re-parse also comes back public, which is refused outright.
+    fakeComposeBox(publicResolvedCompose());
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => "services:\n  app:\n    image: nginx\n    ports:\n      - \"20001:80\"\n"])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('compose');
+
+    // And nothing was stored, so the refusal cost the site nothing.
+    expect($this->application->fresh()->compose)->toBeNull();
+});
+
+it('refuses an empty file rather than treating it as "generate one"', function () {
+    // Empty means "render from the fields" on the create form. Here it would silently revert a
+    // site to a file the user cannot see, so it is refused; stopping a site is what disable is for.
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => ''])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('compose');
+});
+
+it('tells the user what Docker could not read, not where a log is (RC-29)', function () {
+    // The 422 carries Docker's own error line: the server operations log it used to point at is
+    // not something the person who typed the mistake can open.
+    Process::fake(function ($process) {
+        $args = $process->command;
+
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+
+        if (($args[0] ?? '') === 'docker' && in_array('config', $args, true)) {
+            return Process::result(errorOutput: "WARN[0000] `version` is obsolete\nyaml: line 3: did not find expected key\n", exitCode: 1);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $response = $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => "services:\n  app: [\n"])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('compose');
+
+    $message = $response->json('errors.compose.0');
+
+    expect($message)->toBe(__('errors/application.compose_unparsable', ['error' => 'yaml: line 3: did not find expected key']))
+        ->and($message)->not->toContain('operations log')
+        ->and($message)->not->toContain('obsolete');
+
+    expect($this->application->fresh()->compose)->toBeNull();
+});
+
+it('rolls back to the previous file when the new one will not come up', function () {
+    // The case this action exists for. `up` exits non-zero — a bad entrypoint, a
+    // tag that is not there — and the site must not be left down holding the text
+    // that broke it.
+    $working = validCompose();
+    $this->application->forceFill(['compose' => $working])->save();
+
+    $broken = "services:\n  app:\n    image: nginx:does-not-exist\n    ports:\n      - \"127.0.0.1:20001:80\"\n";
+
+    fakeComposeBox(resolvedCompose(), fn () => Process::result(
+        output: '',
+        errorOutput: 'Error response from daemon: manifest unknown',
+        exitCode: 18,
+    ));
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => $broken])
+        ->assertStatus(422)
+        ->assertJsonPath('rolled_back', true);
+
+    expect($this->application->fresh()->compose)->toBe($working);
+});
+
+it('rolls back to the generated file for a site that had no stored one', function () {
+    // Empty is a real previous value, not a missing one: rolling back to "" is
+    // rolling back to "generate it from the fields", which is exactly right.
+    fakeComposeBox(resolvedCompose(), fn () => Process::result(errorOutput: 'boom', exitCode: 1));
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose()])
+        ->assertStatus(422);
+
+    expect($this->application->fresh()->compose)->toBe('');
+});
+
+it('re-renders the vhost when the published port moved', function () {
+    // nginx proxies to `app_port`. Change the port in the file, skip this, and the
+    // web server points at nothing — a 502 from a save that reported success.
+    $this->application->forceFill(['compose' => validCompose()])->save();
+
+    $ran = [];
+    Process::fake(function ($process) use (&$ran) {
+        $args = $process->command;
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+        $ran[] = $args;
+
+        if (($args[0] ?? '') === 'docker' && in_array('config', $args, true)) {
+            return Process::result(output: resolvedCompose(30500));
+        }
+        if (($args[0] ?? '') === 'docker' && in_array('ps', $args, true)) {
+            return Process::result(output: "abc123\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose(30500)])
+        ->assertOk();
+
+    expect($this->application->fresh()->app_port)->toBe(30500);
+
+    // The vhost was written and the web server told to re-read it.
+    $wroteVhost = collect($ran)->contains(
+        fn (array $args) => ($args[0] ?? '') === 'tee' && str_contains($args[1] ?? '', 'nginx')
+    );
+    $reloaded = collect($ran)->contains(
+        fn (array $args) => in_array($args[0] ?? '', ['systemctl', 'nginx'], true)
+    );
+
+    expect($wroteVhost)->toBeTrue()->and($reloaded)->toBeTrue();
+});
+
+it('rolls the file and the vhost back when the new vhost fails its test (DS-09)', function () {
+    // Written and reloaded with neither result read, a vhost that failed `nginx -t` would leave
+    // the old one proxying to the old port behind a save that said OK.
+    $working = validCompose();
+    $this->application->forceFill(['compose' => $working])->save();
+
+    $ran = [];
+    Process::fake(function ($process) use (&$ran) {
+        $args = $process->command;
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+        $ran[] = ['args' => $args, 'input' => (string) $process->input];
+
+        if (($args[0] ?? '') === 'docker' && in_array('config', $args, true)) {
+            // The new file publishes 30500 until it has been put back.
+            $back = $this->application->fresh()->compose === validCompose();
+
+            return Process::result(output: resolvedCompose($back ? 20001 : 30500));
+        }
+        if (($args[0] ?? '') === 'docker' && in_array('ps', $args, true)) {
+            return Process::result(output: "abc123\n");
+        }
+        // The config test fails while the vhost proxies to the new port.
+        if (($args[0] ?? '') === 'nginx' && ($args[1] ?? '') === '-t' && $this->application->fresh()->app_port === 30500) {
+            return Process::result(errorOutput: 'nginx: [emerg] unexpected "}"', exitCode: 1);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose(30500)])
+        ->assertStatus(422)
+        ->assertJsonPath('step', 'test_config')
+        ->assertJsonPath('rolled_back', true);
+
+    $fresh = $this->application->fresh();
+    $vhosts = collect($ran)->filter(fn (array $run) => ($run['args'][0] ?? '') === 'tee' && str_contains($run['args'][1] ?? '', 'nginx'));
+
+    expect($fresh->compose)->toBe($working)
+        ->and($fresh->app_port)->toBe(20001)
+        // The last vhost written proxies to the port the site runs on again.
+        ->and($vhosts->last()['input'])->toContain('127.0.0.1:20001')
+        ->and($vhosts->last()['input'])->not->toContain('30500');
+});
+
+it('leaves the vhost alone when the port did not move', function () {
+    // The inverse, and it matters: reloading nginx on every compose save is a
+    // needless hiccup for every site on the box.
+    $this->application->forceFill(['compose' => validCompose()])->save();
+
+    $ran = [];
+    Process::fake(function ($process) use (&$ran) {
+        $args = $process->command;
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+        $ran[] = $args;
+
+        if (($args[0] ?? '') === 'docker' && in_array('config', $args, true)) {
+            return Process::result(output: resolvedCompose());
+        }
+        if (($args[0] ?? '') === 'docker' && in_array('ps', $args, true)) {
+            return Process::result(output: "abc123\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose()."    restart: unless-stopped\n"])
+        ->assertOk();
+
+    expect(collect($ran)->contains(fn (array $a) => ($a[0] ?? '') === 'tee' && str_contains($a[1] ?? '', 'nginx')))
+        ->toBeFalse();
+});
+
+it('stores without touching the box for a site that is not serving', function () {
+    // A pending site has nothing on disk and a disabled one is deliberately
+    // offline. Bringing either up as a side effect of saving a file would provision
+    // or un-disable a site from the wrong screen.
+    $this->application->forceFill(['status' => 'pending'])->save();
+
+    $ran = [];
+    Process::fake(function ($process) use (&$ran) {
+        $ran[] = $process->command;
+
+        return Process::result(output: resolvedCompose());
+    });
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose()])
+        ->assertOk();
+
+    expect($this->application->fresh()->compose)->toBe(validCompose())
+        ->and(collect($ran)->contains(fn (array $a) => in_array('up', $a, true)))->toBeFalse();
+});
+
+/*
+ * Access.
+ */
+
+it('lets a viewer read the file but not replace it', function () {
+    // Reading it is how somebody diagnoses their own site. Writing it can stop it.
+    $this->application->forceFill(['compose' => validCompose()])->save();
+
+    $viewer = User::factory()->create();
+    $viewer->roles()->attach(Role::create(['name' => 'Viewer', 'slug' => 'viewer']));
+    $headers = ['Authorization' => 'Bearer '.$viewer->createToken('t')->plainTextToken];
+
+    // No grants at all: both are refused, which is the baseline.
+    $this->withHeaders($headers)->getJson(composeUrl())->assertForbidden();
+    $this->withHeaders($headers)->putJson(composeUrl(), ['compose' => validCompose()])->assertForbidden();
+});
+
+it('is refused for a site that is not a container', function () {
+    $this->application->forceFill(['serving_profile' => 'php'])->save();
+
+    $this->withHeaders(composeHeaders())->getJson(composeUrl())->assertStatus(422);
+    $this->withHeaders(composeHeaders())->putJson(composeUrl(), ['compose' => validCompose()])->assertStatus(422);
+});
+
+it('records that the file changed without recording what it said', function () {
+    // A compose file holds environment variables and people put secrets in those.
+    // The activity log has a wider audience than the people who may edit a site.
+    fakeComposeBox(resolvedCompose());
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose()])
+        ->assertOk();
+
+    $row = ActivityLog::where('type', 'application')->where('action', 'compose_updated')->sole();
+
+    expect($row->properties['bytes'])->toBe(strlen(validCompose()))
+        ->and($row->properties['took_over_generated'])->toBeTrue()
+        ->and($row->properties['applied'])->toBeTrue()
+        ->and(json_encode($row->properties))->not->toContain('nginx:1.27-alpine');
+});
+
+/*
+ * The screen's placement, which is a permission question: it is its own item in the application
+ * sidebar, so it has its own `app_compose` permission (the sidebar row IS the permission row),
+ * offered for containers and nothing else.
+ */
+
+it('offers a Compose File item in a container site\'s sidebar', function () {
+    $items = collect(
+        $this->withHeaders(composeHeaders())
+            ->getJson('/api/permissions?level=application&application_id='.$this->application->id)
+            ->json('permissions')
+    );
+
+    $compose = $items->firstWhere('name', 'app_compose');
+
+    expect($compose)->not->toBeNull()
+        ->and($compose['url'])->toBe('/compose');
+});
+
+it('offers it for no other site type', function () {
+    // The site-type filter drops a screen that would be about nothing — the same
+    // way it drops Environment from a WordPress install. A PHP site has no compose
+    // file, so the item must not be there to click.
+    $php = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Plain', 'slug' => 'plain', 'domain' => 'plain.test',
+        'site_type' => 'php', 'serving_profile' => 'php', 'web_root' => 'public_html',
+        'status' => 'active',
+    ]);
+
+    $items = collect(
+        $this->withHeaders(composeHeaders())
+            ->getJson('/api/permissions?level=application&application_id='.$php->id)
+            ->json('permissions')
+    )->pluck('name');
+
+    expect($items)->not->toContain('app_compose');
+
+    // Deliberately NOT asserting that Environment appears instead: `AbstractSiteType` adds it only
+    // for git-deployed and Node sites, so a hand-rolled PHP site gets neither. The pairing holds
+    // for a container, not universally.
+});
+
+it('does not offer Environment on a container, since the file replaced it', function () {
+    $items = collect(
+        $this->withHeaders(composeHeaders())
+            ->getJson('/api/permissions?level=application&application_id='.$this->application->id)
+            ->json('permissions')
+    )->pluck('name');
+
+    expect($items)->not->toContain('app_environment')->toContain('app_compose');
+});
+
+it('has the sidebar label translated in every locale', function () {
+    foreach (['en', 'es', 'de', 'fr', 'pt', 'ja', 'ru', 'hi'] as $locale) {
+        $line = __('nav.app_compose', [], $locale);
+
+        expect($line)->not->toBe('nav.app_compose')->and($line)->not->toBeEmpty();
+    }
+});
+
+/*
+ * The container's own settings, likewise moved off the Dashboard.
+ */
+
+it('offers a Container item in a container site\'s sidebar', function () {
+    $items = collect(
+        $this->withHeaders(composeHeaders())
+            ->getJson('/api/permissions?level=application&application_id='.$this->application->id)
+            ->json('permissions')
+    );
+
+    $container = $items->firstWhere('name', 'app_container');
+
+    expect($container)->not->toBeNull()->and($container['url'])->toBe('/container');
+});
+
+it('gates the container endpoints on their own permission', function () {
+    // They were on `application,manage`, the grant for renaming and enabling a site. Recreating a
+    // container on a new network is a different act and the sidebar row needs its own permission.
+    dockerStack();
+
+    $role = Role::create(['name' => 'Sitewrangler', 'slug' => 'sitewrangler']);
+    $role->permissions()->attach(
+        Permission::where('name', 'application')->sole()->id,
+        ['view' => true, 'manage' => true],
+    );
+
+    $user = User::factory()->create();
+    $user->roles()->attach($role);
+    $headers = ['Authorization' => 'Bearer '.$user->createToken('t')->plainTextToken];
+
+    // Can manage the site itself...
+    $this->withHeaders($headers)->getJson('/api/applications/'.$this->application->id)->assertOk();
+
+    // ...and not its container's runtime, nor the credentials it was built with.
+    $this->withHeaders($headers)
+        ->putJson('/api/applications/'.$this->application->id.'/container', ['container_port' => 8080])
+        ->assertForbidden();
+    $this->withHeaders($headers)
+        ->getJson('/api/applications/'.$this->application->id.'/container/secrets')
+        ->assertForbidden();
+    $this->withHeaders($headers)
+        ->postJson('/api/applications/'.$this->application->id.'/container/pull')
+        ->assertForbidden();
+});
+
+it('has the Container label translated in every locale', function () {
+    foreach (['en', 'es', 'de', 'fr', 'pt', 'ja', 'ru', 'hi'] as $locale) {
+        $line = __('nav.app_container', [], $locale);
+
+        expect($line)->not->toBe('nav.app_container')->and($line)->not->toBeEmpty();
+    }
+});
+
+/*
+ * The one-click apps. `app_container` and `app_compose` were added by `DockerSiteType` alone, so
+ * the fifteen one-click app types went without them, and the credentials endpoint (on
+ * `app_container`) answered 404 for exactly the sites that HAVE generated credentials.
+ * Every earlier test of that endpoint had used the BYO-image type.
+ */
+
+it('offers both container screens to every container-served type', function (string $type) {
+    $siteType = app(SiteTypeManager::class)->find($type);
+    $features = $siteType->features();
+
+    expect($features)->toContain('app_container')->toContain('app_compose')
+        // And never the Environment screen: a container's variables live in the
+        // compose file, which is why that screen is replaced rather than joined.
+        ->and($features)->not->toContain('app_environment');
+})->with(['docker', 'ghost', 'matomo', 'gitea', 'vaultwarden', 'metabase']);
+
+it('keeps the credentials endpoint reachable on a one-click app', function () {
+    // The regression itself, at the endpoint rather than at the feature list.
+    $ghost = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Ghost', 'slug' => 'ghostie', 'domain' => 'ghostie.test',
+        'site_type' => 'ghost', 'serving_profile' => 'docker', 'web_root' => 'public_html',
+        'app_port' => 20002, 'status' => 'active',
+        'docker_secrets' => ['MYSQL_ROOT_PASSWORD' => 'a', 'GHOST_DB_PASSWORD' => 'b'],
+    ]);
+
+    $this->withHeaders(composeHeaders())
+        ->getJson('/api/applications/'.$ghost->id.'/container/secrets')
+        ->assertOk()
+        ->assertJsonPath('secrets.GHOST_DB_PASSWORD', 'b');
+});
+
+/*
+ * Deleting a site whose compose file declared its own volumes.
+ *
+ * The panel removes the volumes IT records on `volume_mounts`, after checking no other site
+ * mounts them. A volume declared inside a pasted compose file was nobody's job: it outlived the
+ * site as an orphan even when the delete asked for the site's Docker objects to go.
+ */
+
+it('passes --volumes to compose down when the delete opted in', function () {
+    $ran = [];
+    recordCompose($ran);
+
+    $this->withHeaders(composeHeaders())
+        ->deleteJson('/api/applications/'.$this->application->id, ['remove_docker_resources' => true]);
+
+    $down = collect($ran)->first(fn (array $args) => ($args[0] ?? '') === 'docker' && in_array('down', $args, true));
+
+    expect($down)->not->toBeNull()->and($down)->toContain('--volumes');
+});
+
+it('does not pass --volumes to a plain delete', function () {
+    // The default has to stay data-preserving: a delete that did not ask about
+    // Docker objects must not destroy the volume holding somebody's database.
+    $ran = [];
+    recordCompose($ran);
+
+    $this->withHeaders(composeHeaders())
+        ->deleteJson('/api/applications/'.$this->application->id);
+
+    $down = collect($ran)->first(fn (array $args) => ($args[0] ?? '') === 'docker' && in_array('down', $args, true));
+
+    expect($down)->not->toBeNull()->and($down)->not->toContain('--volumes');
+});
+
+/**
+ * A box where the site has moved to `team-net` and its original Compose network
+ * is still there, unused and labelled as this project's. Records every command.
+ *
+ * @param  list<list<string>>  $ran
+ */
+function movedSiteBox(array &$ran): void
+{
+    $project = 'sv-app-'.test()->application->id;
+
+    Process::fake(function ($process) use (&$ran, $project) {
+        $args = $process->command;
+
+        while (in_array($args[0] ?? '', ['sudo', '-n', 'env'], true) || str_contains($args[0] ?? '', '=')) {
+            array_shift($args);
+        }
+
+        $ran[] = $args;
+        $line = implode(' ', $args);
+
+        return match (true) {
+            str_contains($line, 'network ls') => Process::result(output: json_encode(['Name' => "{$project}_default", 'ID' => 'n1', 'Driver' => 'bridge', 'Scope' => 'local', 'Internal' => 'false'])."\n"
+                .json_encode(['Name' => 'team-net', 'ID' => 'n2', 'Driver' => 'bridge', 'Scope' => 'local', 'Internal' => 'false'])."\n"),
+            str_contains($line, 'com.docker.compose.project"}}') => Process::result(output: "{$project}|default\n"),
+            str_contains($line, '{{json .Containers}}') => Process::result(output: "{}\n"),
+            ($args[0] ?? '') === 'docker' && in_array('ps', $args, true) => Process::result(output: "abc123\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+}
+
+function networkRemovals(array $ran): array
+{
+    return collect($ran)
+        ->filter(fn (array $args) => ($args[0] ?? '') === 'docker' && ($args[1] ?? '') === 'network' && ($args[2] ?? '') === 'rm')
+        ->map(fn (array $args) => end($args))
+        ->values()
+        ->all();
+}
+
+it('removes the original network on delete when asked to remove Docker resources (BUG-5)', function () {
+    // The positive twin of the opt-out test below: it proves this box makes the
+    // removal visible, so the opt-out test's silence means something.
+    $this->application->forceFill(['docker_network' => 'team-net'])->save();
+    $ran = [];
+    movedSiteBox($ran);
+
+    $this->withHeaders(composeHeaders())
+        ->deleteJson('/api/applications/'.$this->application->id, ['remove_docker_resources' => true]);
+
+    expect(networkRemovals($ran))->toContain('sv-app-'.$this->application->id.'_default');
+});
+
+it('removes no network on a plain delete, even one the site has moved off (BUG-5 opt-out)', function () {
+    // Removing Docker objects stays opt-in: the original-network cleanup rides on
+    // `remove_docker_resources` like every other Docker removal on delete.
+    $this->application->forceFill(['docker_network' => 'team-net'])->save();
+    $ran = [];
+    movedSiteBox($ran);
+
+    $this->withHeaders(composeHeaders())
+        ->deleteJson('/api/applications/'.$this->application->id);
+
+    expect(networkRemovals($ran))->toBe([]);
+});
+
+/*
+ * A port another application holds: the create form refuses it, so the editor has to as well,
+ * leaving the site being edited out (its own port is not a clash with itself).
+ */
+
+it('accepts the file again with the site\'s own port', function () {
+    fakeComposeBox(resolvedCompose(20001));
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose(20001)])
+        ->assertOk();
+});
+
+it('refuses a port another application already uses', function () {
+    Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Blog', 'slug' => 'blog', 'domain' => 'blog.test',
+        'site_type' => 'docker', 'serving_profile' => 'docker', 'web_root' => 'public_html',
+        'image' => 'nginx:1.27-alpine', 'container_port' => 80, 'app_port' => 20002,
+        'status' => 'active',
+    ]);
+    fakeComposeBox(resolvedCompose(20002));
+
+    $this->withHeaders(composeHeaders())
+        ->putJson(composeUrl(), ['compose' => validCompose(20002)])
+        ->assertStatus(422)
+        ->assertJsonPath('errors.compose.0', __('errors/application.compose_port_taken', ['port' => 20002, 'application' => 'Blog']));
+
+    // Refused before anything was written or run.
+    expect($this->application->fresh()->compose)->toBeNull()
+        ->and($this->application->fresh()->app_port)->toBe(20001);
+});

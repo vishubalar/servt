@@ -1,0 +1,88 @@
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { MoreHorizontal, Download, ClipboardCopy } from "lucide-react";
+import { fileDownloadUrl } from "@/lib/api/files";
+import { Button } from "@/components/ui/button";
+import { IconTooltip } from "@/components/ui/icon-tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { FileActionItems } from "@/components/applications/files/file-actions-menu";
+import { useServerPath } from "@/components/applications/files/files-root-context";
+import { DENIED } from "@/components/ui/reason-tooltip";
+
+export function FileRowActions({ file, appId, canManage, onAction }) {
+  const t = useTranslations("applications.files");
+  const tc = useTranslations("common");
+  const { toServerPath } = useServerPath();
+  const symlink = file.type === "symlink";
+  const symlinkReason = symlink ? t("symlinkHint") : null;
+  const canWrite = canManage;
+  const downloadReason = symlinkReason ?? (canManage ? null : DENIED);
+
+  async function copyPath() {
+    try {
+      await navigator.clipboard.writeText(toServerPath(file.path));
+      toast.success(t("actions.pathCopied"));
+    } catch {
+      toast.error(tc("copyFailed"));
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-end gap-0.5">
+      {file.type !== "dir" ? (
+        <IconTooltip label={t("actions.download")} reason={downloadReason}>
+          {downloadReason ? (
+            <Button variant="ghost" size="icon" className="size-8" disabled aria-label={t("actions.download")}>
+              <Download className="size-4" />
+            </Button>
+          ) : (
+            <Button variant="ghost" size="icon" className="size-8" asChild>
+              <a href={fileDownloadUrl(appId, file.path)} download={file.name} aria-label={t("actions.download")}>
+                <Download className="size-4" />
+              </a>
+            </Button>
+          )}
+        </IconTooltip>
+      ) : null}
+      <IconTooltip label={t("actions.copyPath")}>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8"
+          onClick={copyPath}
+          aria-label={t("actions.copyPath")}
+        >
+          <ClipboardCopy className="size-4" />
+        </Button>
+      </IconTooltip>
+
+      {canWrite ? (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="size-8">
+              <MoreHorizontal className="size-4" />
+              <span className="sr-only">{t("actions.label")}</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-48" onCloseAutoFocus={(e) => e.preventDefault()}>
+            <FileActionItems
+              file={file}
+              appId={appId}
+              canManage={canManage}
+              onAction={onAction}
+              Item={DropdownMenuItem}
+              Separator={DropdownMenuSeparator}
+              showQuickActions={false}
+            />
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : null}
+    </div>
+  );
+}

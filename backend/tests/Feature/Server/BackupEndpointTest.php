@@ -1,0 +1,1194 @@
+<?php
+
+use App\Enums\BackupStatus;
+use App\Http\Requests\Server\Backup\BulkDeleteBackupsRequest;
+use App\Jobs\RunBackup;
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\Backup;
+use App\Models\BackupTarget;
+use App\Models\Database;
+use App\Models\StorageDestination;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Backups\Storage\DestinationDisk;
+use App\Services\Server\Backups\Storage\StorageDriverFactory;
+use App\Support\ServerTimezone;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Filesystem\FilesystemAdapter;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    $systemUser = SystemUser::create(['username' => 'siteowner', 'home_path' => '/home/siteowner']);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Shop',
+        'slug' => 'shop',
+        'domain' => 'shop.example.test',
+        'site_type' => 'php',
+        'serving_profile' => 'php',
+        'status' => 'active',
+    ]);
+
+    $this->destination = StorageDestination::create([
+        'name' => 'Offsite',
+        'provider' => 's3',
+        'config' => ['endpoint' => '', 'region' => 'us-east-1', 'bucket' => 'backups', 'access_key' => 'k', 'secret_key' => 's'],
+    ]);
+});
+
+function backupHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+/**
+ * A finished backup on a named destination.
+ *
+ * `backup_targets` is unique on `application_id`, so the target is made once and every backup
+ * hangs off it, like a real history.
+ */
+function seedBackupWithDestination(string $destination): Backup
+{
+    $target = BackupTarget::firstOrCreate(
+        ['application_id' => test()->application->id],
+        [
+            'storage_destination_id' => StorageDestination::firstWhere('name', $destination)->id,
+            'type' => 'full',
+            'retention_count' => 7,
+            'frequency' => 'daily',
+            'enabled' => true,
+        ],
+    );
+
+    return Backup::create([
+        'backup_target_id' => $target->id,
+        'application_id' => test()->application->id,
+        'type' => 'full',
+        'status' => BackupStatus::Verified->value,
+        'manifest' => ['key' => 'shop/'.uniqid().'.tar.gz'],
+    ]);
+}
+
+function targetPayload(array $overrides = []): array
+{
+    return array_merge([
+        'storage_destination_id' => test()->destination->id,
+        'type' => 'full',
+        'retention_count' => 7,
+        'frequency' => 'daily',
+        'enabled' => true,
+    ], $overrides);
+}
+
+it('returns null when backups are not configured for an application', function () {
+    $this->withHeaders(backupHeaders())
+        ->getJson("/api/applications/{$this->application->id}/backup-target")
+        ->assertOk()
+        ->assertJsonPath('backup_target', null);
+});
+
+it('configures backups for an application', function () {
+    $response = $this->withHeaders(backupHeaders())
+        ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload());
+
+    $response->assertOk()
+        ->assertJsonPath('backup_target.type', 'full')
+        ->assertJsonPath('backup_target.frequency', 'daily')
+        ->assertJsonPath('backup_target.retention_count', 7);
+
+    // Localized labels come from the backend so the frontend never holds a
+    // frequency or type list.
+    expect($response->json('backup_target.frequency_title'))->toBe('Daily')
+        ->and($response->json('backup_target.type_title'))->toBe('Files and database');
+});
+
+it('edits rather than duplicating when saved twice', function () {
+    $url = "/api/applications/{$this->application->id}/backup-target";
+
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload())->assertOk();
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload(['frequency' => 'weekly']))->assertOk();
+
+    // `application_id` is unique: a second row would be a constraint violation, not a schedule.
+    expect(BackupTarget::count())->toBe(1)
+        ->and(BackupTarget::first()->frequency)->toBe('weekly');
+});
+
+it('refuses a retention of zero', function () {
+    // Zero would mean every run prunes the backup it just took, which reads
+    // as "backups silently do nothing".
+    $this->withHeaders(backupHeaders())
+        ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload(['retention_count' => 0]))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('retention_count');
+});
+
+it('refuses an unknown frequency', function () {
+    // "Every 2 days" is deliberately not offered: cron cannot express it without restarting
+    // at the start of every month.
+    $this->withHeaders(backupHeaders())
+        ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload(['frequency' => 'every_2_days']))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('frequency');
+});
+
+it('refuses a storage destination that does not exist', function () {
+    $this->withHeaders(backupHeaders())
+        ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload(['storage_destination_id' => 999999]))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('storage_destination_id');
+});
+
+describe('running a backup', function () {
+    it('queues the job', function () {
+        Queue::fake();
+
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload())
+            ->assertOk();
+
+        $this->withHeaders(backupHeaders())
+            ->postJson("/api/applications/{$this->application->id}/backups")
+            // 202: the run happens on the queue, and the Backup row does not
+            // exist until a worker picks it up.
+            ->assertStatus(202);
+
+        // Assert the queue, not just the job: `assertPushed` alone passes for a job sent anywhere
+        // (it once went to a `backups` queue no worker consumed).
+        //
+        // Null, not 'default': naming no queue lands on the connection's default, which the bare
+        // `queue:work` in install.sh drains.
+        Queue::assertPushed(RunBackup::class, fn (RunBackup $job): bool => $job->queue === null);
+    });
+
+    it('refuses when backups are not configured', function () {
+        Queue::fake();
+
+        $this->withHeaders(backupHeaders())
+            ->postJson("/api/applications/{$this->application->id}/backups")
+            ->assertUnprocessable();
+
+        Queue::assertNothingPushed();
+    });
+
+    it('refuses a second run while one is in flight', function () {
+        Queue::fake();
+
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload())
+            ->assertOk();
+
+        Backup::create([
+            'backup_target_id' => BackupTarget::first()->id,
+            'application_id' => $this->application->id,
+            'type' => 'full',
+            'status' => BackupStatus::Running,
+        ]);
+
+        // Two archives of the same site at once compete for the same disk.
+        $this->withHeaders(backupHeaders())
+            ->postJson("/api/applications/{$this->application->id}/backups")
+            ->assertUnprocessable();
+
+        Queue::assertNothingPushed();
+    });
+});
+
+it('lists backups across every application', function () {
+    $target = BackupTarget::create(array_merge(
+        ['application_id' => $this->application->id],
+        targetPayload(),
+    ));
+
+    Backup::create([
+        'backup_target_id' => $target->id,
+        'application_id' => $this->application->id,
+        'type' => 'full',
+        'status' => BackupStatus::Verified,
+    ]);
+
+    $response = $this->withHeaders(backupHeaders())->getJson('/api/backups');
+
+    $response->assertOk()
+        ->assertJsonPath('backups.0.status', 'verified')
+        ->assertJsonStructure(['backups', 'meta' => ['current_page', 'per_page', 'total', 'last_page']]);
+
+    expect($response->json('backups.0.status_title'))->toBe('Complete');
+});
+
+it('sends the uid the archive is stored under', function () {
+    // `id` means nothing outside this database, so it cannot match a row to an object in the
+    // bucket; `uid` exists for that and must be exposed.
+    $target = BackupTarget::create(array_merge(
+        ['application_id' => $this->application->id],
+        targetPayload(),
+    ));
+
+    $backup = Backup::create([
+        'backup_target_id' => $target->id,
+        'application_id' => $this->application->id,
+        'type' => 'full',
+        'status' => BackupStatus::Verified,
+    ]);
+
+    $response = $this->withHeaders(backupHeaders())->getJson('/api/backups');
+
+    expect($backup->uid)->not->toBeNull()
+        ->and($response->json('backups.0.uid'))->toBe($backup->uid);
+});
+
+describe('filtering the restore list', function () {
+    beforeEach(function () {
+        $this->target = BackupTarget::create(array_merge(
+            ['application_id' => $this->application->id],
+            targetPayload(),
+        ));
+
+        $this->makeBackup = function (string $type, string $createdAt): Backup {
+            $backup = Backup::create([
+                'backup_target_id' => $this->target->id,
+                'application_id' => $this->application->id,
+                'type' => $type,
+                'status' => BackupStatus::Verified,
+            ]);
+
+            // created_at is what the range filters on, and the factory-less
+            // create() stamps it as now.
+            $backup->forceFill(['created_at' => $createdAt])->save();
+
+            return $backup;
+        };
+    });
+
+    it('filters by type', function () {
+        ($this->makeBackup)('database', '2026-03-03 02:00:00');
+        ($this->makeBackup)('full', '2026-03-04 02:00:00');
+
+        $response = $this->withHeaders(backupHeaders())
+            ->getJson('/api/backups?filter[type]=database')
+            ->assertOk();
+
+        expect($response->json('backups'))->toHaveCount(1)
+            ->and($response->json('backups.0.type'))->toBe('database');
+    });
+
+    it('filters by date range, inclusive at both ends', function () {
+        ($this->makeBackup)('full', '2026-03-02 23:00:00');
+        ($this->makeBackup)('full', '2026-03-03 02:00:00');
+        // Late on the last day of the range: `to` is taken as end-of-day, so
+        // asking "to the 4th" must not silently drop the 4th.
+        ($this->makeBackup)('full', '2026-03-04 23:30:00');
+        ($this->makeBackup)('full', '2026-03-05 02:00:00');
+
+        $response = $this->withHeaders(backupHeaders())
+            ->getJson('/api/backups?filter[from]=2026-03-03&filter[to]=2026-03-04')
+            ->assertOk();
+
+        expect($response->json('backups'))->toHaveCount(2);
+    });
+
+    it('combines type and date range', function () {
+        ($this->makeBackup)('database', '2026-03-03 02:00:00');
+        ($this->makeBackup)('full', '2026-03-03 02:00:00');
+        ($this->makeBackup)('database', '2026-03-09 02:00:00');
+
+        $response = $this->withHeaders(backupHeaders())
+            ->getJson('/api/backups?filter[type]=database&filter[from]=2026-03-01&filter[to]=2026-03-05')
+            ->assertOk();
+
+        expect($response->json('backups'))->toHaveCount(1);
+    });
+
+    it('rejects an unknown status instead of returning an empty list', function () {
+        // Silently returning nothing reads to the user as "there are no
+        // backups", which is a different and much more alarming statement.
+        $this->withHeaders(backupHeaders())
+            ->getJson('/api/backups?filter[status]=nonsense')
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('filter.status');
+    });
+
+    it('rejects a reversed date range', function () {
+        $this->withHeaders(backupHeaders())
+            ->getJson('/api/backups?filter[from]=2026-03-09&filter[to]=2026-03-01')
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('filter.to');
+    });
+});
+
+describe('the cross-application overview', function () {
+    beforeEach(function () {
+        // A second site, deliberately left unconfigured: the whole point of
+        // the overview is that it shows up.
+        $this->unprotected = Application::forceCreate([
+            'system_user_id' => $this->application->system_user_id,
+            'name' => 'Blog',
+            'slug' => 'blog',
+            'domain' => 'blog.example.test',
+            'site_type' => 'php',
+            'serving_profile' => 'php',
+            'status' => 'active',
+        ]);
+    });
+
+    it('lists configured and unconfigured applications alike', function () {
+        $target = BackupTarget::create(array_merge(
+            ['application_id' => $this->application->id],
+            targetPayload(),
+        ));
+
+        $response = $this->withHeaders(backupHeaders())->getJson('/api/backup-targets?sort=name');
+
+        // Ordered by name: Blog before Shop. (The default is by state.)
+        $response->assertOk()
+            ->assertJsonPath('backup_targets.0.application_name', 'Blog')
+            ->assertJsonPath('backup_targets.0.application_domain', 'blog.example.test')
+            ->assertJsonPath('backup_targets.0.backup_target', null)
+            ->assertJsonPath('backup_targets.0.last_backup', null)
+            ->assertJsonPath('backup_targets.1.application_id', $this->application->id)
+            ->assertJsonPath('backup_targets.1.backup_target.id', $target->id)
+            ->assertJsonPath('backup_targets.1.backup_target.frequency', 'daily')
+            ->assertJsonPath('meta.total', 2)
+            ->assertJsonPath('meta.protected', 1)
+            ->assertJsonPath('meta.unprotected', 1);
+    });
+
+    it('reports the newest backup, however it ended', function () {
+        $target = BackupTarget::create(array_merge(
+            ['application_id' => $this->application->id],
+            targetPayload(),
+        ));
+
+        Backup::create([
+            'backup_target_id' => $target->id,
+            'application_id' => $this->application->id,
+            'type' => 'full',
+            'status' => BackupStatus::Verified,
+        ]);
+
+        // The most recent run failed. A screen that answers "am I protected?"
+        // must show this one, not skip back to the last success.
+        $failed = Backup::create([
+            'backup_target_id' => $target->id,
+            'application_id' => $this->application->id,
+            'type' => 'full',
+            'status' => BackupStatus::Failed,
+            'reason' => 'upload_artifact',
+        ]);
+
+        $this->withHeaders(backupHeaders())
+            ->getJson('/api/backup-targets?sort=name')
+            ->assertOk()
+            ->assertJsonPath('backup_targets.1.last_backup.id', $failed->id)
+            ->assertJsonPath('backup_targets.1.last_backup.status', 'failed')
+            // And the row's state says so too: scheduled, last run failed.
+            ->assertJsonPath('backup_targets.1.state', 'failing');
+    });
+
+    it('denies a user without the backup permission', function () {
+        $user = User::factory()->create();
+        $token = $user->createToken('t')->plainTextToken;
+
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson('/api/backup-targets')
+            ->assertForbidden();
+    });
+});
+
+describe('the next scheduled run', function () {
+    it('is computed for every scheduled frequency', function (string $frequency, string $expected) {
+        $this->travelTo('2026-03-10 12:00:00');
+
+        $response = $this->withHeaders(backupHeaders())
+            ->putJson(
+                "/api/applications/{$this->application->id}/backup-target",
+                targetPayload(['frequency' => $frequency]),
+            );
+
+        $response->assertOk()->assertJsonPath('backup_target.next_run_at', $expected);
+
+        expect($response->json('backup_target.next_run_at_human'))->not->toBeNull();
+    })->with([
+        // Tuesday 12:00 → tonight, the coming Sunday, the 1st of next month.
+        ['daily', '11-03-2026 02:00:00'],
+        ['weekly', '15-03-2026 02:00:00'],
+        ['monthly', '01-04-2026 02:00:00'],
+    ]);
+
+    it('reports a brand-new target as due, not as scheduled for tomorrow', function () {
+        $this->travelTo('2026-03-10 10:00:00');
+
+        // A target that never ran is picked up on the next scheduler tick (within a minute), so
+        // showing only next_run_at would name tomorrow as the first backup is about to run.
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload())
+            ->assertOk()
+            ->assertJsonPath('backup_target.is_due', true)
+            ->assertJsonPath('backup_target.next_run_at', '11-03-2026 02:00:00');
+    });
+
+    it('stops reporting due once a run has been recorded', function () {
+        $this->travelTo('2026-03-10 10:00:00');
+
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload())
+            ->assertOk();
+
+        BackupTarget::first()->update(['last_run_at' => now()]);
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/applications/{$this->application->id}/backup-target")
+            ->assertOk()
+            ->assertJsonPath('backup_target.is_due', false);
+    });
+
+    it('is never due when manual or disabled', function () {
+        $this->withHeaders(backupHeaders())
+            ->putJson(
+                "/api/applications/{$this->application->id}/backup-target",
+                targetPayload(['frequency' => 'manual']),
+            )
+            ->assertJsonPath('backup_target.is_due', false);
+
+        $this->withHeaders(backupHeaders())
+            ->putJson(
+                "/api/applications/{$this->application->id}/backup-target",
+                targetPayload(['enabled' => false]),
+            )
+            ->assertJsonPath('backup_target.is_due', false);
+    });
+
+    it('is null for a manual target', function () {
+        $this->withHeaders(backupHeaders())
+            ->putJson(
+                "/api/applications/{$this->application->id}/backup-target",
+                targetPayload(['frequency' => 'manual']),
+            )
+            ->assertOk()
+            ->assertJsonPath('backup_target.next_run_at', null)
+            ->assertJsonPath('backup_target.next_run_at_human', null);
+    });
+
+    it('is null for a disabled target', function () {
+        // A disabled target has a frequency but no next run. Showing one
+        // would promise a backup that is never taken.
+        $this->withHeaders(backupHeaders())
+            ->putJson(
+                "/api/applications/{$this->application->id}/backup-target",
+                targetPayload(['enabled' => false]),
+            )
+            ->assertOk()
+            ->assertJsonPath('backup_target.next_run_at', null);
+    });
+});
+
+describe('the within-a-day frequencies', function () {
+    // The chosen time is one of the runs; the rest fall every N hours around it. Every 12 hours at
+    // 15:00 matters: the naive cron `30 14-23/12` means "from 14:00" and runs once a day, so the
+    // next run would be tomorrow 14:30, not tonight 02:30.
+    it('runs at the times the chosen time implies', function (string $frequency, string $time, string $now, string $expected) {
+        $this->travelTo($now);
+
+        $this->withHeaders(backupHeaders())
+            ->putJson(
+                "/api/applications/{$this->application->id}/backup-target",
+                targetPayload(['frequency' => $frequency, 'schedule_time' => $time]),
+            )
+            ->assertOk()
+            ->assertJsonPath('backup_target.frequency', $frequency)
+            ->assertJsonPath('backup_target.next_run_at', $expected);
+    })->with([
+        'hourly uses only the minute' => ['hourly', '14:30', '2026-03-10 12:00:00', '10-03-2026 12:30:00'],
+        'every 3 hours' => ['every_3_hours', '14:30', '2026-03-10 15:00:00', '10-03-2026 17:30:00'],
+        'every 6 hours' => ['every_6_hours', '14:30', '2026-03-10 15:00:00', '10-03-2026 20:30:00'],
+        'every 12 hours, after the chosen time' => ['every_12_hours', '14:30', '2026-03-10 15:00:00', '11-03-2026 02:30:00'],
+        'every 12 hours from midnight' => ['every_12_hours', '00:00', '2026-03-10 01:00:00', '10-03-2026 12:00:00'],
+    ]);
+
+    // A missed slot (a reboot, a busy box) runs once when the scheduler comes
+    // back, and only once: an hourly target is not owed one run per hour lost.
+    it('catches up a missed hourly slot once, not once per hour missed', function () {
+        $target = BackupTarget::create(array_merge(
+            ['application_id' => $this->application->id],
+            targetPayload(['frequency' => 'hourly', 'schedule_time' => '00:15']),
+        ));
+
+        $target->forceFill(['last_run_at' => '2026-03-10 07:15:00'])->save();
+
+        expect($target->isDue(new DateTime('2026-03-10 10:20:00')))->toBeTrue();
+
+        $target->forceFill(['last_run_at' => '2026-03-10 10:20:00'])->save();
+
+        expect($target->isDue(new DateTime('2026-03-10 10:40:00')))->toBeFalse()
+            ->and($target->isDue(new DateTime('2026-03-10 11:15:00')))->toBeTrue();
+    });
+});
+
+describe('the settings form options', function () {
+    it('offers every frequency the API accepts, translated, with the picker each needs', function () {
+        $options = $this->withHeaders(backupHeaders())
+            ->getJson('/api/backup-targets/options')
+            ->assertOk()
+            ->json();
+
+        expect(collect($options['frequencies'])->pluck('value')->all())->toBe(BackupTarget::FREQUENCIES)
+            ->and(collect($options['frequencies'])->firstWhere('value', 'hourly'))->toBe([
+                'value' => 'hourly',
+                'label' => 'Every hour',
+                'time' => 'minute',
+                'hint' => 'Runs every hour, at the chosen minute.',
+            ])
+            ->and(collect($options['frequencies'])->firstWhere('value', 'manual')['time'])->toBeNull()
+            ->and(collect($options['frequencies'])->firstWhere('value', 'every_12_hours')['time'])->toBe('time')
+            ->and($options['default_frequency'])->toBe('daily')
+            // All six, both families. The form narrows them by the site's
+            // `serving_profile` using the `family` each type carries, because
+            // this endpoint has no application to scope itself to.
+            ->and(collect($options['types'])->pluck('value')->all())
+            ->toBe(['filesystem', 'database', 'full', 'volumes', 'config', 'volumes_config'])
+            ->and($options['retention'])->toBe(['min' => 1, 'max' => 365])
+            ->and($options['timezone'])->toBe(config('app.timezone'));
+
+        // Every value it offers is one the save accepts: the dropdown and the
+        // validation cannot drift, because both read one list.
+        foreach ($options['frequencies'] as $frequency) {
+            $this->withHeaders(backupHeaders())
+                ->putJson(
+                    "/api/applications/{$this->application->id}/backup-target",
+                    targetPayload(['frequency' => $frequency['value']]),
+                )
+                ->assertOk();
+        }
+
+        // A site with a database: a Database backup of a site without one is refused on purpose.
+        Database::create(['name' => 'shop', 'engine' => 'mysql', 'application_id' => $this->application->id]);
+
+        // The hosted family only, because this fixture is a PHP site. The container types are
+        // refused here on purpose: `volumes` on a site with no volumes would upload an empty
+        // archive and report success.
+        $offered = collect($options['types'])->where('family', 'hosted')->pluck('value');
+
+        expect($offered->all())->toBe(['filesystem', 'database', 'full']);
+
+        foreach ($offered as $type) {
+            $this->withHeaders(backupHeaders())
+                ->putJson(
+                    "/api/applications/{$this->application->id}/backup-target",
+                    targetPayload(['type' => $type]),
+                )
+                ->assertOk();
+        }
+
+        // And the container family is refused on this site, which is the other
+        // half of the same contract.
+        foreach (collect($options['types'])->where('family', 'container')->pluck('value') as $type) {
+            $this->withHeaders(backupHeaders())
+                ->putJson(
+                    "/api/applications/{$this->application->id}/backup-target",
+                    targetPayload(['type' => $type]),
+                )
+                ->assertJsonValidationErrors('type');
+        }
+    });
+
+    it('answers in the language asked for', function () {
+        $this->withHeaders(backupHeaders() + ['Accept-Language' => 'de'])
+            ->getJson('/api/backup-targets/options')
+            ->assertOk()
+            ->assertJsonPath('frequencies.1.label', 'Stündlich');
+    });
+
+    it('is refused without the per-site backup permission', function () {
+        $user = User::factory()->create();
+
+        $this->withHeader('Authorization', 'Bearer '.$user->createToken('t')->plainTextToken)
+            ->getJson('/api/backup-targets/options')
+            ->assertForbidden();
+    });
+});
+
+describe('downloading a backup', function () {
+    beforeEach(function () {
+        $this->target = BackupTarget::create(array_merge(
+            ['application_id' => $this->application->id],
+            targetPayload(),
+        ));
+
+        $this->backup = Backup::create([
+            'backup_target_id' => $this->target->id,
+            'application_id' => $this->application->id,
+            'type' => 'full',
+            'status' => BackupStatus::Verified,
+            'size_bytes' => 5382914,
+            'manifest' => ['key' => 'a1b2c3.tar.gz'],
+        ]);
+
+        // A disk that answers exists()/temporaryUrl() without an S3 endpoint. Mocked as
+        // FilesystemAdapter, not the contract: only the adapter declares temporaryUrl, and
+        // DestinationDisk::for() returns the contract, so an anonymous stub fails its return type.
+        $this->fakeDestinationDisk = function (bool $exists = true) {
+            $disk = Mockery::mock(FilesystemAdapter::class);
+            $disk->shouldReceive('exists')->andReturn($exists);
+            // The controller must ask before it signs: `temporaryUrl()` throws on every adapter but S3.
+            $disk->shouldReceive('providesTemporaryUrls')->andReturn(true);
+            $disk->shouldReceive('temporaryUrl')
+                ->andReturn('https://bucket.example.com/a1b2c3.tar.gz?X-Amz-Signature=deadbeef');
+
+            $this->app->bind(
+                DestinationDisk::class,
+                fn () => new DestinationDisk(app(StorageDriverFactory::class), builder: fn (array $config) => $disk),
+            );
+        };
+    });
+
+    it('returns a signed url, an expiry and a filename someone can recognise', function () {
+        ($this->fakeDestinationDisk)();
+        $this->travelTo('2026-03-10 12:00:00');
+
+        $response = $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertOk();
+
+        expect($response->json('download.url'))->toContain('X-Amz-Signature')
+            ->and($response->json('download.expires_at'))->toBe('10-03-2026 12:05:00')
+            ->and($response->json('download.size_bytes'))->toBe(5382914)
+            // The object key is a uuid — useless once four of them are side
+            // by side in a downloads folder.
+            ->and($response->json('download.filename'))->toContain('shop-example-test')
+            ->and($response->json('download.filename'))->toEndWith('-full.tar.gz');
+    });
+
+    it('says download is unavailable rather than answering 500', function () {
+        // The regression this guards: a disk that cannot sign URLs (FTP, SFTP, a service-account
+        // Drive) reached `temporaryUrl()` and threw `RuntimeException: This driver does not support
+        // creating temporary URLs`, which became a bare 500.
+        $disk = Mockery::mock(FilesystemAdapter::class);
+        $disk->shouldReceive('exists')->andReturn(true);
+        $disk->shouldReceive('providesTemporaryUrls')->andReturn(false);
+        // Deliberately not stubbed: if the controller still calls this, the
+        // test fails loudly instead of quietly passing on a mocked answer.
+        $disk->shouldNotReceive('temporaryUrl');
+
+        $this->app->bind(
+            DestinationDisk::class,
+            fn () => new DestinationDisk(app(StorageDriverFactory::class), builder: fn (array $config) => $disk),
+        );
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('backup');
+
+        // The entry must not be written before the link: this refusal used to read "Downloaded"
+        // in the Activity Log.
+        expect(ActivityLog::where('type', 'backup')->where('action', 'downloaded')->exists())->toBeFalse();
+    });
+
+    it('records who asked, without putting the signed url in the log', function () {
+        ($this->fakeDestinationDisk)();
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertOk();
+
+        $entry = ActivityLog::where('type', 'backup')->where('action', 'downloaded')->first();
+
+        expect($entry)->not->toBeNull()
+            ->and($entry->user_id)->toBe($this->admin->id)
+            // The URL carries a working credential for five minutes. It has
+            // no business being replayable out of the audit trail.
+            ->and(json_encode($entry->properties))->not->toContain('X-Amz-Signature');
+    });
+
+    it('refuses when the upload never finished', function () {
+        ($this->fakeDestinationDisk)();
+
+        $this->backup->update(['manifest' => []]);
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('backup');
+    });
+
+    it('refuses when the archive is gone from the destination', function () {
+        // Saying so beats handing over a link that 404s in the browser,
+        // where it looks like the panel is broken rather than the bucket.
+        ($this->fakeDestinationDisk)(false);
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('backup');
+    });
+
+    it('allows a failed backup to be downloaded for forensics', function () {
+        // Unlike restore: downloading overwrites nothing, and a partial
+        // archive is sometimes exactly what explains the failure.
+        ($this->fakeDestinationDisk)();
+
+        $this->backup->update(['status' => BackupStatus::Failed, 'reason' => 'verify_artifact']);
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertOk();
+    });
+
+    it('denies a user who can view backups but not manage them', function () {
+        ($this->fakeDestinationDisk)();
+
+        // The restore tier, not the read tier: this URL is every file on the
+        // site plus the database.
+        $user = User::factory()->create();
+        grantPermission($user, 'backup');
+        $token = $user->createToken('t')->plainTextToken;
+
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson("/api/backups/{$this->backup->id}/download")
+            ->assertForbidden();
+    });
+});
+
+it('denies a user without the backup permissions', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/backups')
+        ->assertForbidden();
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload())
+        ->assertForbidden();
+});
+
+it('denies an unauthenticated request', function () {
+    $this->getJson('/api/backups')->assertUnauthorized();
+});
+
+it('has copy for every step, status, type and frequency in every locale', function () {
+    foreach (config('app.available_locales') as $locale) {
+        app()->setLocale($locale);
+
+        foreach (['dump_database', 'archive_files', 'upload_artifact', 'verify_artifact', 'prune_old_backups'] as $step) {
+            expect(__('backup.steps.'.$step))->not->toBe('backup.steps.'.$step);
+            // Every step is also a failure reason, because `reason` holds the
+            // step that failed.
+            expect(__('backup.errors.'.$step))->not->toBe('backup.errors.'.$step);
+        }
+
+        foreach (BackupStatus::cases() as $status) {
+            expect(__('backup.status.'.$status->value))->not->toBe('backup.status.'.$status->value);
+        }
+
+        foreach (BackupTarget::FREQUENCIES as $frequency) {
+            expect(__('backup.frequency.'.$frequency))->not->toBe('backup.frequency.'.$frequency)
+                ->and(__('backup.frequency_hint.'.$frequency))->not->toBe('backup.frequency_hint.'.$frequency);
+        }
+    }
+});
+
+describe('deleting backups in bulk', function () {
+    beforeEach(function () {
+        $this->target = BackupTarget::create(array_merge(
+            ['application_id' => $this->application->id],
+            targetPayload(),
+        ));
+
+        $this->makeBackup = function (BackupStatus $status = BackupStatus::Verified, string $key = 'a.tar.gz') {
+            return Backup::create([
+                'backup_target_id' => $this->target->id,
+                'application_id' => $this->application->id,
+                'type' => 'full',
+                'status' => $status,
+                'size_bytes' => 100,
+                'manifest' => ['key' => $key],
+            ]);
+        };
+
+        $this->fakeDisk = function (bool $deletes = true) {
+            $disk = Mockery::mock(FilesystemAdapter::class);
+            $disk->shouldReceive('exists')->andReturn(true);
+            $deletes
+                ? $disk->shouldReceive('delete')->andReturn(true)
+                : $disk->shouldReceive('delete')->andThrow(new RuntimeException('bucket unreachable'));
+
+            $this->app->bind(
+                DestinationDisk::class,
+                fn () => new DestinationDisk(app(StorageDriverFactory::class), builder: fn (array $config) => $disk),
+            );
+        };
+    });
+
+    it('deletes every selected backup and its archive', function () {
+        ($this->fakeDisk)();
+        $a = ($this->makeBackup)();
+        $b = ($this->makeBackup)();
+
+        $response = $this->withHeaders(backupHeaders())
+            ->deleteJson('/api/backups', ['ids' => [$a->id, $b->id]]);
+
+        $response->assertOk()
+            ->assertJsonPath('deleted', true)
+            ->assertJsonPath('failed', []);
+
+        expect(Backup::query()->whereIn('id', [$a->id, $b->id])->count())->toBe(0);
+    });
+
+    it('deletes the rest and names the one it could not, rather than failing the batch', function () {
+        // Twenty backups where one is mid-run must delete the nineteen. Failing
+        // the whole request hides deletions the user would then repeat; a quiet
+        // success hides an archive still being paid for.
+        ($this->fakeDisk)();
+        $ok = ($this->makeBackup)();
+        $running = ($this->makeBackup)(BackupStatus::Running);
+
+        $response = $this->withHeaders(backupHeaders())
+            ->deleteJson('/api/backups', ['ids' => [$ok->id, $running->id]]);
+
+        $response->assertOk()
+            ->assertJsonPath('deleted', false)
+            ->assertJsonPath('succeeded', [$ok->id])
+            ->assertJsonPath('failed.0.id', $running->id)
+            ->assertJsonPath('failed.0.reason', 'running');
+
+        expect(Backup::find($ok->id))->toBeNull()
+            ->and(Backup::find($running->id))->not->toBeNull();
+    });
+
+    it('keeps the row when the archive could not be removed', function () {
+        // The order the single delete established: archive first, row second.
+        // A row surviving a failed storage delete is visible and retryable; the
+        // reverse leaves an object nothing in the panel can find.
+        ($this->fakeDisk)(deletes: false);
+        $backup = ($this->makeBackup)();
+
+        $this->withHeaders(backupHeaders())
+            ->deleteJson('/api/backups', ['ids' => [$backup->id]])
+            ->assertOk()
+            ->assertJsonPath('deleted', false)
+            ->assertJsonPath('failed.0.reason', 'artifact');
+
+        expect(Backup::find($backup->id))->not->toBeNull();
+    });
+
+    it('refuses an empty selection rather than reporting nothing deleted', function () {
+        $this->withHeaders(backupHeaders())
+            ->deleteJson('/api/backups', ['ids' => []])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('ids');
+    });
+
+    it('refuses more than one page of backups in a single request', function () {
+        $ids = range(1, BulkDeleteBackupsRequest::MAX + 1);
+
+        $this->withHeaders(backupHeaders())
+            ->deleteJson('/api/backups', ['ids' => $ids])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('ids');
+    });
+
+    it('denies a user who may view backups but not manage them', function () {
+        // Deleting destroys the copy that exists to survive a mistake, so it
+        // sits at the same tier as restore rather than with the schedule.
+        $viewer = User::factory()->create();
+        grantPermission($viewer, 'backup', view: true, manage: false);
+        $token = $viewer->createToken('t')->plainTextToken;
+        $backup = ($this->makeBackup)();
+
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->deleteJson('/api/backups', ['ids' => [$backup->id]])
+            ->assertForbidden();
+
+        expect(Backup::find($backup->id))->not->toBeNull();
+    });
+});
+
+describe('the destination on a backup row', function () {
+    it('names where the archive went', function () {
+        $backup = seedBackupWithDestination('Offsite');
+
+        $row = collect($this->withHeaders(backupHeaders())
+            ->getJson('/api/backups')->assertOk()->json('backups'))
+            ->firstWhere('id', $backup->id);
+
+        expect($row['storage_destination_name'])->toBe('Offsite');
+    });
+
+    it('says the same thing when a single backup is polled', function () {
+        // The history row and the polled row are the same row. One dropping
+        // the column on refresh would blank a cell the user is watching.
+        $backup = seedBackupWithDestination('Offsite');
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/backups/{$backup->id}")
+            ->assertOk()
+            ->assertJsonPath('backup.storage_destination_name', 'Offsite');
+    });
+
+    it('does not ask the database once per row for it', function () {
+        // The destination comes through the target, so without the eager load
+        // a page of twenty backups is forty extra queries.
+        seedBackupWithDestination('Offsite');
+
+        $count = function (): int {
+            DB::flushQueryLog();
+            test()->withHeaders(backupHeaders())->getJson('/api/backups?per_page=20')->assertOk();
+
+            return count(DB::getQueryLog());
+        };
+
+        DB::enableQueryLog();
+
+        // Warm-up: the first request of a test pays for things a later one
+        // does not, and measuring it against a later one reads as five rows
+        // being *cheaper* than one.
+        $count();
+
+        $one = $count();
+
+        foreach (range(1, 4) as $i) {
+            seedBackupWithDestination('Offsite');
+        }
+
+        $five = $count();
+        DB::disableQueryLog();
+
+        // One page against five, rather than an absolute number: the total
+        // includes auth and the per-status counts, which is noise that would
+        // make this fail for unrelated reasons. What matters is that a row
+        // costs nothing extra.
+        expect($five)->toBe($one);
+    });
+});
+
+/*
+| Saying which clock the schedule is in.
+|
+| `schedule_time` is a bare "02:00" with no zone, and `RunScheduledBackups` resolves it against
+| the APP clock. On a server set to another clock, the number on screen is not when the backup runs.
+*/
+
+it('names the timezone its schedule is interpreted in', function () {
+    Carbon::setTestNow(Carbon::parse('2026-07-29 12:00:00', 'UTC'));
+
+    BackupTarget::create(array_merge(
+        ['application_id' => $this->application->id],
+        targetPayload(['schedule_time' => '02:00']),
+    ));
+
+    $this->withHeaders(backupHeaders())
+        ->getJson("/api/applications/{$this->application->id}/backup-target")
+        ->assertOk()
+        ->assertJsonPath('backup_target.timezone', 'UTC')
+        // The next run is in the zone just named, not some other one.
+        ->assertJsonPath('backup_target.next_run_at', '30-07-2026 02:00:00');
+
+    Carbon::setTestNow();
+});
+
+it('names the clock the scheduler uses, not the one the server runs on', function () {
+    // The guard this feature exists for. Cronjob publishes `ServerTimezone::get()` because Linux
+    // cron runs on the OS clock; backups run on the app's. Copying Cronjob here would print
+    // "02:00 Asia/Kolkata" for a backup that fires at 02:00 UTC: a confident, wrong answer.
+    // It also fails if backups move to server time and the label is not updated.
+    $timezoneFile = sys_get_temp_dir().'/sv-oss-tz-'.uniqid();
+    file_put_contents($timezoneFile, "Asia/Kolkata\n");
+    config(['server.timezone_file' => $timezoneFile]);
+    ServerTimezone::forget();
+
+    expect(ServerTimezone::get())->toBe('Asia/Kolkata')
+        ->and(config('app.timezone'))->toBe('UTC');
+
+    BackupTarget::create(array_merge(
+        ['application_id' => $this->application->id],
+        targetPayload(['schedule_time' => '02:00']),
+    ));
+
+    $this->withHeaders(backupHeaders())
+        ->getJson("/api/applications/{$this->application->id}/backup-target")
+        ->assertOk()
+        ->assertJsonPath('backup_target.timezone', 'UTC');
+
+    ServerTimezone::forget();
+    @unlink($timezoneFile);
+});
+
+describe('a Database backup for a site with no database (bug #33)', function () {
+    it('is refused, naming the choice that works', function () {
+        // n8n keeps its data in files; every run archived nothing.
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload(['type' => 'database']))
+            ->assertUnprocessable()
+            ->assertJsonPath('errors.type.0', __('backup.errors.target_no_database', ['files' => __('backup.type.filesystem')]));
+
+        expect(BackupTarget::count())->toBe(0);
+    });
+
+    it('is accepted once the site has a database', function () {
+        Database::create(['name' => 'shop', 'engine' => 'mysql', 'application_id' => $this->application->id]);
+
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload(['type' => 'database']))
+            ->assertOk();
+    });
+
+    it('leaves Files and Full alone', function (string $type) {
+        $this->withHeaders(backupHeaders())
+            ->putJson("/api/applications/{$this->application->id}/backup-target", targetPayload(['type' => $type]))
+            ->assertOk();
+    })->with(['filesystem', 'full']);
+});
+
+it('tells the form which family each backup type belongs to', function () {
+    // Without this the form would offer six types where the API accepts three.
+    $types = collect($this->withHeaders(backupHeaders())
+        ->getJson('/api/backup-targets/options')
+        ->assertOk()
+        ->json('types'))
+        ->keyBy('value');
+
+    expect($types['filesystem']['family'])->toBe('hosted')
+        ->and($types['database']['family'])->toBe('hosted')
+        ->and($types['full']['family'])->toBe('hosted')
+        ->and($types['volumes']['family'])->toBe('container')
+        ->and($types['config']['family'])->toBe('container')
+        ->and($types['volumes_config']['family'])->toBe('container')
+        // Labels are translated, not raw keys — a missing string shows as the key.
+        ->and($types['volumes_config']['label'])->not->toContain('backup.type');
+});
+
+describe('the last backup', function () {
+    // `last_run_at` stays (the schedule reads it) but outlives deleted backups;
+    // `last_backup_at` follows the backups that still exist.
+    it('names the newest good backup still kept, and clears once none is', function () {
+        $good = seedBackupWithDestination('Offsite');
+        $good->update(['finished_at' => Carbon::parse('2026-10-01 02:03:41')]);
+        $good->target->update(['last_run_at' => Carbon::parse('2026-10-02 02:00:00')]);
+        Backup::create([
+            'backup_target_id' => $good->backup_target_id,
+            'application_id' => $this->application->id,
+            'type' => 'full',
+            'status' => BackupStatus::Failed->value,
+            'finished_at' => Carbon::parse('2026-10-02 02:01:00'),
+        ]);
+
+        $url = "/api/applications/{$this->application->id}/backup-target";
+
+        $this->withHeaders(backupHeaders())->getJson($url)
+            ->assertJsonPath('backup_target.last_backup_at', '01-10-2026 02:03:41');
+        $this->withHeaders(backupHeaders())->getJson('/api/backup-targets')
+            ->assertJsonPath('backup_targets.0.backup_target.last_backup_at', '01-10-2026 02:03:41');
+
+        $good->delete();
+
+        $this->withHeaders(backupHeaders())->getJson($url)
+            ->assertJsonPath('backup_target.last_backup_at', null)
+            ->assertJsonPath('backup_target.last_backup_at_human', null)
+            ->assertJsonPath('backup_target.last_run_at', '02-10-2026 02:00:00');
+    });
+});
+
+describe('one application\'s own backups (BK-K)', function () {
+    it('lists them under the application\'s backup permission alone', function () {
+        $mine = seedBackupWithDestination('Offsite');
+
+        $other = Application::forceCreate([
+            'system_user_id' => $this->application->system_user_id,
+            'name' => 'Blog', 'slug' => 'blog', 'domain' => 'blog.example.test',
+            'site_type' => 'php', 'serving_profile' => 'php', 'status' => 'active',
+        ]);
+        $otherTarget = BackupTarget::create(['application_id' => $other->id, 'storage_destination_id' => $this->destination->id, 'type' => 'full', 'retention_count' => 7, 'frequency' => 'daily', 'enabled' => true]);
+        Backup::create(['backup_target_id' => $otherTarget->id, 'application_id' => $other->id, 'type' => 'full', 'status' => BackupStatus::Verified->value]);
+
+        $user = User::factory()->create();
+        grantPermission($user, 'app_backup');
+
+        $this->actingAs($user)->getJson("/api/applications/{$this->application->id}/backups")
+            ->assertOk()
+            ->assertJsonCount(1, 'backups')
+            ->assertJsonPath('backups.0.id', $mine->id)
+            ->assertJsonPath('meta.counts.total', 1);
+
+        // The server-wide list still needs the server permission.
+        $this->actingAs($user)->getJson('/api/backups')->assertForbidden();
+    });
+
+    it('refuses someone without the application\'s backup permission', function () {
+        $user = User::factory()->create();
+
+        $this->actingAs($user)->getJson("/api/applications/{$this->application->id}/backups")->assertForbidden();
+    });
+
+    it('ignores an application filter that points elsewhere', function () {
+        seedBackupWithDestination('Offsite');
+
+        $this->withHeaders(backupHeaders())
+            ->getJson("/api/applications/{$this->application->id}/backups?filter[application_id]=999")
+            ->assertOk()
+            ->assertJsonCount(1, 'backups');
+    });
+});
+
+it('does not count a paused or manual-only target as protected (OLD-9)', function () {
+    BackupTarget::create(['application_id' => $this->application->id, 'storage_destination_id' => $this->destination->id, 'type' => 'full', 'retention_count' => 7, 'frequency' => 'daily', 'enabled' => false]);
+    $blog = Application::forceCreate([
+        'system_user_id' => $this->application->system_user_id, 'name' => 'Blog', 'slug' => 'blog', 'domain' => 'blog.example.test',
+        'site_type' => 'php', 'serving_profile' => 'php', 'status' => 'active',
+    ]);
+    BackupTarget::create(['application_id' => $blog->id, 'storage_destination_id' => $this->destination->id, 'type' => 'full', 'retention_count' => 7, 'frequency' => 'manual', 'enabled' => true]);
+
+    $this->withHeaders(backupHeaders())->getJson('/api/backup-targets')
+        ->assertJsonPath('meta.protected', 0)
+        ->assertJsonPath('meta.configured', 2)
+        // Paused, not unprotected: they have settings (BackupCoverage).
+        ->assertJsonPath('meta.paused', 2)
+        ->assertJsonPath('meta.unprotected', 0);
+
+    $this->withHeaders(backupHeaders())->getJson('/api/backup-targets?filter[protected]=0')
+        ->assertJsonCount(2, 'backup_targets');
+});
+
+it('records what an edit changed, and nothing for the first save', function () {
+    $url = "/api/applications/{$this->application->id}/backup-target";
+
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload())->assertOk();
+    $this->travel(1)->seconds();
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload(['frequency' => 'weekly', 'retention_count' => 3]))->assertOk();
+    $this->travel(1)->seconds();
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload(['frequency' => 'weekly', 'retention_count' => 3]))->assertOk();
+
+    $logged = ActivityLog::where('type', 'backup')->oldest('id')->get()->map(fn ($row) => $row->properties['changes'] ?? null)->all();
+
+    expect($logged)->toBe([
+        null, // configured: everything is new, the sentence already says what
+        [['field' => 'frequency', 'from' => 'daily', 'to' => 'weekly'], ['field' => 'retention_count', 'from' => 7, 'to' => 3]],
+        [],
+    ]);
+
+    $this->withHeaders(backupHeaders())->getJson('/api/activity-log?filter[type]=backup')
+        ->assertJsonPath('activity_log.1.changes.0.text', 'Frequency changed from daily to weekly')
+        ->assertJsonPath('activity_log.1.changes.1.text', 'Backups kept changed from 7 to 3');
+});
+
+it('names the storage a target moved to, never its credentials', function () {
+    $url = "/api/applications/{$this->application->id}/backup-target";
+    $other = StorageDestination::create([
+        'name' => 'Second bucket', 'provider' => 's3',
+        'config' => ['endpoint' => '', 'region' => 'us-east-1', 'bucket' => 'b2', 'access_key' => 'k2', 'secret_key' => 'very-secret-key'],
+    ]);
+
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload())->assertOk();
+    $this->withHeaders(backupHeaders())->putJson($url, targetPayload(['storage_destination_id' => $other->id]))->assertOk();
+
+    $row = ActivityLog::where('type', 'backup')->latest('id')->first();
+    expect($row->properties['changes'])->toBe([['field' => 'storage_destination', 'from' => 'Offsite', 'to' => 'Second bucket']])
+        ->and(json_encode($row->properties))->not->toContain('very-secret-key');
+});

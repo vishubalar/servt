@@ -1,0 +1,78 @@
+import { useState } from "react";
+import { useRefresh } from "@/hooks/use-refresh";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { Loader2, ShieldCheck, Sparkles } from "lucide-react";
+import { updateFail2ban } from "@/lib/api/fail2ban";
+import { Button } from "@/components/ui/button";
+import { ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { Card, CardContent } from "@/components/ui/card";
+import { ensureIgnored, settingsPayload } from "@/lib/fail2ban/settings-payload";
+import { apiMessage } from "@/lib/api/error-message";
+import { useBrowserIpSettled } from "@/components/network/browser-ip";
+
+// Ignores the user's IP first, so jails are never on while the user is bannable.
+export function RecommendedSetup({ jails, settings, yourIp, ignoreIps = [], canManage }) {
+  const t = useTranslations("fail2ban");
+  const { refreshAndWait } = useRefresh();
+  const [pending, setPending] = useState(false);
+  const ipSettled = useBrowserIpSettled();
+
+  const anyEnabled = jails.some((jail) => jail.enabled);
+  if (anyEnabled || jails.length === 0) return null;
+
+  const willIgnoreMe = Boolean(yourIp) && !ignoreIps.includes(yourIp);
+
+  async function apply() {
+    setPending(true);
+    try {
+      if (willIgnoreMe) await ensureIgnored(yourIp);
+      await updateFail2ban({
+        ...settingsPayload(settings),
+        jails: Object.fromEntries(jails.map((jail) => [jail.name, true])),
+        acknowledged: Boolean(yourIp),
+      });
+      await refreshAndWait();
+      toast.success(t("recommended.done"));
+    } catch (error) {
+      toast.error(
+        apiMessage(error, t("recommended.failed")),
+      );
+    } finally {
+      setPending(false);
+    }
+  }
+
+  if (!canManage) return null;
+
+  return (
+    <Card className="border-primary/25 bg-[color-mix(in_oklab,var(--primary)_5%,var(--card))]">
+      <CardContent className="flex flex-col gap-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+        <div className="flex items-start gap-3">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+            <Sparkles className="size-5" />
+          </span>
+          <div className="space-y-1">
+            <p className="text-base font-semibold">{t("recommended.title")}</p>
+            <p className="text-sm text-muted-foreground">
+              {willIgnoreMe
+                ? t("recommended.bodyWithIp", { count: jails.length, ip: yourIp })
+                : t("recommended.body", { count: jails.length })}
+            </p>
+          </div>
+        </div>
+
+        <ReasonTooltip reason={!ipSettled ? t("recommended.checkingIp") : null}>
+          <Button disabled={pending || !ipSettled} onClick={apply}>
+            {pending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <ShieldCheck className="size-4" />
+            )}
+            {t("recommended.action")}
+          </Button>
+        </ReasonTooltip>
+      </CardContent>
+    </Card>
+  );
+}

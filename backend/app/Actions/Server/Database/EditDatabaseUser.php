@@ -1,0 +1,111 @@
+<?php
+
+namespace App\Actions\Server\Database;
+
+use App\Models\DatabaseUser;
+use App\Services\ActivityLogger;
+use App\Services\Server\Databases\DatabaseFirewall;
+use App\Services\Server\Databases\DatabaseManager;
+use App\Services\Server\Databases\RemoteAccessPreparer;
+use Illuminate\Validation\ValidationException;
+
+/**
+ * Edit an existing DB user's credentials: username, connection_preference/host
+ * (remote toggle), and/or password — in one call. SQL uses RENAME USER
+ * (grants preserved); Mongo (no rename) drops + recreates with the password.
+ */
+class EditDatabaseUser
+{
+    public function __construct(
+        private DatabaseManager $manager,
+        private DatabaseFirewall $firewall,
+        private RemoteAccessPreparer $remoteAccess,
+        private ActivityLogger $activityLogger,
+    ) {}
+
+    /**
+     * @param  array{username?: string, connection_preference?: string, host?: ?string, password?: ?string, restart_cluster?: bool}  $data
+     */
+    public function execute(DatabaseUser $user, array $data): DatabaseUser
+    {
+        // FS-C14(a): the panel's own account (and the engines' built-in
+        // ones). Removing or renaming it breaks every database operation
+        // with no way back through the panel — the screen only hid it.
+        if ($this->manager->isSystemUser($user->username)) {
+            throw ValidationException::withMessages([
+                'username' => [__('errors/database.panel_user_protected', ['username' => $user->username])],
+            ]);
+        }
+
+        $database = $user->database;
+        $engine = $this->manager->engine($database->engine);
+
+        $newUsername = $data['username'] ?? $user->username;
+        $newPreference = $data['connection_preference'] ?? $user->connection_preference;
+        $newHost = $this->resolveHost($newPreference, $data['host'] ?? null, $user);
+        $newPassword = ($data['password'] ?? null) ?: $user->password;
+
+        $renamed = $newUsername !== $user->username || $newHost !== $user->host;
+        $passwordChanged = ! empty($data['password']);
+
+        // Bug #25: renaming onto a name the server already has failed inside
+        // the engine as a 500. Asked first, as adding a user already does —
+        // and only for a new name: a role's host is not part of it on
+        // PostgreSQL, so a host-only change would find the user itself.
+        if ($newUsername !== $user->username && $engine->userExists($newUsername, $newHost, $database->name)) {
+            throw ValidationException::withMessages([
+                'username' => [__('errors/database.user_exists', ['username' => $newUsername])],
+            ]);
+        }
+
+        // Before anything is changed, for the same reason the firewall sync is:
+        // a refusal must not leave the panel describing an account the engine
+        // has already been told about. On PostgreSQL this is where a cluster
+        // restart is asked for and consented to.
+        $this->remoteAccess->prepare($database, $newPreference, (bool) ($data['restart_cluster'] ?? false));
+
+        // Firewall setup can fail; perform it before mutating credentials so
+        // the panel cannot be left describing an account the engine changed.
+        $this->firewall->sync($database->engine, $newPreference, $newHost);
+
+        if ($renamed) {
+            // SQL RENAME preserves the password; Mongo recreates with $newPassword.
+            $engine->renameUser($user->username, $user->host, $newUsername, $newHost, $newPassword, $database->name);
+            if ($passwordChanged && $this->manager->renameKeepsPassword($database->engine)) {
+                $engine->setPassword($newUsername, $newHost, $newPassword, $database->name);
+            }
+        } elseif ($passwordChanged) {
+            $engine->setPassword($newUsername, $newHost, $newPassword, $database->name);
+        }
+
+        $oldPreference = $user->connection_preference;
+        $oldHost = $user->host;
+
+        $user->update([
+            'username' => $newUsername,
+            'host' => $newHost,
+            'connection_preference' => $newPreference,
+            'password' => $newPassword,
+        ]);
+
+        if ($oldPreference !== $newPreference || $oldHost !== $newHost) {
+            $this->firewall->release($database->engine, $oldPreference, $oldHost);
+        }
+
+        $this->activityLogger->log('database.user_updated', $user, [
+            'username' => $newUsername,
+            'database' => $database->name,
+        ]);
+
+        return $user;
+    }
+
+    private function resolveHost(string $preference, ?string $host, DatabaseUser $user): string
+    {
+        return match ($preference) {
+            'anywhere' => '%',
+            'remote' => (string) ($host ?? ($user->connection_preference === 'remote' ? $user->host : $host)),
+            default => 'localhost',
+        };
+    }
+}

@@ -1,0 +1,738 @@
+<?php
+
+namespace App\Services\Server\Php;
+
+use App\Models\Application;
+use App\Models\ApplicationPhpSettings;
+use App\Services\Server\ManagedFile;
+use App\Services\Server\ServerOps;
+use App\Services\Server\ServerOpsResult;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\View;
+
+/**
+ * One PHP-FPM pool per application.
+ *
+ * Without a pool per site, PHP runs as www-data for every site, so one compromised plugin could
+ * read every other customer's `.env` and the per-site Linux users protect nothing.
+ *
+ * Everything here is FPM-only by construction. OpenLiteSpeed has no pools at
+ * all — it spawns LSPHP itself — so the stack answers `null` for a pool path
+ * and this class is never reached.
+ */
+class PoolManager
+{
+    public function __construct(
+        private ServerOps $serverOps,
+        private ManagedFile $files,
+        private PhpStackManager $stacks,
+    ) {}
+
+    /**
+     * Named after the app's slug, not an opaque `sv-app-{id}`: the slug is unique too (vhosts and
+     * logs use it, see AbstractWebServerDriver::fileName()) and readable in pool.d/. Falls back to
+     * the domain for a row that predates the slug column.
+     */
+    public function poolName(Application $application): string
+    {
+        return (string) ($application->slug ?: $application->domain);
+    }
+
+    /**
+     * The socket this site's vhost should talk to.
+     *
+     * Its own pool once isolated; the server-wide one until then. Every PHP
+     * site on an un-upgraded server keeps working exactly as it did, which is
+     * what makes isolation safe to roll out one site at a time.
+     */
+    public function socketFor(Application $application): string
+    {
+        if ($application->isolated_at !== null && $this->supported()) {
+            return $this->socketPath($application);
+        }
+
+        $version = $application->php_version ?: config('server.default_php_version');
+        $dir = rtrim((string) config('server.php_socket_dir', '/run/php'), '/');
+
+        return "{$dir}/php{$version}-fpm.sock";
+    }
+
+    public function socketPath(Application $application): string
+    {
+        $dir = rtrim((string) config('server.php_socket_dir', '/run/php'), '/');
+
+        return $dir.'/'.$this->poolName($application).'.sock';
+    }
+
+    /** Null when this server's PHP stack has no pools (OpenLiteSpeed). */
+    public function poolPath(Application $application, ?string $version = null): ?string
+    {
+        $stack = $this->stacks->stack();
+
+        if ($stack->key() !== 'fpm') {
+            return null;
+        }
+
+        $version = $version ?: ($application->php_version ?: config('server.default_php_version'));
+        $root = rtrim((string) config('server.php_dir', '/etc/php'), '/');
+
+        return "{$root}/{$version}/fpm/pool.d/".$this->poolName($application).'.conf';
+    }
+
+    public function supported(): bool
+    {
+        return $this->stacks->stack()->key() === 'fpm';
+    }
+
+    /**
+     * Write the pool and make it live.
+     *
+     * The order is the safety property. `php-fpm -t` runs **before** any
+     * reload, because a pool file FPM cannot parse stops the whole daemon
+     * starting — which takes down every PHP site on the server, not just this
+     * one. A failed test removes the file and reloads nothing.
+     *
+     * @return array{ok: bool, reason: ?string, reference: ?string}
+     */
+    public function apply(Application $application, ApplicationPhpSettings $settings): array
+    {
+        $path = $this->poolPath($application);
+
+        if ($path === null) {
+            return ['ok' => false, 'reason' => 'unsupported_stack', 'reference' => null];
+        }
+
+        // FPM resolves `user =` to a uid at startup and refuses to initialise if it cannot, and
+        // that refusal is server-wide: a pool naming a missing account stops php-fpm coming back
+        // after a restart, taking every PHP site with it. Checked before writing.
+        $account = $application->systemUser?->username;
+
+        if ($account === null || ! $this->accountExists($account)) {
+            return ['ok' => false, 'reason' => 'missing_account', 'reference' => null];
+        }
+
+        $version = $application->php_version ?: config('server.default_php_version');
+        $previous = $this->read($path);
+
+        $this->ensureSiteDirectories($application);
+
+        $written = $this->files->put($path, $this->render($application, $settings), $this->context($application, 'pool_write'));
+
+        if ($written->failed()) {
+            return ['ok' => false, 'reason' => 'write_failed', 'reference' => $written->reference];
+        }
+
+        $test = $this->test($version);
+
+        if ($test->failed()) {
+            // Put back exactly what was there — or remove the file if this was
+            // the first attempt. Either way nothing is reloaded, so the server
+            // is still serving what it was a moment ago.
+            $this->restore($application, $path, $previous);
+
+            return ['ok' => false, 'reason' => 'config_test_failed', 'reference' => $test->reference];
+        }
+
+        $reload = $this->reload($version);
+
+        if ($reload->failed()) {
+            $this->restore($application, $path, $previous);
+            $this->reload($version);
+
+            return ['ok' => false, 'reason' => 'reload_failed', 'reference' => $reload->reference];
+        }
+
+        return ['ok' => true, 'reason' => null, 'reference' => null];
+    }
+
+    /**
+     * Whether this OS account actually exists on the server.
+     *
+     * The panel's `system_users` table records what it created; it is not proof (a rebuilt or
+     * adopted server, or a failed `useradd`, leaves a row with no passwd entry). Asks `getent`,
+     * like {@see CrontabManager}.
+     */
+    private function accountExists(string $username): bool
+    {
+        return $this->serverOps->run(
+            ['getent', 'passwd', $username],
+            ['feature' => 'php', 'op' => 'pool_account_check'],
+            timeout: 15,
+        )->ok;
+    }
+
+    /**
+     * Pool files on disk whose `user` no longer resolves to an account.
+     *
+     * Read from the filesystem, not the applications table: the pools that matter are exactly the
+     * ones no application row claims any more. One of these stops the php-fpm daemon initialising
+     * at the next restart and fails the `php-fpm -t` inside every other site's {@see apply()},
+     * which blames whichever innocent site was being created.
+     *
+     * @return array<int, array{path: string, user: string}>
+     */
+    public function unresolvableAccounts(): array
+    {
+        $root = rtrim((string) config('server.php_dir', '/etc/php'), '/');
+
+        $found = $this->serverOps->run(
+            ['find', $root, '-type', 'f', '-name', '*.conf', '-path', '*/fpm/pool.d/*'],
+            ['feature' => 'php', 'op' => 'pool_scan'],
+            timeout: 30,
+        );
+
+        if ($found->failed()) {
+            return [];
+        }
+
+        $files = array_values(array_filter(array_map('trim', explode("\n", (string) $found->output()))));
+
+        if ($files === []) {
+            return [];
+        }
+
+        // One grep for every pool rather than one read each (one elevated command, not a dozen).
+        $users = $this->serverOps->run(
+            ['grep', '-H', '-m', '1', '-E', '^[[:space:]]*user[[:space:]]*=', ...$files],
+            ['feature' => 'php', 'op' => 'pool_scan_users'],
+            timeout: 30,
+        );
+
+        $orphans = [];
+        $resolved = [];
+
+        foreach (explode("\n", (string) $users->output()) as $line) {
+            if (preg_match('/^(.+?):\s*user\s*=\s*(\S+)/', trim($line), $m) !== 1) {
+                continue;
+            }
+
+            [, $path, $user] = $m;
+
+            $resolved[$user] ??= $this->accountExists($user);
+
+            if (! $resolved[$user]) {
+                $orphans[] = ['path' => $path, 'user' => $user];
+            }
+        }
+
+        return $orphans;
+    }
+
+    /** Remove the pool and reload. Used when un-isolating or deleting a site. */
+    public function remove(Application $application, ?string $version = null): void
+    {
+        $path = $this->poolPath($application, $version);
+
+        if ($path === null) {
+            return;
+        }
+
+        $version = $version ?: ($application->php_version ?: config('server.default_php_version'));
+
+        $this->files->delete($path, $this->context($application, 'pool_remove'));
+        $this->reload($version);
+    }
+
+    /**
+     * Whether this application has a pool file on disk.
+     *
+     * **Null means the panel could not find out**, not "no". The only caller is the doctor, which
+     * reports a missing pool as a serious finding; a bare `false` would make it cry wolf for every
+     * isolated site when every probe fails (e.g. a sudo grant that predates the build).
+     */
+    public function exists(Application $application): ?bool
+    {
+        $path = $this->poolPath($application);
+
+        if ($path === null) {
+            return false;
+        }
+
+        $result = $this->serverOps->probe(
+            ['test', '-f', $path],
+            $this->context($application, 'pool_exists'),
+            timeout: 15,
+        );
+
+        return $result->answered ? $result->ok : null;
+    }
+
+    /**
+     * Whether the file on disk still matches what the panel would write.
+     *
+     * Reported rather than corrected: someone who hand-edited the pool should
+     * be told their changes will be overwritten *before* they press save, not
+     * discover it afterwards.
+     */
+    public function managed(Application $application, ApplicationPhpSettings $settings): ?bool
+    {
+        $path = $this->poolPath($application);
+
+        if ($path === null) {
+            return true;
+        }
+
+        // Null when it could not be checked: an unknown must not become a confident answer in
+        // either direction (a false "managed" or a false "hand-edited").
+        $exists = $this->exists($application);
+
+        if ($exists === null) {
+            return null;
+        }
+
+        if ($exists === false) {
+            return true;
+        }
+
+        $contents = $this->read($path);
+
+        if ($contents === null) {
+            return null;
+        }
+
+        return trim($contents) === trim($this->render($application, $settings));
+    }
+
+    /**
+     * @param  array<string, mixed>  $effective
+     * @return array{pmStartServers: int, pmMinSpare: int, pmMaxSpare: int}
+     */
+    private function spareServers(array $effective, int $children): array
+    {
+        [$start, $min, $max] = [$effective['pm_start_servers'], $effective['pm_min_spare_servers'], $effective['pm_max_spare_servers']];
+
+        if ($start !== null && $min !== null && $max !== null
+            && (int) $min >= 1 && (int) $min <= (int) $start && (int) $start <= (int) $max && (int) $max <= $children) {
+            return ['pmStartServers' => (int) $start, 'pmMinSpare' => (int) $min, 'pmMaxSpare' => (int) $max];
+        }
+
+        return [
+            'pmStartServers' => max(1, (int) ceil($children / 2)),
+            'pmMinSpare' => max(1, (int) ceil($children / 4)),
+            'pmMaxSpare' => max(2, (int) ceil($children * 3 / 4)),
+        ];
+    }
+
+    public function render(Application $application, ApplicationPhpSettings $settings): string
+    {
+        $effective = $settings->effective();
+        $root = $this->appRoot($application);
+        $children = max(1, (int) $effective['pm_max_children']);
+
+        return View::make('server.pools.fpm', [
+            'pool' => $this->poolName($application),
+            'user' => $application->systemUser?->username ?? 'www-data',
+            'socket' => $this->socketPath($application),
+            'webServerUser' => (string) config('server.web_server_user', 'www-data'),
+
+            'pmType' => $effective['pm_type'],
+            'pmMaxChildren' => $children,
+            'pmMaxRequests' => (int) $effective['pm_max_requests'],
+            // Derived from max_children unless the site brought its own, and only all three
+            // together while they still agree with max_children (a later max_children change must
+            // not leave a pool that will not start).
+            ...$this->spareServers($effective, $children),
+            'pmIdleTimeout' => (int) ($effective['pm_process_idle_timeout'] ?? 0) ?: 30,
+            // Written on PHP 8.1+ only; older php-fpm refuses the key.
+            'pmMaxSpawnRate' => $effective['pm_max_spawn_rate'] !== null
+                && version_compare((string) ($application->php_version ?: '8.4'), '8.1', '>=')
+                ? (int) $effective['pm_max_spawn_rate'] : null,
+
+            'sessionPath' => $this->sessionPath($application),
+            'errorLog' => $this->errorLogPath($application),
+
+            'memoryLimit' => $effective['memory_limit'],
+            'uploadMaxFilesize' => $effective['upload_max_filesize'],
+            'postMaxSize' => $effective['post_max_size'],
+            'maxExecutionTime' => (int) $effective['max_execution_time'],
+            'maxInputTime' => (int) $effective['max_input_time'],
+            'maxInputVars' => (int) $effective['max_input_vars'],
+            'sessionGcMaxlifetime' => (int) $effective['session_gc_maxlifetime'],
+            'phpTimezone' => $effective['php_timezone'],
+            'autoPrependFile' => $effective['auto_prepend_file'],
+            'allowUrlFopen' => (bool) $effective['allow_url_fopen'],
+
+            'openBasedir' => $effective['open_basedir_enabled']
+                ? $this->openBasedir($application, (string) ($effective['open_basedir_paths'] ?? ''))
+                : null,
+            'disableFunctions' => $effective['disable_functions'],
+            // PHP settings as php_admin_value/flag, plus the few pool
+            // settings AdditionalDirectives allows — parsed, never the
+            // owner's text as typed.
+            'additionalDirectives' => app(AdditionalDirectives::class)->forFpm((string) $effective['additional_directives'], rescue(fn () => $application->logsPath(), null, false)),
+        ])->render();
+    }
+
+    public function test(string $version): ServerOpsResult
+    {
+        return $this->serverOps->run(
+            ['php-fpm'.$version, '-t'],
+            ['feature' => 'php', 'op' => 'pool_test', 'version' => $version],
+            timeout: 60,
+        );
+    }
+
+    public function reload(string $version): ServerOpsResult
+    {
+        // Reload, never restart: a restart drops every in-flight request on
+        // every site the daemon serves. A reload does too unless
+        // process_control_timeout lets it wait — see FpmReloadGrace.
+        return $this->serverOps->run(
+            ['systemctl', 'reload', 'php'.$version.'-fpm'],
+            ['feature' => 'php', 'op' => 'pool_reload', 'version' => $version],
+            timeout: 60,
+        );
+    }
+
+    public function sessionPath(Application $application): string
+    {
+        return $this->appRoot($application).'/.panel/sessions';
+    }
+
+    /**
+     * In `logs/`, not `.panel/`: `.panel` is deliberately unreadable by the site's owner, and a
+     * developer needs to read this file. Still above the document root, and opened by the php-fpm
+     * master before it drops to the pool user, so a root-owned log directory is no obstacle.
+     * {@see ApplicationLogDirectory}
+     */
+    public function errorLogPath(Application $application): string
+    {
+        return $application->logsPath().'/php-error.log';
+    }
+
+    /**
+     * The session and log directories, owned by the site.
+     *
+     * Created before the pool goes live: FPM will not start a pool whose
+     * session path does not exist, and a site that cannot write sessions logs
+     * nobody in.
+     */
+    private function ensureSiteDirectories(Application $application): void
+    {
+        $user = $application->systemUser?->username;
+        $sessions = $this->sessionPath($application);
+
+        $this->serverOps->run(['mkdir', '-p', $sessions], $this->context($application, 'pool_dirs'), timeout: 30);
+
+        // The sessions directory only, never its parent: a `chown -R` on `.panel` would hand the
+        // panel's own directory to the site user, and later root writes into it could be
+        // redirected by a symlink the user planted. `-h` so a `sessions` that is already a link
+        // is not followed either.
+        if ($user !== null) {
+            $this->serverOps->run(
+                ['chown', '-h', $user.':'.$user, $sessions],
+                $this->context($application, 'pool_dirs_own'),
+                timeout: 30,
+            );
+        }
+
+        // 0700: session files are as sensitive as the cookies that name them.
+        // As the user, who owns it: root's chmod follows a link, the user's
+        // reaches only what the user could already change.
+        $this->serverOps->run(
+            $user !== null ? ['runuser', '-u', $user, '--', 'chmod', '0700', $sessions] : ['chmod', '0700', $sessions],
+            $this->context($application, 'pool_dirs_mode'),
+            timeout: 15,
+        );
+    }
+
+    private function restore(Application $application, string $path, ?string $previous): void
+    {
+        if ($previous === null) {
+            $this->files->delete($path, $this->context($application, 'pool_rollback_delete'));
+
+            return;
+        }
+
+        $this->files->put($path, $previous, $this->context($application, 'pool_rollback'));
+    }
+
+    /**
+     * Memoized for this instance (one request): `managed()` and the live open_basedir lookup want
+     * the same file, and each read is an elevated `cat`.
+     *
+     * @var array<string, string|null>
+     */
+    private array $readCache = [];
+
+    private function read(string $path): ?string
+    {
+        if (array_key_exists($path, $this->readCache)) {
+            return $this->readCache[$path];
+        }
+
+        // Probe first: a missing file is a normal state for an isolated site with no pool written
+        // yet. We `cat` only when the file is confirmed present, so only a genuine read failure
+        // returns null. See `ServerOps::probe()`, which marks exit-1 as expected.
+        $probe = $this->serverOps->probe(['test', '-f', $path], ['feature' => 'php', 'op' => 'pool_exists']);
+
+        if (! $probe->ok) {
+            return $this->readCache[$path] = null;
+        }
+
+        $result = $this->serverOps->run(['cat', $path], ['feature' => 'php', 'op' => 'pool_read'], timeout: 30);
+
+        return $this->readCache[$path] = $result->failed() ? null : $result->output();
+    }
+
+    /**
+     * The open_basedir the pool file on disk actually sets, or null when the
+     * file does not exist or does not set one.
+     *
+     * Read rather than derived: someone can hand-edit the pool, or put their own
+     * `php_admin_value[open_basedir]` in the additional-directives box, where it lands after ours
+     * and wins. Deriving would report a restriction PHP is not applying.
+     */
+    public function liveOpenBasedir(Application $application): ?string
+    {
+        $path = $this->livePoolPath($application);
+
+        if ($path === null) {
+            return null;
+        }
+
+        $contents = $this->read($path);
+
+        if ($contents === null) {
+            return null;
+        }
+
+        // Resolved the way FPM resolves it: within one kind the first line wins (fpm_conf prepends
+        // each to its list, so the first written is the last applied), and php_admin_value beats
+        // php_value wherever it sits. `php_value` is matched too, as a config the panel did not
+        // write may use it.
+        preg_match_all(
+            '/^\s*php_(admin_)?value\s*\[\s*open_basedir\s*\]\s*=\s*(.+?)\s*$/mi',
+            $contents,
+            $matches,
+            PREG_SET_ORDER,
+        );
+
+        $admin = array_values(array_filter($matches, fn (array $m): bool => $m[1] !== ''));
+        $winner = $admin[0] ?? $matches[0] ?? null;
+        $value = $winner === null ? null : trim($winner[2]);
+
+        return ($value === null || $value === '') ? null : $value;
+    }
+
+    /**
+     * Take over an open_basedir that was already on the box.
+     *
+     * A server migrated from another panel has real values in its pool files, and the settings row
+     * that replaces them starts empty, so writing our own pool would silently drop a restriction
+     * the owner set. Read what is there, subtract the paths we supply ourselves, and keep the
+     * remainder as the user's own.
+     *
+     * Runs once, when the panel takes ownership of a site's pool; after that the row is
+     * authoritative and the file is its artefact.
+     *
+     * @return array{adopted: bool, kept: array<int, string>, dropped: array<int, string>}
+     */
+    public function adoptOpenBasedir(Application $application, ApplicationPhpSettings $settings): array
+    {
+        $none = ['adopted' => false, 'kept' => [], 'dropped' => []];
+
+        // Already answered by the user — never overwrite a real choice with
+        // whatever a previous panel happened to leave on disk.
+        if ($settings->getAttribute('open_basedir_paths') !== null || $settings->open_basedir_enabled) {
+            return $none;
+        }
+
+        $live = $this->liveOpenBasedir($application);
+
+        if ($live === null) {
+            // A pool that was already there and restricted nothing stays unrestricted, recorded as
+            // a choice: the open_basedir default is for sites this panel creates, and switching it
+            // on while taking over a working site would break it.
+            $existing = $this->livePoolPath($application);
+
+            if ($existing !== null && $this->read($existing) !== null) {
+                $settings->open_basedir_enabled = false;
+                $settings->application_id = $application->id;
+                $settings->save();
+            }
+
+            return $none;
+        }
+
+        $ours = array_map('trim', explode(':', $this->openBasedir($application, '')));
+        $shared = array_map(
+            fn (string $path): string => rtrim($path, '/'),
+            (array) config('server.shared_session_dirs', []),
+        );
+
+        $kept = [];
+        $dropped = [];
+
+        foreach (explode(':', $live) as $path) {
+            $path = trim($path);
+
+            if ($path === '' || in_array($path, $ours, true)) {
+                continue;
+            }
+
+            // A server-wide session directory is not carried over: it would hand this site read
+            // access to every other site's sessions (its own is already in the base paths).
+            if (in_array(rtrim($path, '/'), $shared, true)) {
+                $dropped[] = $path;
+
+                continue;
+            }
+
+            $kept[] = $path;
+        }
+
+        $settings->open_basedir_enabled = true;
+        $settings->open_basedir_paths = $kept === [] ? null : implode(':', $kept);
+        $settings->application_id = $application->id;
+        $settings->save();
+
+        Log::channel('server-ops')->info('adopted an existing open_basedir', [
+            'feature' => 'php',
+            'op' => 'open_basedir_adopt',
+            'application' => $application->id,
+            'kept' => $kept,
+            'dropped' => $dropped,
+        ]);
+
+        return ['adopted' => true, 'kept' => $kept, 'dropped' => $dropped];
+    }
+
+    /**
+     * The pool file that actually serves this site, whatever it is called.
+     *
+     * `poolPath()` builds a name from the panel's own slug, which is wrong for a site the panel
+     * did not create (a migrated box names pools its own way). So: try our name first, then look
+     * for a pool that declares this site's Linux user, the one property a pool cannot fake (it is
+     * what FPM drops privileges to).
+     */
+    public function livePoolPath(Application $application): ?string
+    {
+        $ours = $this->poolPath($application);
+
+        if ($ours !== null && $this->readable($ours)) {
+            return $ours;
+        }
+
+        $username = $application->systemUser?->username;
+
+        if ($username === null || $ours === null) {
+            return null;
+        }
+
+        $directory = dirname($ours);
+
+        $listing = $this->serverOps->run(
+            ['find', $directory, '-maxdepth', '1', '-type', 'f'],
+            ['feature' => 'php', 'op' => 'locate_pool', 'application' => $application->id],
+            timeout: 30,
+        );
+
+        if ($listing->failed()) {
+            return null;
+        }
+
+        foreach (preg_split('/\r?\n/', trim($listing->output())) ?: [] as $candidate) {
+            $candidate = trim($candidate);
+
+            if ($candidate === '') {
+                continue;
+            }
+
+            $contents = $this->read($candidate);
+
+            if ($contents === null) {
+                continue;
+            }
+
+            // `user = <name>` is what the pool runs as. Matched on its own
+            // line so a path that merely contains the username elsewhere in
+            // the file cannot claim the pool.
+            if (preg_match('/^\s*user\s*=\s*'.preg_quote($username, '/').'\s*$/m', $contents)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * A pool file's contents, memoized. Public so the sync discoverer reads
+     * through the same cache rather than shelling out for the same bytes a
+     * second time on the same request.
+     */
+    public function readPool(string $path): ?string
+    {
+        return $this->read($path);
+    }
+
+    private function readable(string $path): bool
+    {
+        return $this->read($path) !== null;
+    }
+
+    /**
+     * What we would set if the user turned this on and added nothing.
+     *
+     * Offered as a starting point when open_basedir is off, so the screen can show the value. It
+     * is the bare minimum the site needs, not a guess at what it might want.
+     */
+    public function recommendedOpenBasedir(Application $application): string
+    {
+        return $this->openBasedir($application, '');
+    }
+
+    /**
+     * The full open_basedir value: what the site always needs, plus whatever
+     * the user added.
+     *
+     * The first three are not negotiable: the app root (PHP reads its own code), the session
+     * directory (otherwise every login stops working), and /tmp (where uploads land).
+     *
+     * The session directory is this site's own, under its app root. Naming a shared one such as
+     * `/var/lib/php/sessions` would let every site read every other site's session files, which is
+     * the isolation per-app pools exist to provide.
+     *
+     * Empty entries are dropped: a trailing colon leaves an empty path component, and what PHP
+     * does with one is version dependent.
+     */
+    public function openBasedirFor(Application $application, ApplicationPhpSettings $settings): ?string
+    {
+        $effective = $settings->effective();
+
+        return $effective['open_basedir_enabled']
+            ? $this->openBasedir($application, (string) ($effective['open_basedir_paths'] ?? ''))
+            : null;
+    }
+
+    private function openBasedir(Application $application, string $extra): string
+    {
+        $paths = array_merge(
+            [$this->appRoot($application), $this->sessionPath($application), '/tmp'],
+            preg_split('/[:\n,]+/', $extra) ?: [],
+        );
+
+        $paths = array_values(array_unique(array_filter(array_map('trim', $paths), fn (string $p): bool => $p !== '')));
+
+        return implode(':', $paths);
+    }
+
+    /**
+     * The app's own root — deliberately NOT the document root.
+     *
+     * Sessions and the PHP error log must sit outside the directory the web
+     * server serves, or they are downloadable.
+     */
+    private function appRoot(Application $application): string
+    {
+        return $application->rootPath();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function context(Application $application, string $op): array
+    {
+        return ['feature' => 'php', 'op' => $op, 'application' => $application->id];
+    }
+}

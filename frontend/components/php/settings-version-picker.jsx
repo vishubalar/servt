@@ -1,0 +1,47 @@
+"use client";
+
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useTranslations } from "next-intl";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useUnsaved } from "@/components/ui/unsaved-guard";
+import { Badge } from "@/components/ui/badge";
+
+export function SettingsVersionPicker({ versions, selected }) {
+  const t = useTranslations("php");
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const { guardNavigation } = useUnsaved();
+
+  function pick(version) {
+    if (version === selected) return;
+    const params = new URLSearchParams(searchParams);
+    params.set("version", version);
+    const href = `${pathname}?${params.toString()}`;
+    if (!guardNavigation(href)) router.push(href, { scroll: false });
+  }
+
+  return (
+    <Select value={selected} onValueChange={pick}>
+      <SelectTrigger
+        className="h-9 w-auto min-w-44 gap-2 bg-card shadow-e1 dark:bg-card"
+        aria-label={t("versions.pickerLabel")}
+      >
+        <span className="text-xs text-muted-foreground">{t("table.colVersion")}</span>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent align="end">
+        {versions.map((version) => (
+          <SelectItem key={version.version} value={version.version}>
+            {t("versions.name", { version: version.version })}
+            {version.is_default ? (
+              <Badge variant="muted" className="font-normal">
+                {t("versions.default")}
+              </Badge>
+            ) : null}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}

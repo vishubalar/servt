@@ -1,0 +1,291 @@
+<?php
+
+return [
+
+    'accepted' => ':attribute を承認してください。',
+    'accepted_if' => ':other が :value の場合、:attribute を承認してください。',
+    'active_url' => ':attribute は有効なURLではありません。',
+    'after' => ':attribute には :date より後の日付を指定してください。',
+    'after_or_equal' => ':attribute には :date 以降の日付を指定してください。',
+    'alpha' => ':attribute には文字のみを使用してください。',
+    'alpha_dash' => ':attribute には文字、数字、ハイフン、アンダースコアのみを使用してください。',
+    'alpha_num' => ':attribute には文字と数字のみを使用してください。',
+    'array' => ':attribute は配列でなければなりません。',
+    'ascii' => ':attribute には半角の英数字と記号のみを使用してください。',
+    'before' => ':attribute には :date より前の日付を指定してください。',
+    'before_or_equal' => ':attribute には :date 以前の日付を指定してください。',
+    'between' => [
+        'array' => ':attribute の項目数は :min 個から :max 個の間でなければなりません。',
+        'file' => ':attribute のファイルサイズは :min KBから :max KBの間でなければなりません。',
+        'numeric' => ':attribute は :min から :max の間でなければなりません。',
+        'string' => ':attribute は :min 文字から :max 文字の間でなければなりません。',
+    ],
+    'boolean' => ':attribute は true または false でなければなりません。',
+    'can' => ':attribute に許可されていない値が含まれています。',
+    'confirmed' => ':attribute の確認が一致しません。',
+    'current_password' => 'パスワードが正しくありません。',
+    'date' => ':attribute は有効な日付ではありません。',
+    'date_equals' => ':attribute は :date と同じ日付でなければなりません。',
+    'date_format' => ':attribute は :format 形式と一致しません。',
+    'decimal' => ':attribute には小数点以下 :decimal 桁を指定してください。',
+    'declined' => ':attribute を拒否してください。',
+    'declined_if' => ':other が :value の場合、:attribute を拒否してください。',
+    'different' => ':attribute と :other は異なる値でなければなりません。',
+    'digits' => ':attribute は :digits 桁でなければなりません。',
+    'digits_between' => ':attribute は :min 桁から :max 桁の間でなければなりません。',
+    'dimensions' => ':attribute の画像サイズが無効です。',
+    'distinct' => ':attribute に重複した値があります。',
+    'doesnt_end_with' => ':attribute は次のいずれかで終わってはいけません: :values。',
+    'doesnt_start_with' => ':attribute は次のいずれかで始まってはいけません: :values。',
+    'email' => ':attribute は有効なメールアドレスではありません。',
+    'ends_with' => ':attribute は次のいずれかで終わる必要があります: :values。',
+    'enum' => '選択された :attribute は無効です。',
+    'exists' => '選択された :attribute は無効です。',
+    'extensions' => ':attribute は次のいずれかの拡張子でなければなりません: :values。',
+    'file' => ':attribute はファイルでなければなりません。',
+    'filled' => ':attribute は必須です。',
+    'gt' => [
+        'array' => ':attribute の項目数は :value 個より多くなければなりません。',
+        'file' => ':attribute のファイルサイズは :value KBより大きくなければなりません。',
+        'numeric' => ':attribute は :value より大きくなければなりません。',
+        'string' => ':attribute は :value 文字より長くなければなりません。',
+    ],
+    'gte' => [
+        'array' => ':attribute の項目数は :value 個以上でなければなりません。',
+        'file' => ':attribute のファイルサイズは :value KB以上でなければなりません。',
+        'numeric' => ':attribute は :value 以上でなければなりません。',
+        'string' => ':attribute は :value 文字以上でなければなりません。',
+    ],
+    'hex_color' => ':attribute は有効な16進数カラーコードでなければなりません。',
+    'image' => ':attribute は画像でなければなりません。',
+    'in' => '選択された :attribute は無効です。',
+    'in_array' => ':attribute は :other に存在しなければなりません。',
+    'integer' => ':attribute は整数でなければなりません。',
+    'ip' => ':attribute は有効なIPアドレスでなければなりません。',
+    'ipv4' => ':attribute は有効なIPv4アドレスでなければなりません。',
+    'ipv6' => ':attribute は有効なIPv6アドレスでなければなりません。',
+    'json' => ':attribute は有効なJSON文字列でなければなりません。',
+    'lowercase' => ':attribute は小文字でなければなりません。',
+    'lt' => [
+        'array' => ':attribute の項目数は :value 個より少なくなければなりません。',
+        'file' => ':attribute のファイルサイズは :value KBより小さくなければなりません。',
+        'numeric' => ':attribute は :value より小さくなければなりません。',
+        'string' => ':attribute は :value 文字より短くなければなりません。',
+    ],
+    'lte' => [
+        'array' => ':attribute の項目数は :value 個以下でなければなりません。',
+        'file' => ':attribute のファイルサイズは :value KB以下でなければなりません。',
+        'numeric' => ':attribute は :value 以下でなければなりません。',
+        'string' => ':attribute は :value 文字以下でなければなりません。',
+    ],
+    'mac_address' => ':attribute は有効なMACアドレスでなければなりません。',
+    'max' => [
+        'array' => ':attribute の項目数は :max 個以下でなければなりません。',
+        'file' => ':attribute のファイルサイズは :max KB以下でなければなりません。',
+        'numeric' => ':attribute は :max 以下でなければなりません。',
+        'string' => ':attribute は :max 文字以下でなければなりません。',
+    ],
+    'max_digits' => ':attribute は :max 桁以下でなければなりません。',
+    'mimes' => ':attribute は次のタイプのファイルでなければなりません: :values。',
+    'mimetypes' => ':attribute は次のタイプのファイルでなければなりません: :values。',
+    'min' => [
+        'array' => ':attribute の項目数は :min 個以上でなければなりません。',
+        'file' => ':attribute のファイルサイズは :min KB以上でなければなりません。',
+        'numeric' => ':attribute は :min 以上でなければなりません。',
+        'string' => ':attribute は :min 文字以上でなければなりません。',
+    ],
+    'min_digits' => ':attribute は :min 桁以上でなければなりません。',
+    'missing' => ':attribute は存在してはいけません。',
+    'missing_if' => ':other が :value の場合、:attribute は存在してはいけません。',
+    'missing_unless' => ':other が :value でない限り、:attribute は存在してはいけません。',
+    'missing_with' => ':values が存在する場合、:attribute は存在してはいけません。',
+    'missing_with_all' => ':values が存在する場合、:attribute は存在してはいけません。',
+    'multiple_of' => ':attribute は :value の倍数でなければなりません。',
+    'not_in' => '選択された :attribute は無効です。',
+    'not_regex' => ':attribute の形式が無効です。',
+    'numeric' => ':attribute は数値でなければなりません。',
+    'password' => [
+        'letters' => ':attribute には少なくとも1文字の文字を含めてください。',
+        'mixed' => ':attribute には少なくとも1文字の大文字と小文字を含めてください。',
+        'numbers' => ':attribute には少なくとも1つの数字を含めてください。',
+        'symbols' => ':attribute には少なくとも1つの記号を含めてください。',
+        'uncompromised' => '指定された :attribute はデータ漏洩に含まれています。別の :attribute を選択してください。',
+    ],
+    'present' => ':attribute は存在しなければなりません。',
+    'present_if' => ':other が :value の場合、:attribute は存在しなければなりません。',
+    'present_unless' => ':other が :value でない限り、:attribute は存在しなければなりません。',
+    'present_with' => ':values が存在する場合、:attribute は存在しなければなりません。',
+    'present_with_all' => ':values が存在する場合、:attribute は存在しなければなりません。',
+    'prohibited' => ':attribute は禁止されています。',
+    'prohibited_if' => ':other が :value の場合、:attribute は禁止されています。',
+    'prohibited_unless' => ':other が :values でない限り、:attribute は禁止されています。',
+    'prohibits' => ':attribute が存在すると :other は使用できません。',
+    'regex' => ':attribute の形式が無効です。',
+    'required' => ':attribute は必須です。',
+    'required_array_keys' => ':attribute には :values のエントリを含める必要があります。',
+    'required_if' => ':other が :value の場合、:attribute は必須です。',
+    'required_if_accepted' => ':other が承認された場合、:attribute は必須です。',
+    'required_unless' => ':other が :values でない限り、:attribute は必須です。',
+    'required_with' => ':values が存在する場合、:attribute は必須です。',
+    'required_with_all' => ':values が存在する場合、:attribute は必須です。',
+    'required_without' => ':values が存在しない場合、:attribute は必須です。',
+    'required_without_all' => ':values のいずれも存在しない場合、:attribute は必須です。',
+    'same' => ':attribute と :other は一致しなければなりません。',
+    'size' => [
+        'array' => ':attribute の項目数は :size 個でなければなりません。',
+        'file' => ':attribute のファイルサイズは :size KBでなければなりません。',
+        'numeric' => ':attribute は :size でなければなりません。',
+        'string' => ':attribute は :size 文字でなければなりません。',
+    ],
+    'starts_with' => ':attribute は次のいずれかで始まる必要があります: :values。',
+    'string' => ':attribute は文字列でなければなりません。',
+    'timezone' => ':attribute は有効なタイムゾーンでなければなりません。',
+    'unique' => ':attribute はすでに使用されています。別の値を選んでください。',
+    'uploaded' => ':attribute のアップロードに失敗しました。',
+    'uppercase' => ':attribute は大文字でなければなりません。',
+    'url' => ':attribute は有効なURLでなければなりません。',
+    'ulid' => ':attribute は有効なULIDでなければなりません。',
+    'uuid' => ':attribute は有効なUUIDでなければなりません。',
+
+    'any_of' => ':attribute が無効です。',
+    'base64' => ':attribute は有効なBase64文字列でなければなりません。',
+    'contains' => ':attribute に必須の値が不足しています。',
+    'doesnt_contain' => ':attribute には次のいずれの値も含めてはいけません: :values。',
+    'encoding' => ':attribute は :encoding でエンコードされていなければなりません。',
+    'in_array_keys' => ':attribute には次のキーのうち少なくとも1つを含める必要があります: :values。',
+    'list' => ':attribute はリストでなければなりません。',
+    'prohibited_if_accepted' => ':other が承認された場合、:attribute は禁止されています。',
+    'prohibited_if_declined' => ':other が拒否された場合、:attribute は禁止されています。',
+    'required_if_declined' => ':other が拒否された場合、:attribute は必須です。',
+
+    'custom' => [
+
+        // Docker accepts a CPU quota larger than the machine and silently
+        // clamps it, so the refusal has to come from here — and it names what
+        // the server actually has rather than saying "invalid".
+        'cpu_limit' => [
+            'format' => 'CPU 数を、小数点以下 2 桁までで指定してください — 1、1.5、0.5。',
+            'positive' => 'Docker が受け付ける最小の CPU 制限は :minimum です。制限なしにする場合は空欄のままにしてください。',
+            'too_many' => 'このサーバーの CPU は :cores 個で、これを超えて要求するコンテナは Docker が起動しません。:cores 以下を指定してください。',
+        ],
+
+        'memory_limit' => [
+            'format' => '単位付きのサイズを指定してください — 512m や 2g。単位のない数値は Docker にはバイトとして扱われ、メガバイトではありません。',
+            'too_small' => 'メモリが 6m 未満のコンテナは Docker が起動しません。',
+        ],
+
+        // A registry address Docker cannot interpret is silently IGNORED at
+        // pull time — the credential simply never applies and the error is
+        // identical to having none. So these are refusals at the form, and each
+        // one names the specific mistake rather than saying "invalid".
+        'registry' => [
+            'empty' => 'レジストリのアドレスを入力してください — Docker Hub なら `docker.io`、ほかに `ghcr.io` や自前のホストです。',
+            'path' => 'それは名前空間かリポジトリのように見えます。レジストリではありません。ホストだけを入力してください — `ghcr.io/your-org` ではなく `ghcr.io` です。',
+            'credentials' => 'アドレスにユーザー名やパスワードを含めないでください。ホストだけを入力し、認証情報は下のフィールドに入れてください。',
+            'host' => 'レジストリのアドレスではありません。ホスト名を、必要ならポートも付けて入力してください — `registry.example.com` または `registry.example.com:5000`。',
+            'port' => 'ポートは 1 から 65535 の間でなければなりません。',
+        ],
+        'attribute-name' => [
+            'rule-name' => 'custom-message',
+        ],
+
+        // Laravel's default reads "The docker network new field prohibits docker
+        // network from being present" — raw attribute names at a user.
+        'docker_network_new' => [
+            'prohibits' => 'リストからネットワークを選ぶか、新しい名前を入力するかのどちらかにしてください。両方はできません。同じ問いに対する2つの答えです。',
+        ],
+
+        'volume_path' => [
+            'required_with' => 'このボリュームをコンテナ内のどこに置くか、パスを指定してください。例: /var/lib/mysql',
+        ],
+
+        'volume_new' => [
+            'required_with' => '作成するボリュームの名前を入力してください。不要な場合はパスを空にしてください。',
+        ],
+    ],
+
+    // i18n-v: the web firewall's own words for what it refuses.
+    'waf_exception_characters' => '例外は /wp-json/ のようなパスの一部です。「..」「?」や改行は使えません。',
+    'waf_rule_characters' => 'カスタムルールは制御文字を含まない 1 行で指定してください。',
+
+    // FS-B6: an application admin password's policy, named.
+    'admin_password_strength' => 'パスワードには小文字、大文字、数字、記号をそれぞれ含めてください。',
+    'admin_password_strength_no_symbol' => 'パスワードには小文字、大文字、数字をそれぞれ含めてください。',
+
+    'attributes' => [
+        'system_user.username' => 'ユーザー名',
+        'system_user.password' => 'パスワード',
+        'name' => '名前',
+        'username' => 'ユーザー名',
+        'password' => 'パスワード',
+        'current_password' => '現在のパスワード',
+        'role' => 'ロール',
+        'label' => 'ラベル',
+        'exceptions.*' => '例外',
+        'custom_rules.*' => 'カスタムルール',
+        'create_user.username' => 'データベースユーザー名',
+        'create_user.password' => 'データベースユーザーのパスワード',
+        'create_user.host' => 'リモートアドレス',
+        'create_user.connection_preference' => '接続の種類',
+    ],
+
+    'start_command_shell' => '起動コマンドに「:token」は使えません。シェルを介さず直接実行されます。',
+    'process_instances_entrypoint' => '複数のプロセスを実行するには、起動コマンドでスクリプトを指定してください（例: 「node server.js」）。PM2 はそのファイルを fork してクラスタ化するため、それ以外を指定すると警告なくプロセスが 1 つだけ実行されます。',
+    'start_command_wrapper' => 'アプリはエントリファイル（例:「node server.js」）で起動してください。:binary では実際のプロセスがフォークされ、シグナルが届きません。',
+
+    'port_in_use_by_app' => 'ポート :port はこのサーバーの別のアプリケーションが使用中です。',
+
+    // A network the panel created, named by a site that will join it.
+    'docker_network_invalid' => 'ネットワーク名は英数字で始め、その後は英数字、ドット、ハイフン、アンダースコアを使用してください。',
+    'docker_network_missing' => 'このサーバーに \':name\' という Docker ネットワークはありません。このページを読み込んだあとに削除された可能性があります。',
+
+    // Mounting a panel-created volume into a container site.
+    'docker_volume_invalid' => 'ボリューム名は英数字で始め、その後は英数字、ドット、ハイフン、アンダースコアを使用してください。',
+    'docker_volume_missing' => 'このサーバーに \':name\' という Docker ボリュームはありません。このページを読み込んだあとに削除された可能性があります。',
+    'docker_mount_duplicate' => '2 つのボリュームを :path にマウントできません。Docker はどちらか一方だけを残し、どちらかは示しません。',
+    'docker_mount_root' => 'コンテナ内のパスを指定してください。例: /var/lib/mysql',
+    'docker_mount_site_root' => 'そのパスにはアプリケーション自身のファイルがマウントされています (:path)。ここにボリュームを置くとコンテナから見えなくなります。ファイルはサーバー上に残りますが、アプリケーションは空のボリュームを配信します。',
+    'docker_mount_reserved' => ':path はコンテナが起動するイメージの一部です。空のボリュームで覆うと、コンテナは起動できません。',
+    'docker_mount_characters' => '英字、数字、ドット、ハイフン、アンダースコア、スラッシュのみを使い、/ で始めてください。例: /var/lib/mysql',
+
+    // A name the panel is about to create, so the inverse rule: not taken.
+    'docker_network_taken' => '\':name\' という名前のネットワークはこのサーバーに既に存在します。2つ目を作成せず、上のリストから選択してください。',
+    'docker_volume_taken' => '\':name\' という名前のボリュームはこのサーバーに既に存在します。2つ目を作成せず、アプリケーションのコンテナカードから既存のものをマウントしてください。',
+    'node_version_unsupported' => ':type アプリケーションは Node :range で動作します。その範囲内のバージョンを選んでください。範囲外ではアプリケーションが起動を拒否し、アプリケーションは何も配信しません。',
+    'php_version_unsupported' => ':type アプリケーションは PHP :range で動作します。その範囲内のバージョンを選んでください。範囲外ではインストールがアプリケーション自身のコードの途中で失敗し、後片付けの必要なアプリケーションが残ります。',
+    'php_version_default_unsupported' => ':type アプリケーションは PHP :range で動作します。この欄を空のままにするとサーバーの既定値 (:default) が使われますが、これは範囲外です。範囲内のバージョンを選んでください。',
+    'web_root_fixed' => ':type は :web_root から配信され、そのパスを前提にインストールされます。ここでウェブルートは変更できません。他の値にするとアプリケーションにアクセスできなくなり、ソースが公開されます。',
+    'web_root_missing' => 'フォルダー :path は存在しないため、アプリケーションが配信するものがありません。先にフォルダーを作成するかファイルをアップロードしてから、ウェブルートに設定してください。',
+    'web_root_symlink' => 'そのパスの一部 :path はシンボリックリンクのため、アプリケーションが別の場所のファイルを配信してしまう可能性があります。アプリケーション内の実際のフォルダーを指定してください。',
+    'port_in_use' => 'このサーバーでは既に何かがポート :port をリッスンしています。別のポートを選ぶか、使用中のものを停止してください。',
+
+    'port_registered' => 'ポート :port は通常 :service が使用します。このサーバーで何も使っていなければ、そのまま使用できます。',
+    'application_name_immutable' => 'アプリケーション名は作成後は変更できません。サーバー上の設定ファイル名になるためです。別の名前が必要な場合は新しいアプリケーションを作成してください。',
+    'application_domain_use_endpoint' => 'ドメインは Domains ページ (/applications/{id}/domains) で変更してください。Web サーバーの設定と証明書もあわせて更新されます。',
+    'site_name_taken_pool' => 'このサーバーには、パネルが作成したものではない「:name.conf」という PHP プールファイルがすでにあります。別の名前を選んでください。',
+    'site_name_taken_vhost' => 'このサーバーには、パネルが作成したものではない「:name」というウェブサーバー設定がすでにあります（パネル自身の設定もその一つです）。別の名前を選んでください。',
+    'site_name_taken_vhost_order' => 'このサーバーでは「:name」という名前のサイトは Apache の既定サイトより前に並び、未知のすべてのドメインに応答してしまいます。英字、または 0 以外の数字で始まる名前を選んでください。',
+
+    'webhook_secret_min' => 'Webhook のシークレットは 16 文字以上で入力してください。',
+
+    // Per-app fail2ban thresholds
+    'fail2ban.validation.maxretry_min' => '少なくとも 1 回の失敗でブロックする必要があります。',
+    'fail2ban.validation.maxretry_max' => '100 回を超える失敗後にはブロックできません。',
+    'fail2ban.validation.findtime_min' => '集計期間は 60 秒以上である必要があります。',
+    'fail2ban.validation.findtime_max' => '集計期間は 24 時間（86400 秒）を超えられません。',
+    'fail2ban.validation.bantime_min' => 'ブロック時間は 0 秒以上である必要があります（無期限ブロックも可）。',
+    'fail2ban.validation.bantime_max' => 'ブロック時間は 7 日（604800 秒）を超えられません。',
+    'ip_or_cidr' => '有効な IP アドレス（例: 1.2.3.4）または CIDR 表記（例: 10.0.0.0/8）である必要があります。',
+
+    'jail_content_required' => 'jail 設定は必須です。',
+    'jail_content_string' => 'jail 設定はテキストである必要があります。',
+    'jail_content_max' => 'jail 設定が大きすぎます（最大 65535 文字）。',
+    'filter_content_required' => 'フィルター設定は必須です。',
+    'filter_content_string' => 'フィルター設定はテキストである必要があります。',
+    'filter_content_max' => 'フィルター設定が大きすぎます（最大 65535 文字）。',
+    'basic_auth_conflicts' => 'パスワード保護は :type では使用できません。:type の画面は Authorization ヘッダーで認証しますが、HTTP はこのヘッダーをリクエストごとに1つしか許可しません。Basic 認証がそれを占有するとアプリケーションに到達できなくなります。:type はすでに独自の認証情報を必要とします。',
+    'basic_auth_username' => 'ユーザー名には英字、数字、記号のみ使用できます（スペースとコロン (:) は不可）。ブラウザーはそれ以外の文字を確実に送信できません。',
+    'git_repository_unreachable' => 'リポジトリにアクセスできませんでした。アドレスと、アカウント（公開リポジトリの場合はリポジトリ）がアクセスを許可しているか確認してください。',
+    'git_host_unreachable' => 'サーバーが Git ホストに接続できませんでした。ネットワーク接続を確認して、もう一度お試しください。',
+    'git_branch_missing' => 'ブランチ ":branch" はこのリポジトリに存在しません。',
+];

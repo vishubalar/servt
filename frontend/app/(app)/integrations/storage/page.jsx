@@ -1,0 +1,46 @@
+import { getTranslations } from "next-intl/server";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import { getStorageDestinations } from "@/lib/storage/get-storage";
+import { getBackupDestinationUsage } from "@/lib/backups/get-backups";
+import { usageByDestination } from "@/lib/storage/usage";
+import { DestinationsCard } from "@/components/integrations/storage/destinations-card";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PageHeader } from "@/components/ui/page-header";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata() {
+  const t = await getTranslations("storage");
+  return { title: t("title") };
+}
+
+export default async function StorageIntegrationsPage() {
+  const [permissions, t, list, backups] = await Promise.all([
+    getPermissions(),
+    getTranslations("storage"),
+    getStorageDestinations(),
+    getBackupDestinationUsage().catch(() => ({ failed: true })),
+  ]);
+
+  if (!can(permissions, "storage", "view")) return <PermissionDenied title={t("title")} />;
+  const canManage = can(permissions, "storage", "manage");
+
+  if (list.failed) return <LoadFailed description={t("loadFailed")} status={list.status} failure={list.failure} message={list.message} debug={list.debug} />;
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("title")} />
+      <div >
+        <DestinationsCard
+          destinations={list.destinations}
+          canManage={canManage}
+          oauthRedirectUri={list.oauthRedirectUri}
+          localSettings={list.localSettings}
+          usage={usageByDestination(backups)}
+        />
+      </div>
+    </div>
+  );
+}

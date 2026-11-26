@@ -1,0 +1,31 @@
+<?php
+
+return [
+
+    'policies' => [
+        'legacy_v7' => [
+            'title' => 'Blocage IA hérité de v7',
+            'description' => 'Conserve la liste étendue des robots de v7 et son exception pour YandexBot.',
+        ],
+        'allow_all' => [
+            'title' => 'Autoriser tous les robots IA',
+            'description' => 'Aucun robot d\'indexation IA n\'est bloqué.',
+        ],
+        'block_training' => [
+            'title' => 'Bloquer les robots d\'entraînement IA',
+            'description' => 'Arrête les robots qui aspirent votre contenu pour entraîner des modèles d\'IA. Les moteurs de recherche IA qui vous envoient des visiteurs, comme la recherche ChatGPT et Perplexity, continuent de fonctionner.',
+        ],
+        'block_agents' => [
+            'title' => 'Bloquer l\'entraînement IA et les assistants IA',
+            'description' => 'Arrête les robots d\'entraînement et les assistants IA qui récupèrent vos pages une par une. Les moteurs de recherche IA peuvent toujours vous indexer, vous gardez donc vos citations dans les réponses IA.',
+        ],
+        'block_all' => [
+            'title' => 'Bloquer tous les robots IA',
+            'description' => 'Bloque tous les robots IA connus, y compris ceux qui vous envoient du trafic depuis les résultats de recherche IA.',
+        ],
+    ],
+
+    'robots_txt' => [
+        'note' => 'Google (Gemini) et Apple entraînent leur IA sur les pages récupérées par leurs robots de recherche habituels : aucun blocage de bot ne peut l\'empêcher sans vous retirer aussi des résultats de recherche. Pour refuser leur entraînement IA, ajoutez ces lignes au robots.txt de votre application :',
+    ],
+];

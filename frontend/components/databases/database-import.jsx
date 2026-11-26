@@ -1,0 +1,475 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "@/components/ui/app-link";
+import { useFormatter, useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { Check, Circle, Download, FileText, FileUp, Loader2, Play, ShieldCheck, Trash2, TriangleAlert, UploadCloud } from "lucide-react";
+import { deleteImport, getImports, startImport, uploadAndStartImport } from "@/lib/api/databases";
+import { importSchema, importsResponseSchema } from "@/lib/schemas/database";
+import { IMPORT_IN_FLIGHT, IMPORT_STEPS, engineMismatch, hasImportAccount, importFormat, importStage } from "@/lib/databases/import-formats";
+import { formatBytes } from "@/lib/format/bytes";
+import { apiMessage } from "@/lib/api/error-message";
+import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Caution } from "@/components/ui/caution";
+import { Checkbox } from "@/components/ui/checkbox";
+import { CardIcon } from "@/components/ui/card-icon";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Progress } from "@/components/ui/progress";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useWatchUnsaved } from "@/components/ui/unsaved-guard";
+import { SizeText } from "@/components/ui/size-text";
+import { localizeSizeText } from "@/lib/format/bytes";
+
+const POLL_MS = 2500;
+const HISTORY_SHOWN = 3;
+
+const UNTOUCHED = ["wrong_format", "client_command", "truncated", "unreadable", "backup_failed", "no_account", "database_missing", "abandoned"];
+
+const FAMILY_NAME = { sql: "MySQL / MariaDB", pgsql: "PostgreSQL", mongo: "MongoDB" };
+
+const TONE = { completed: "success", failed: "destructive", running: "muted", queued: "muted", uploading: "muted" };
+
+export function DatabaseImport({ database, imports: initial = [], exports = [], canManage, unavailable = null }) {
+  const t = useTranslations("databases.import");
+  const tDb = useTranslations("databases");
+  const format = useFormatter();
+  const router = useRouter();
+  const inputRef = useRef(null);
+  const controllerRef = useRef(null);
+  const [polled, setPolled] = useState(null);
+  const [seenInitial, setSeenInitial] = useState(initial);
+  if (seenInitial !== initial) {
+    setSeenInitial(initial);
+    setPolled(null);
+  }
+  const [dragOver, setDragOver] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const [chosen, setChosen] = useState(null);
+  const [safetyCopy, setSafetyCopy] = useState(true);
+  const safetyChoiceRef = useRef(new Map());
+  const [upload, setUpload] = useState(null);
+  const [busyRow, setBusyRow] = useState(null);
+  const [removing, setRemoving] = useState(null);
+  const watchingRef = useRef(null);
+
+  const rows = polled ?? initial;
+  const running = rows.find((row) => IMPORT_IN_FLIGHT.includes(row.status)) ?? null;
+  const formats = importFormat(database);
+  const runningId = running?.id ?? null;
+
+  useWatchUnsaved("database-import", upload !== null);
+
+  useEffect(() => {
+    if (runningId === null) return;
+    const controller = new AbortController();
+    const id = setInterval(async () => {
+      try {
+        const { data } = await getImports(database.id, { signal: controller.signal });
+        const parsed = importsResponseSchema.safeParse(data);
+        if (!parsed.success) return;
+        setPolled(parsed.data.imports);
+
+        const row = parsed.data.imports.find((r) => r.id === watchingRef.current);
+        if (row && (row.status === "completed" || row.status === "failed")) {
+          watchingRef.current = null;
+          if (row.status === "completed") toast.success(t("completed", { file: row.file_name ?? "", name: database.name }));
+          else toast.error(row.message ?? t("failedFallback"));
+          router.refresh();
+        }
+      } catch {
+        // retry on the next poll
+      }
+    }, POLL_MS);
+    return () => {
+      controller.abort();
+      clearInterval(id);
+    };
+  }, [runningId, database.id, database.name, router, t]);
+
+  const noAccount = !hasImportAccount(database);
+  const blocked = !canManage
+    ? DENIED
+    : unavailable
+      ? t("engineDown", { engine: unavailable })
+      : noAccount
+        ? t("noAccount")
+        : running || upload
+          ? t("busy")
+          : null;
+
+  function choose(files) {
+    const file = files?.[0];
+    if (!file || blocked) return;
+    setSafetyCopy(true);
+    setChosen(file);
+  }
+
+  async function run() {
+    const file = chosen;
+    const withCopy = safetyCopy;
+    setChosen(null);
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setUpload({ file, progress: 0, safetyCopy: withCopy });
+    try {
+      const { data } = await uploadAndStartImport(database.id, file, {
+        signal: controller.signal,
+        safetyCopy: withCopy,
+        onProgress: (progress) => setUpload({ file, progress, safetyCopy: withCopy }),
+        onBegun: (id) => {
+          watchingRef.current = id;
+          safetyChoiceRef.current.set(id, withCopy);
+        },
+      });
+      const parsed = importSchema.safeParse(data?.import);
+      if (parsed.success) setPolled((current) => [parsed.data, ...(current ?? initial).filter((r) => r.id !== parsed.data.id)]);
+      toast.success(t("started"));
+    } catch (error) {
+      if (controller.signal.aborted) {
+        toast.message(t("cancelled"));
+        watchingRef.current = null;
+      } else {
+        toast.error(apiMessage(error, t("uploadFailed")));
+      }
+      router.refresh();
+    } finally {
+      controllerRef.current = null;
+      setUpload(null);
+    }
+  }
+
+  async function startAgain(row) {
+    setBusyRow(row.id);
+    try {
+      const { data } = await startImport(database.id, row.id, { safetyCopy: safetyChoiceRef.current.get(row.id) ?? true });
+      const parsed = importSchema.safeParse(data?.import);
+      if (parsed.success) setPolled((current) => (current ?? initial).map((r) => (r.id === row.id ? parsed.data : r)));
+      watchingRef.current = row.id;
+      toast.success(t("started"));
+    } catch (error) {
+      toast.error(apiMessage(error, t("startFailed")));
+    } finally {
+      setBusyRow(null);
+    }
+  }
+
+  async function remove() {
+    const row = removing;
+    setBusyRow(row.id);
+    try {
+      await deleteImport(database.id, row.id);
+      setPolled((current) => (current ?? initial).filter((r) => r.id !== row.id));
+      setRemoving(null);
+      toast.success(t("removed"));
+    } catch (error) {
+      toast.error(apiMessage(error, t("removeFailed")));
+    } finally {
+      setBusyRow(null);
+    }
+  }
+
+  const stage = upload ? "uploading" : importStage(running);
+  const skipsCopy = upload ? upload.safetyCopy === false : running?.safety_copy === false;
+  const steps = skipsCopy ? IMPORT_STEPS.filter((step) => step !== "backing_up") : IMPORT_STEPS;
+  const activeFile = upload?.file.name ?? running?.file_name ?? "";
+  const activeSize = upload ? formatBytes(upload.file.size, format) : localizeSizeText(running?.size_human ?? "", format);
+  const history = rows.filter((row) => row.id !== running?.id);
+  const mismatch = chosen ? engineMismatch(chosen.name, database) : null;
+  const backupFor = (row) => {
+    if (!canManage || !row.safety_export_id) return null;
+    const found = exports.find((e) => e.id === row.safety_export_id);
+    return found?.status === "completed" && found.available && found.download_url ? found.download_url : null;
+  };
+
+  if (!canManage && !stage && history.length === 0) return null;
+
+  return (
+    <>
+      <Card className="gap-0 overflow-hidden py-0">
+        <div className="flex flex-wrap items-center gap-3 border-b px-5 py-3.5">
+          <CardIcon icon={FileUp} />
+          <div className="min-w-48 flex-1">
+            <h2 className="text-[15px] font-semibold tracking-tight">{t("title")}</h2>
+            <p className="text-sm text-muted-foreground">{t("description")}</p>
+          </div>
+        </div>
+
+        <CardContent className="space-y-4 px-5 py-4">
+          {stage ? (
+            <div className="space-y-3 rounded-xl border bg-muted/30 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="min-w-0 text-sm">
+                  <span className="font-mono font-medium break-all">{activeFile}</span>{" "}
+                  <span className="text-muted-foreground tabular-nums">{activeSize}</span>
+                </p>
+                {upload ? (
+                  <Button variant="outline" size="sm" onClick={() => controllerRef.current?.abort()}>
+                    {t("cancelUpload")}
+                  </Button>
+                ) : null}
+              </div>
+
+              <ol className={cn("grid gap-2", steps.length === 4 ? "sm:grid-cols-4" : "sm:grid-cols-3")}>
+                {steps.map((step, index) => {
+                  const current = steps.indexOf(stage);
+                  const state = index < current ? "done" : index === current ? "current" : "next";
+                  return (
+                    <li key={step} className={cn("flex items-center gap-2 text-sm", state === "next" && "text-muted-foreground")}>
+                      {state === "done" ? (
+                        <Check className="size-4 shrink-0 text-success" aria-hidden />
+                      ) : state === "current" ? (
+                        <Loader2 className="size-4 shrink-0 animate-spin text-primary" aria-hidden />
+                      ) : (
+                        <Circle className="size-4 shrink-0" aria-hidden />
+                      )}
+                      <span className={cn(state === "current" && "font-medium")}>
+                        {step === "importing" && running?.step === "rolling_back" ? t("rollingBack") : t(`steps.${step}`)}
+                        {step === "uploading" && upload ? ` ${Math.round(upload.progress * 100)}%` : ""}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ol>
+
+              {upload ? <Progress value={Math.round(upload.progress * 100)} aria-label={t("steps.uploading")} /> : null}
+
+              <p className="text-xs text-muted-foreground">{upload ? t("keepOpen") : t("serverNote")}</p>
+            </div>
+          ) : !canManage ? null : (
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (!blocked) setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                choose(e.dataTransfer.files);
+              }}
+              className={cn(
+                "flex flex-wrap items-center gap-3 rounded-xl border-2 border-dashed px-4 py-3 transition-colors",
+                blocked && "opacity-60",
+                dragOver && "border-primary bg-primary/5",
+              )}
+            >
+              <UploadCloud className="size-5 shrink-0 text-muted-foreground" aria-hidden />
+              <div className="min-w-48 flex-1">
+                <p className="text-sm font-medium">{t("drop")}</p>
+                <p className="text-xs text-muted-foreground">{t(`formats.${formats.key}`)}</p>
+              </div>
+              <ReasonTooltip reason={blocked}>
+                <Button variant="outline" size="sm" disabled={Boolean(blocked)} onClick={() => inputRef.current?.click()}>
+                  <FileUp className="size-4" />
+                  {t("choose")}
+                </Button>
+              </ReasonTooltip>
+              <input
+                ref={inputRef}
+                type="file"
+                accept={formats.accept}
+                className="hidden"
+                tabIndex={-1}
+                onChange={(e) => {
+                  choose(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+          )}
+
+          {noAccount && canManage && !unavailable ? (
+            <Caution
+              size="md"
+              action={
+                <Button asChild variant="outline" size="sm" className="h-8">
+                  <Link href={`/databases/${database.id}?tab=users`} prefetch={false}>
+                    {t("openUsers")}
+                  </Link>
+                </Button>
+              }
+            >
+              <p>{t("noAccount")}</p>
+            </Caution>
+          ) : null}
+
+          {history.length ? (
+            <div className="space-y-2">
+              <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">{t("history")}</p>
+              <div className="divide-y rounded-xl border">
+                {(showAll ? history : history.slice(0, HISTORY_SHOWN)).map((row) => (
+                  <ImportRow
+                    key={row.id}
+                    row={row}
+                    canManage={canManage}
+                    busy={busyRow === row.id}
+                    canStart={canManage && !running && !upload && row.status === "uploading" && row.received_bytes === row.size_bytes}
+                    onStart={() => startAgain(row)}
+                    onRemove={() => setRemoving(row)}
+                    backup={backupFor(row)}
+                  />
+                ))}
+              </div>
+              {history.length > HISTORY_SHOWN ? (
+                <Button variant="link" size="sm" className="h-auto px-0" onClick={() => setShowAll((v) => !v)}>
+                  {showAll ? t("showLess") : t("showAll", { count: history.length })}
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+        </CardContent>
+
+        <div className="border-t bg-muted/30 px-5 py-3">
+          <p className="text-xs leading-relaxed text-muted-foreground">{t("backupNote")}</p>
+        </div>
+      </Card>
+
+      <ConfirmDialog
+        open={chosen !== null}
+        onOpenChange={(next) => !next && setChosen(null)}
+        icon={TriangleAlert}
+        tone="destructive"
+        confirmVariant="destructive"
+        title={t("confirmTitle", { name: database.name })}
+        description={t("confirmDescription")}
+        cancelLabel={t("cancel")}
+        confirmLabel={t("confirmLabel")}
+        onConfirm={run}
+      >
+        {chosen ? (
+          <>
+            <div className="flex items-start gap-3 rounded-lg border bg-muted/40 px-3 py-2.5">
+              <FileText className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
+              <div className="min-w-0">
+                <p className="font-mono text-sm break-all">{chosen.name}</p>
+                <p className="text-xs text-muted-foreground tabular-nums">{formatBytes(chosen.size, format)}</p>
+              </div>
+            </div>
+            {mismatch ? (
+              <p className="flex items-start gap-2 text-sm text-warning">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />
+                {t("mismatch", { fileEngine: FAMILY_NAME[mismatch], engine: tDb(`engines.${database.engine}`) })}
+              </p>
+            ) : null}
+            <label htmlFor="import-safety-copy" className="flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5">
+              <Checkbox
+                id="import-safety-copy"
+                className="mt-0.5"
+                checked={safetyCopy}
+                onCheckedChange={(value) => setSafetyCopy(value === true)}
+              />
+              <span className="min-w-0 space-y-0.5">
+                <span className="block text-sm font-medium">{t("safetyCopy")}</span>
+                {safetyCopy ? (
+                  <span className="flex items-start gap-1.5 text-xs text-muted-foreground">
+                    <ShieldCheck className="mt-px size-3.5 shrink-0 text-success" aria-hidden />
+                    {t("confirmSafety")}
+                  </span>
+                ) : null}
+              </span>
+            </label>
+            {!safetyCopy ? (
+              <Caution tone="destructive" size="md">
+                <p>{t("noSafetyCopyWarning")}</p>
+              </Caution>
+            ) : null}
+          </>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={removing !== null}
+        onOpenChange={(next) => !next && setRemoving(null)}
+        icon={Trash2}
+        tone="destructive"
+        title={t("removeTitle")}
+        description={t("removeDescription")}
+        cancelLabel={t("cancel")}
+        confirmLabel={t("remove")}
+        pending={removing !== null && busyRow === removing.id}
+        onConfirm={remove}
+      />
+    </>
+  );
+}
+
+function ImportRow({ row, canManage, busy, canStart, onStart, onRemove, backup = null }) {
+  const t = useTranslations("databases.import");
+  const safe = row.restored || UNTOUCHED.includes(row.reason);
+
+  return (
+    <div className="flex items-start justify-between gap-3 px-4 py-3">
+      <div className="min-w-0 space-y-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={TONE[row.status] ?? "muted"} className="font-normal">
+            {t(`status.${row.status}`)}
+          </Badge>
+          <span className="min-w-0 font-mono text-sm break-all">{row.file_name}</span>
+          {row.size_human ? <span className="text-sm tabular-nums text-muted-foreground"><SizeText value={row.size_human} /></span> : null}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {[
+            row.requested_by ? t("by", { user: row.requested_by.username }) : null,
+            row.finished_at_human ?? row.created_at_human,
+            row.status !== "uploading" && row.safety_copy != null ? t(row.safety_copy ? "withCopy" : "withoutCopy") : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </p>
+        {row.status === "uploading" && row.received_bytes !== row.size_bytes ? (
+          <p className="text-xs text-muted-foreground">{t("uploadUnfinished")}</p>
+        ) : null}
+        {row.status === "failed" ? (
+          <p className={cn("text-xs leading-relaxed", safe ? "text-warning" : "text-destructive")}>
+            {row.message ?? t("failedFallback")}
+            {row.reference ? <span className="mt-0.5 block font-mono break-all">{row.reference}</span> : null}
+          </p>
+        ) : null}
+      </div>
+
+      <div className="flex shrink-0 items-center gap-1">
+        {backup ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button asChild variant="ghost" size="icon" className="size-8">
+                <a href={backup} download aria-label={t("backupDownload")}>
+                  <Download className="size-4" />
+                </a>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("backupDownload")}</TooltipContent>
+          </Tooltip>
+        ) : null}
+        {canStart ? (
+          <Button size="sm" variant="outline" onClick={onStart} disabled={busy}>
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
+            {t("startAgain")}
+          </Button>
+        ) : null}
+        {canManage && !IMPORT_IN_FLIGHT.includes(row.status) ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={t("remove")}
+                className="size-8 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                onClick={onRemove}
+                disabled={busy}
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("remove")}</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </div>
+    </div>
+  );
+}

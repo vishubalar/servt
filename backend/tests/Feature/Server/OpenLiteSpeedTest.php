@@ -1,0 +1,1681 @@
+<?php
+
+use App\Contracts\PhpStack;
+use App\Exceptions\Server\Php\PhpConfigException;
+use App\Exceptions\Server\WebServer\OlsListenerNotFoundException;
+use App\Models\Application;
+use App\Models\ApplicationPhpSettings;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Applications\SiteTypeManager;
+use App\Services\Server\Capabilities\ServerCapabilities;
+use App\Services\Server\Php\PhpExtensionManager;
+use App\Services\Server\Php\PhpOverview;
+use App\Services\Server\Php\PhpStackManager;
+use App\Services\Server\Php\PhpVersionManager;
+use App\Services\Server\Php\Stacks\LsphpPhpStack;
+use App\Services\Server\Runtimes\PhpRuntime;
+use App\Services\Server\WebServers\OlsDriver;
+use App\Services\Server\WebServers\OlsSharedConfig;
+use App\Services\Server\WebServers\WebServerManager;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Sleep;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+
+/**
+ * OpenLiteSpeed support.
+ *
+ * Verified against the *shape* of OLS's configuration, not a running OLS server: these prove the
+ * dangerous logic (rebuilding the shared config, and the order in which files and shared entries
+ * change), not that the paths are right.
+ */
+beforeEach(function () {
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'ols',
+        'web_server' => 'openlitespeed',
+        // Node too, so the catalog assertions below are about the web server
+        // rather than about a runtime this fixture happens to lack.
+        'capabilities' => ['php' => true, 'node' => true],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    $this->lsws = sys_get_temp_dir().'/sv-oss-lsws-'.getmypid();
+    File::deleteDirectory($this->lsws);
+    File::makeDirectory($this->lsws.'/lsphp84/etc/php/8.4/litespeed', 0755, true);
+    File::makeDirectory($this->lsws.'/lsphp84/bin', 0755, true);
+    // Both binaries, because the panel probes for them rather than assuming.
+    File::put($this->lsws.'/lsphp84/bin/php', '');
+    File::put($this->lsws.'/lsphp84/bin/lsphp', '');
+
+    config([
+        'server.php_stacks.lsphp.dir' => $this->lsws,
+        'server.web_server_drivers.openlitespeed.shared_config' => '/usr/local/lsws/conf/httpd_config.conf',
+    ]);
+});
+
+afterEach(fn () => File::deleteDirectory($this->lsws));
+
+/**
+ * A shared config with content the panel does not own, on both sides of where
+ * its regions go.
+ */
+function olsConfig(string $managed = ''): string
+{
+    return <<<CONF
+    serverName                SomeServer
+    user                      nobody
+
+    listener Default {
+      address                 *:80
+      secure                  0
+    {$managed}}
+
+    # A hand-written virtual host the operator added themselves.
+    virtualHost legacy {
+      configFile              \$SERVER_ROOT/conf/vhosts/legacy/vhconf.conf
+    }
+    CONF;
+}
+
+/**
+ * A fake filesystem keyed by path.
+ *
+ * Keyed because `apply()` writes the vhost file *and* the shared config; a "last thing written"
+ * fake would hand the driver its own vhost back when it reads httpd_config.conf.
+ */
+function fakeOls(string $config, bool $testPasses = true, bool $tlsFallbackPresent = true): ArrayObject
+{
+    $runs = new ArrayObject;
+    $files = new ArrayObject([sharedPath() => $config]);
+
+    Process::fake(function ($process) use ($runs, $files, $testPasses, $tlsFallbackPresent) {
+        $runs[] = ['command' => $process->command, 'input' => (string) $process->input];
+        $command = $process->command;
+        $path = (string) ($command[1] ?? '');
+
+        // `test -s <cert> -a -s <key>`: whether the shared TLS-reject pair is on disk. Answered
+        // explicitly because a secure listener is only written when it is.
+        if (($command[0] ?? '') === 'test') {
+            return Process::result(exitCode: $tlsFallbackPresent ? 0 : 1);
+        }
+
+        if (($command[0] ?? '') === 'cat') {
+            return Process::result(output: $files[$path] ?? '');
+        }
+
+        if (($command[0] ?? '') === 'tee') {
+            $files[$path] = (string) $process->input;
+
+            return Process::result(output: '');
+        }
+
+        if (($command[0] ?? '') === 'cp') {
+            $files[(string) $command[3]] = $files[(string) $command[2]] ?? '';
+
+            return Process::result(output: '');
+        }
+
+        // Matches the config test (`openlitespeed -t`) and the restart (`lswsctrl restart`): the
+        // fake must follow the real command names or a passing test proves nothing ran.
+        if (str_contains((string) ($command[0] ?? ''), '/lsws/bin/')) {
+            // Exit 2 with the reason on *stdout*, like a real failing `openlitespeed -t` (exit 1
+            // means "warnings, nothing wrong", not refusal).
+            return $testPasses
+                ? Process::result(output: 'ok')
+                : Process::result(output: "[ERROR] [config:vhost:shop] invalid directive\n", exitCode: 2);
+        }
+
+        return Process::result(output: '');
+    });
+
+    test()->files = $files;
+
+    return $runs;
+}
+
+function sharedPath(): string
+{
+    return '/usr/local/lsws/conf/httpd_config.conf';
+}
+
+function sharedConfig(): string
+{
+    return test()->files[sharedPath()] ?? '';
+}
+
+describe('the shared httpd_config.conf', function () {
+    it('registers a site as a virtualHost block and a listener map', function () {
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test', 'www.shop.test'], '/home/shopuser/shop.test');
+
+        expect(sharedConfig())
+            ->toContain('virtualHost shop.test {')
+            ->toContain('map                     shop.test shop.test, www.shop.test');
+    });
+
+    /*
+     * A map inside the panel's markers with no virtualHost block says nothing about where the
+     * site lives; rendering it with an empty root (`vhRoot /`) passes the config test but breaks
+     * the next change once the site's config names a log under $VH_ROOT.
+     */
+    it('refuses to rebuild when a site in its maps has no known directory, and changes nothing', function () {
+        $orphan = "  ### BEGIN panel-managed maps — do not edit between these markers\n"
+            ."  map                     brownsite brown.test\n"
+            ."  ### END panel-managed maps\n";
+        $runs = fakeOls(olsConfig($orphan));
+        $before = sharedConfig();
+
+        $result = app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect($result->ok)->toBeFalse()
+            ->and($result->reference)->not->toBe('')
+            ->and(sharedConfig())->toBe($before)
+            ->and(collect($runs)->contains(fn (array $r) => ($r['command'][0] ?? '') === 'tee'))->toBeFalse();
+    });
+
+    it('creates a secure listener when the server has none', function () {
+        // OLS binds certificates to a listener, not a vhost. A fresh install has no secure
+        // listener, so issuing a certificate on an HTTP panel wrote `vhssl` with nothing on 443.
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(sharedConfig())
+            ->toContain('listener Defaultssl {')
+            ->toContain('address                 *:443')
+            ->toContain('secure                  1')
+            // The shared TLS-reject pair, the same one a vhost with no
+            // certificate of its own names. A listener certificate is only the
+            // SNI fallback; each site overrides it in `vhssl`.
+            ->toContain('.panel-tls-reject.crt')
+            ->toContain('.panel-tls-reject.key');
+    });
+
+    it('maps the site into the secure listener it just created', function () {
+        // A listener with no map serves nothing — the site would still be
+        // unreachable on 443, which is the bug this is here to prevent.
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        $ssl = substr(sharedConfig(), (int) strpos(sharedConfig(), 'listener Defaultssl {'));
+
+        expect($ssl)->toContain('map                     shop.test shop.test');
+    });
+
+    it('leaves a secure listener the operator already has alone', function () {
+        // A box that has one has it for a reason: their own certificate, a
+        // different port, a listener the panel did not make. Same rule as
+        // install.sh — create only when absent, never rewrite.
+        $existing = olsConfig()."\n\nlistener Defaultssl {\n  address                 *:443\n  secure                  1\n  keyFile                 /etc/ssl/theirs.key\n  certFile                /etc/ssl/theirs.crt\n}\n";
+
+        fakeOls($existing);
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(sharedConfig())
+            ->toContain('/etc/ssl/theirs.crt')
+            ->not->toContain('.panel-tls-reject.crt')
+            ->and(substr_count(sharedConfig(), 'listener Defaultssl {'))->toBe(1);
+    });
+
+    it('does not create a listener naming a key pair that is not on disk', function () {
+        // A secure listener pointing at missing files stops OpenLiteSpeed from starting at all,
+        // taking every site with it; `openlitespeed -t` can pass such a config, so this cannot
+        // be left to the config test.
+        fakeOls(olsConfig(), tlsFallbackPresent: false);
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(sharedConfig())
+            ->not->toContain('listener Defaultssl {')
+            // …and the site is still registered on plain HTTP: refusing it for lack of TLS
+            // material would be worse.
+            ->toContain('virtualHost shop.test {');
+    });
+
+    it('does not create a secure listener while removing a site', function () {
+        // Changing what the server binds as a side effect of a deletion is
+        // not something a user asked for.
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->unregister('shop.test');
+
+        expect(sharedConfig())->not->toContain('listener Defaultssl {');
+    });
+
+    it('never touches anything outside its markers', function () {
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        // Users migrate real servers into this panel with hand-written config
+        // in this file. Losing it would be unforgivable.
+        expect(sharedConfig())
+            ->toContain('# A hand-written virtual host the operator added themselves.')
+            ->toContain('virtualHost legacy {')
+            ->toContain('serverName                SomeServer')
+            ->toContain('address                 *:80');
+    });
+
+    it('puts the map inside the listener block, where it is legal', function () {
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        $config = sharedConfig();
+        $listener = strpos($config, 'listener Default {');
+        $map = strpos($config, 'map                     shop.test');
+        $close = strpos($config, "\n}", $listener);
+
+        expect($map)->toBeGreaterThan($listener)->toBeLessThan($close);
+    });
+
+    it('is idempotent — registering twice leaves one block, not two', function () {
+        fakeOls(olsConfig());
+        $shared = app(OlsSharedConfig::class);
+
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        // The region is rebuilt rather than appended to, so a re-provision
+        // cannot duplicate a site.
+        file_put_contents('/tmp/out.conf', sharedConfig());
+        expect(substr_count(sharedConfig(), 'virtualHost shop.test {'))->toBe(1);
+    });
+
+    it('takes over an entry the old panel left outside the markers', function () {
+        /*
+         * Migration: a box that ran the old panel already has `virtualHost <site>` and `map <site>`
+         * in httpd_config.conf, written before these markers existed. `sites()` reads only the
+         * managed regions, so registering the site would add a second definition beside the first
+         * — two `virtualHost` blocks for one name in the file every site depends on.
+         */
+        $migrated = <<<'CONF'
+        serverName                SomeServer
+
+        listener Default {
+          address                 *:80
+          map                     shop.test shop.test
+        }
+
+        virtualHost shop.test {
+          vhRoot                  /home/shopuser/shop.test/
+          configFile              /etc/sureshcloud-ols/shop.test/main.conf
+        }
+
+        # A hand-written virtual host the operator added themselves.
+        virtualHost legacy {
+          configFile              $SERVER_ROOT/conf/vhosts/legacy/vhconf.conf
+        }
+        CONF;
+
+        fakeOls($migrated);
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(substr_count(sharedConfig(), 'virtualHost shop.test {'))->toBe(1)
+            // Two maps, not one: a site is mapped into the plain listener and
+            // the secure one. The old panel's single unmanaged map is gone, and
+            // both of these sit inside managed regions.
+            ->and(substr_count(sharedConfig(), 'map                     shop.test'))->toBe(2)
+            // The inherited block was absorbed, not left beside ours: its
+            // configFile named the old panel's path and no longer appears.
+            ->and(sharedConfig())->not->toContain('/etc/sureshcloud-ols/shop.test/main.conf')
+            ->and(sharedConfig())->toContain('### BEGIN panel-managed virtual hosts')
+            // And somebody else's config is still none of our business.
+            ->and(sharedConfig())->toContain('virtualHost legacy {');
+    });
+
+    it('refuses to take over a vhost that is not a site', function (string $name, string $root) {
+        /*
+         * The other side of the takeover: a site created as `panel` absorbed the panel's own
+         * `virtualHost panel` and both its maps. A name cannot tell a site from the server's own
+         * vhosts; where it is rooted can — a site's vhRoot is its folder, install.sh roots the
+         * panel in the config directory, and OpenLiteSpeed's sample uses a relative path.
+         */
+        $original = <<<CONF
+        serverName                SomeServer
+
+        listener Default {
+          address                 *:80
+          map                     {$name} {$name}.example.test
+        }
+
+        virtualHost {$name} {
+          vhRoot                  {$root}
+          configFile              \$SERVER_ROOT/conf/vhosts/{$name}/vhconf.conf
+        }
+        CONF;
+
+        fakeOls($original);
+
+        $result = app(OlsSharedConfig::class)->register($name, ['qa.example.test'], '/home/shopuser/'.$name);
+
+        expect($result->ok)->toBeFalse()
+            ->and($result->reference)->not->toBeNull()
+            // Not touched at all — the server's own entry, and its map, as
+            // they were.
+            ->and(sharedConfig())->toBe($original)
+            ->and(app(OlsSharedConfig::class)->ownedByServer($name))->toBeTrue();
+    })->with([
+        'the panel, rooted in the config directory' => ['panel', '/usr/local/lsws/conf/vhosts/panel/'],
+        'OpenLiteSpeed\'s sample, rooted relatively' => ['Example', 'Example/'],
+    ]);
+
+    it('still counts a migrated site, rooted in its own folder, as a site', function () {
+        fakeOls(<<<'CONF'
+        virtualHost shop.test {
+          vhRoot                  /home/shopuser/shop.test/
+          configFile              /etc/sureshcloud-ols/shop.test/main.conf
+        }
+        CONF);
+
+        // The takeover test above depends on this answering false; pinned on
+        // its own so a guard widened by mistake fails here, by name.
+        expect(app(OlsSharedConfig::class)->ownedByServer('shop.test'))->toBeFalse();
+    });
+
+    it('points vhRoot at the site, not at the config directory', function () {
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        // With `restrained 1` the vhost may only reach files under vhRoot. Rooted at the config
+        // directory, the document root sits outside that tree and every request is refused.
+        expect(sharedConfig())
+            ->toContain('vhRoot                  /home/shopuser/shop.test/')
+            ->toContain('configFile              /usr/local/lsws/conf/vhosts/shop.test/vhconf.conf');
+    });
+
+    it('preserves another site vhRoot when rebuilding the region', function () {
+        fakeOls(olsConfig());
+        $shared = app(OlsSharedConfig::class);
+
+        $shared->register('blog.test', ['blog.test'], '/home/bloguser/blog.test');
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        // The region is rebuilt on every change, so each site's root has to be
+        // read back out rather than regenerated from a default — otherwise
+        // adding one site silently moves another.
+        expect(sharedConfig())->toContain('vhRoot                  /home/bloguser/blog.test/');
+    });
+
+    it('keeps other managed sites when one is removed', function () {
+        fakeOls(olsConfig());
+        $shared = app(OlsSharedConfig::class);
+
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+        $shared->register('blog.test', ['blog.test'], '/home/bloguser/blog.test');
+        $shared->unregister('shop.test');
+
+        expect(sharedConfig())
+            ->not->toContain('virtualHost shop.test {')
+            ->not->toContain('map                     shop.test')
+            ->toContain('virtualHost blog.test {')
+            ->toContain('map                     blog.test');
+    });
+
+    it('removes both the block and the map, not just one', function () {
+        fakeOls(olsConfig());
+        $shared = app(OlsSharedConfig::class);
+
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+        $shared->unregister('shop.test');
+
+        // A leftover map pointing at a gone virtualHost fails config_test and
+        // blocks every later reload — for every site, not just this one.
+        expect(sharedConfig())->not->toContain('shop.test');
+    });
+
+    it('restores the whole file when the config test fails', function () {
+        $runs = fakeOls(olsConfig(), testPasses: false);
+
+        $result = app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        $commands = collect($runs)->pluck('command');
+
+        expect($result->failed())->toBeTrue()
+            // Backed up before writing, and put back after the test failed. A
+            // broken shared config surviving to the next reload takes the
+            // whole box down.
+            ->and($commands)->toContain(['cp', '-f', '/usr/local/lsws/conf/httpd_config.conf', '/usr/local/lsws/conf/httpd_config.conf.panel-bak'])
+            ->and($commands)->toContain(['cp', '-f', '/usr/local/lsws/conf/httpd_config.conf.panel-bak', '/usr/local/lsws/conf/httpd_config.conf']);
+    });
+
+    it('removes its copy once the new file passed its test, and keeps it on a failure (2026-10-29)', function () {
+        $runs = fakeOls(olsConfig());
+
+        expect(app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test')->failed())->toBeFalse()
+            ->and(collect($runs)->pluck('command'))->toContain(['rm', '-f', '--', sharedPath().'.panel-bak']);
+
+        $runs = fakeOls(olsConfig(), testPasses: false);
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(collect($runs)->pluck('command'))->not->toContain(['rm', '-f', '--', sharedPath().'.panel-bak']);
+    });
+
+    it('does not write at all when nothing would change', function () {
+        $runs = fakeOls(olsConfig());
+        $shared = app(OlsSharedConfig::class);
+
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+        $runs->exchangeArray([]);
+        $shared->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        // No reason to rewrite a file every site depends on to say the same
+        // thing again.
+        expect(collect($runs)->pluck('command')->map(fn ($c) => $c[0] ?? ''))
+            ->not->toContain('tee');
+    });
+
+    it('keeps regex metacharacters in paths intact', function () {
+        // `$1` and `\1` are backreferences in a replacement string. vhost_root is operator-set
+        // config, so it can contain them; preg_replace would eat them silently.
+        config(['server.web_server_drivers.openlitespeed.vhost_root' => '/srv/$1/vhosts']);
+        fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(sharedConfig())->toContain('/srv/$1/vhosts/shop.test/vhconf.conf');
+    });
+
+    it('restores the file when the write itself fails, not just the test', function () {
+        $runs = fakeOls(olsConfig());
+        $original = sharedConfig();
+
+        // tee truncates before writing, so a failed write leaves the file
+        // empty — with the backup sitting right there unused.
+        Process::fake(function ($process) use ($runs, $original) {
+            $runs[] = ['command' => $process->command, 'input' => (string) $process->input];
+
+            return match ($process->command[0] ?? '') {
+                'cat' => Process::result(output: $original),
+                'tee' => Process::result(output: '', errorOutput: 'No space left on device', exitCode: 1),
+                default => Process::result(output: ''),
+            };
+        });
+
+        $result = app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect($result->failed())->toBeTrue()
+            ->and(collect($runs)->pluck('command'))
+            ->toContain(['cp', '-f', sharedPath().'.panel-bak', sharedPath()]);
+    });
+
+    it('finds the listener closing brace by counting, not by column', function () {
+        // A hand-written config that indents its closing brace would otherwise
+        // send the search into the next block, where `map` is illegal.
+        fakeOls("listener Default {\n  address *:80\n  }\n\nvirtualHost legacy {\n  vhRoot /x/\n}\n");
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        $config = sharedConfig();
+        $map = strpos($config, 'map                     shop.test');
+
+        expect($map)->toBeLessThan(strpos($config, 'virtualHost legacy'));
+    });
+
+    it('refuses when there is no listener to map into', function () {
+        fakeOls("serverName Nothing\nuser nobody\n");
+
+        // Inventing a listener means guessing an address and port — either a
+        // no-op or a hijack of one something else owns.
+        expect(fn () => app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test'))
+            ->toThrow(OlsListenerNotFoundException::class);
+    });
+});
+
+describe('the driver', function () {
+    beforeEach(function () {
+        $user = SystemUser::create([
+            'username' => 'shopuser', 'home_path' => '/home/shopuser',
+            'shell' => '/bin/bash', 'sudo' => false,
+        ]);
+
+        $this->app_ = Application::forceCreate([
+            'system_user_id' => $user->id, 'name' => 'Shop',
+            'slug' => 'shop', 'domain' => 'shop.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'web_root' => '/',
+            'status' => 'pending', 'php_version' => '8.4',
+        ]);
+    });
+
+    it('writes Basic Auth in the syntax OpenLiteSpeed accepts', function (string $profile) {
+        // OLS rejects a `userNameSeparator` line ("Not support [usernameseparator :]"), which
+        // failed the config test and rolled back every attempt to switch protection on.
+        $this->app_->forceFill([
+            'serving_profile' => $profile,
+            'site_type' => $profile === 'node' ? 'n8n' : 'wordpress',
+            'app_port' => $profile === 'node' ? 5678 : null,
+            'basic_auth_enabled' => true,
+            'basic_auth_username' => 'qa',
+        ])->save();
+
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh('systemUser'), '/home/shopuser/shop/public_html');
+
+        $vhost = collect($runs)->last(fn (array $run) => $run['command'][0] === 'tee'
+            && str_contains($run['command'][1], 'vhosts/shop/vhconf.conf'))['input'];
+
+        $realm = 'sv-app-'.$this->app_->id;
+
+        expect($vhost)->not->toMatch('/^\s*userNameSeparator/mi')
+            ->and($vhost)->toMatch('/^\s*realm\s+'.$realm.'$/m')
+            ->and($vhost)->toMatch('/^\s*authName\s+Restricted$/m')
+            ->and($vhost)->toMatch('/^realm '.$realm.' \{\n  userDB \{\n    location\s+\/home\/shopuser\/shop\/conf\/openlitespeed\/\.htpasswd\n  \}\n\}/m');
+    })->with(['php', 'static', 'node']);
+
+    /*
+     * OLS rotates a site's access and error logs itself and the panel's logrotate policy leaves
+     * them alone, so the vhost is the only place that says how long rotated copies stay. Without
+     * keepDays OLS keeps every rotated error log; v7 kept 30 days of both.
+     */
+    it('keeps rotated logs for 30 days and compresses old access logs', function (string $profile, bool $waf) {
+        $this->app_->forceFill([
+            'serving_profile' => $profile,
+            'site_type' => $profile === 'node' ? 'n8n' : 'wordpress',
+            'app_port' => $profile === 'node' ? 5678 : null,
+            'waf_enabled' => $waf,
+        ])->save();
+
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh('systemUser'), '/home/shopuser/shop/public_html');
+
+        $vhost = collect($runs)->last(fn (array $run) => $run['command'][0] === 'tee'
+            && str_contains($run['command'][1], 'vhosts/shop/vhconf.conf'))['input'];
+
+        preg_match('/^errorlog \S+ \{\n(.*?)\n\}/ms', $vhost, $error);
+        preg_match('/^accesslog \S+ \{\n(.*?)\n\}/ms', $vhost, $access);
+
+        expect($error[1] ?? '')->toMatch('/^\s*keepDays\s+30$/m')
+            ->toMatch('/^\s*logLevel\s+WARN$/m')
+            // As v7: only old access logs are compressed.
+            ->not->toMatch('/compressArchive/')
+            ->and($access[1] ?? '')->toMatch('/^\s*keepDays\s+30$/m')
+            ->toMatch('/^\s*compressArchive\s+1$/m');
+    })->with(['php', 'static', 'node'])->with(['waf off' => false, 'waf on' => true]);
+
+    it('writes nothing for a site whose name is one of the server\'s own vhosts', function () {
+        // The shared config refuses on its own, but by then the site's `vhconf.conf` has been
+        // written into the panel's own vhost folder. So the driver asks first.
+        $this->app_->forceFill(['slug' => 'panel'])->save();
+
+        $runs = fakeOls(<<<'CONF'
+        virtualHost panel {
+          vhRoot                  /usr/local/lsws/conf/vhosts/panel/
+          configFile              /usr/local/lsws/conf/vhosts/panel/vhconf.conf
+        }
+        CONF);
+
+        $result = app(OlsDriver::class)->apply($this->app_->fresh('systemUser'), '/home/shopuser/panel/public_html');
+
+        $writes = collect($runs)->filter(fn (array $run) => in_array($run['command'][0], ['tee', 'mkdir', 'cp'], true));
+
+        expect($result->ok)->toBeFalse()
+            ->and($writes->all())->toBe([]);
+    });
+
+    it('is resolved for a server running OpenLiteSpeed', function () {
+        expect(app(WebServerManager::class)->driver())->toBeInstanceOf(OlsDriver::class);
+    });
+
+    it('puts each site in its own directory', function () {
+        expect(app(OlsDriver::class)->configPath($this->app_))
+            ->toBe('/usr/local/lsws/conf/vhosts/shop/vhconf.conf');
+    });
+
+    it('writes the vhost before registering it in the shared config', function () {
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop.test');
+
+        // Found by the path each step touches, not by the binary it runs: `apply()` issues several
+        // `mkdir`s, `tee`s and `cat`s, so "the first tee" would name the wrong step.
+        $commands = collect($runs)->pluck('command')->map(fn ($c) => implode(' ', $c))->values();
+
+        $siteDir = $commands->search(fn (string $c) => str_starts_with($c, 'mkdir') && str_contains($c, '/vhosts/shop'));
+        $vhost = $commands->search(fn (string $c) => str_starts_with($c, 'tee') && str_contains($c, 'vhconf.conf'));
+        $register = $commands->search(fn (string $c) => str_starts_with($c, 'tee') && str_contains($c, 'httpd_config.conf'));
+
+        // The fallback-certificate existence check may safely happen first.
+        // The site directory and vhost still have to exist before the shared
+        // virtualHost block can point at them — reversing that strands the
+        // whole server, not just this site.
+        expect($siteDir)->not->toBeFalse()
+            ->and($vhost)->not->toBeFalse()
+            ->and($register)->not->toBeFalse()
+            ->and($siteDir)->toBeLessThan($vhost)
+            ->and($vhost)->toBeLessThan($register);
+    });
+
+    it("writes the site's PHP settings as an ini file of its own", function () {
+        // There is no pool on this stack, so nothing else carries these; without it the PHP screen
+        // saved memory_limit and friends with a 200 and applied none of them.
+        ApplicationPhpSettings::create([
+            'application_id' => $this->app_->id,
+            'memory_limit' => '512M',
+            'upload_max_filesize' => '128M',
+            'disable_functions' => 'exec,passthru',
+        ]);
+
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        $ini = test()->files['/home/shopuser/shop/.panel/php/zz-panel.ini'] ?? '';
+
+        expect($ini)
+            ->toContain('memory_limit = 512M')
+            ->toContain('upload_max_filesize = 128M')
+            // The directive `phpIniOverride` cannot set at all — PHP only
+            // honours it from an ini file, which is why this is one.
+            ->toContain('disable_functions = exec,passthru');
+    });
+
+    it('keeps the settings file out of the served directory', function () {
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop/public_html');
+
+        // Above the document root: anything under it is a URL, and this names
+        // the session path and the error log.
+        expect(array_keys((array) test()->files))
+            ->toContain('/home/shopuser/shop/.panel/php/zz-panel.ini')
+            ->not->toContain('/home/shopuser/shop/public_html/zz-panel.ini');
+    });
+
+    it('creates the session directory the ini points at', function () {
+        // The ini named session.save_path and nothing created it. FPM refuses to start a pool
+        // whose session path is missing; LSPHP starts happily and every site dies later at
+        // session_start() with "No such file or directory".
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop/public_html');
+
+        $commands = collect((array) $runs)->pluck('command')->map(
+            fn ($c) => implode(' ', (array) $c),
+        );
+
+        expect($commands)->toContain('mkdir -p /home/shopuser/shop/.panel/sessions')
+            // -h and the mode by its owner: neither may follow a `sessions` that was replaced by
+            // a link.
+            ->toContain('chown -h shopuser:shopuser /home/shopuser/shop/.panel/sessions')
+            // As sensitive as the cookies that name the files in it.
+            ->toContain('runuser -u shopuser -- chmod 0700 /home/shopuser/shop/.panel/sessions');
+    });
+
+    it('hands the site its sessions without handing it its own limits', function () {
+        // Unlike FPM (limits in a pool file under /etc), the limits here live in
+        // .panel/php/zz-panel.ini, so a recursive chown would let a site rewrite its own
+        // disable_functions and open_basedir.
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop/public_html');
+
+        $chowns = collect((array) $runs)
+            ->pluck('command')
+            ->map(fn ($c) => implode(' ', (array) $c))
+            ->filter(fn (string $c) => str_starts_with($c, 'chown'));
+
+        expect($chowns)->not->toContain('chown -R shopuser:shopuser /home/shopuser/shop/.panel');
+
+        foreach ($chowns as $chown) {
+            expect($chown)->not->toContain('/home/shopuser/shop/.panel/php');
+        }
+    });
+
+    it('creates the PHP error log it names, owned by the site', function () {
+        // logs/ is root-owned 0750 with the site as group. On other stacks a root master opens
+        // the file first; lshttpd spawns LSPHP *as* extUser and hands it nothing, so PHP opened
+        // the path itself, was refused, and fell back to stderr: an empty PHP error log viewer.
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop/public_html');
+
+        $commands = collect((array) $runs)->pluck('command')->map(
+            fn ($c) => implode(' ', (array) $c),
+        );
+
+        expect($commands)->toContain('touch /home/shopuser/shop/logs/php-error.log')
+            ->toContain('chown shopuser:shopuser /home/shopuser/shop/logs/php-error.log');
+    });
+
+    it('creates the file without making the log directory writable', function () {
+        // Write permission on a directory is permission to unlink its contents: a site owning
+        // logs/ could swap access.log for a symlink to /etc/cron.d and have root append
+        // attacker-chosen text into it. Owning the one file it already writes gives it nothing.
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop/public_html');
+
+        $chowns = collect((array) $runs)
+            ->pluck('command')
+            ->map(fn ($c) => implode(' ', (array) $c))
+            ->filter(fn (string $c) => str_starts_with($c, 'chown') || str_starts_with($c, 'chmod'));
+
+        foreach ($chowns as $command) {
+            // The directory itself must never be handed over or loosened.
+            expect($command)->not->toBe('chown shopuser:shopuser /home/shopuser/shop/logs')
+                ->and($command)->not->toBe('chmod 0770 /home/shopuser/shop/logs')
+                ->and($command)->not->toBe('chmod 0777 /home/shopuser/shop/logs');
+        }
+    });
+
+    it('adds its ini directory to the default one rather than replacing it', function () {
+        $config = app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop/public_html');
+
+        // The leading colon means "also scan the directory PHP was compiled
+        // with". Without it this REPLACES that directory — where every
+        // extension's ini lives — and the site loses mysqli, curl and opcache.
+        expect($config)->toContain('env                     PHP_INI_SCAN_DIR=:/home/shopuser/shop/.panel/php');
+    });
+
+    it('does not write a settings file for a site that does not run PHP', function () {
+        $this->app_->forceFill(['serving_profile' => 'node', 'php_version' => null])->save();
+
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh(), '/home/shopuser/shop/public_html');
+
+        expect(array_keys((array) test()->files))
+            ->not->toContain('/home/shopuser/shop/.panel/php/zz-panel.ini');
+    });
+
+    it('accepts PHP settings instead of demanding a pool that cannot exist', function () {
+        // The guard asked "does this stack have pools", which is false here, so saving returned
+        // 200 and the server did not move.
+        $this->seed(PermissionSeeder::class);
+        $admin = User::factory()->admin()->create();
+
+        fakeOls(olsConfig());
+
+        $this->withHeaders(['Authorization' => 'Bearer '.$admin->createToken('t')->plainTextToken])
+            ->putJson("/api/applications/{$this->app_->id}/php", ['memory_limit' => '512M'])
+            ->assertSuccessful();
+
+        expect(test()->files['/home/shopuser/shop/.panel/php/zz-panel.ini'] ?? '')
+            ->toContain('memory_limit = 512M');
+    });
+
+    it('names the account the site actually runs as', function () {
+        // `runs_as` was inferred from `isolated_at`, which only the pool feature sets, so every
+        // OpenLiteSpeed site showed as www-data. The vhost names the site's user as `extUser`.
+        $this->seed(PermissionSeeder::class);
+        $admin = User::factory()->admin()->create();
+
+        fakeOls(olsConfig());
+
+        $this->withHeaders(['Authorization' => 'Bearer '.$admin->createToken('t')->plainTextToken])
+            ->getJson("/api/applications/{$this->app_->id}/php")
+            ->assertOk()
+            ->assertJsonPath('php.runs_as', 'shopuser')
+            ->assertJsonPath('php.isolated', true)
+            // …and there is still nothing to switch on: isolation here is a
+            // property of how the vhost is written, not a feature to enable.
+            ->assertJsonPath('php.isolation_supported', false);
+    });
+
+    it('creates the directory the config test writes its verdict into', function () {
+        // `openlitespeed -t` reads {tmp}/testconf back to pick its exit code, and test mode does
+        // not create that directory. With /tmp/lshttpd missing (a rebooted box, or lshttpd never
+        // started) the test exits 0 on any config at all.
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->test();
+
+        $commands = collect($runs)->pluck('command');
+
+        expect($commands)->toContain(['mkdir', '-p', '/tmp/lshttpd']);
+
+        // And before the test, not after it.
+        expect($commands->search(['mkdir', '-p', '/tmp/lshttpd']))
+            ->toBeLessThan($commands->search(['/usr/local/lsws/bin/openlitespeed', '-t']));
+    });
+
+    it('prepares the config test for the shared file too, not only for a vhost', function () {
+        // The rollback in OlsSharedConfig is the last defence for the shared config and used to
+        // run the raw command, so the guard could not fail there either. Both callers go
+        // through OlsConfigCheck now.
+        $runs = fakeOls(olsConfig());
+
+        app(OlsSharedConfig::class)->register('shop.test', ['shop.test'], '/home/shopuser/shop.test');
+
+        expect(collect($runs)->pluck('command'))->toContain(['mkdir', '-p', '/tmp/lshttpd']);
+    });
+
+    it('asks again when the config test is killed by a restart, not by the config', function () {
+        // About six seconds after a graceful restart OpenLiteSpeed kills every `openlitespeed`
+        // process, a running `-t` included.
+        $tests = 0;
+        Process::fake(function ($process) use (&$tests) {
+            if (in_array('/usr/local/lsws/bin/openlitespeed', $process->command, true)) {
+                if (++$tests === 1) {
+                    throw new Symfony\Component\Process\Exception\RuntimeException('The process has been signaled with signal "9".');
+                }
+            }
+
+            return Process::result();
+        });
+        Sleep::fake();
+
+        expect(app(OlsDriver::class)->test()->ok)->toBeTrue()
+            ->and($tests)->toBe(2);
+    });
+
+    it('still fails a config test that keeps being killed', function () {
+        Process::fake(function ($process) {
+            if (in_array('/usr/local/lsws/bin/openlitespeed', $process->command, true)) {
+                throw new Symfony\Component\Process\Exception\RuntimeException('The process has been signaled with signal "9".');
+            }
+
+            return Process::result();
+        });
+        Sleep::fake();
+
+        expect(app(OlsDriver::class)->test()->failed())->toBeTrue();
+    });
+
+    it('fails the config test on an error', function () {
+        fakeOls(olsConfig(), testPasses: false);
+
+        // Exit 2: the error log OLS read back contained `[ERROR]`.
+        expect(app(OlsDriver::class)->test()->failed())->toBeTrue();
+    });
+
+    it('passes the config test on a warning, rather than refusing the site', function () {
+        Process::fake(fn () => Process::result(output: "[WARN] [config] deprecated directive\n", exitCode: 1));
+
+        // Exit 1 means the log had content and none of it was an error. It was unreachable before
+        // the directory above was created; treating it as failure now would be a brand-new refusal
+        // (a deprecation notice would block site creation).
+        $result = app(OlsDriver::class)->test();
+
+        expect($result->failed())->toBeFalse()
+            ->and($result->exitCode())->toBe(1);
+    });
+
+    it('still fails when the test binary cannot be run at all', function () {
+        // sudo refusing, or a missing binary. Not an exit code from OLS, and
+        // must not be read as one.
+        Process::fake(fn () => Process::result(output: '', errorOutput: 'sudo: a password is required', exitCode: 127));
+
+        expect(app(OlsDriver::class)->test()->failed())->toBeTrue();
+    });
+
+    it('unregisters before deleting the files', function () {
+        $runs = fakeOls(olsConfig());
+        $driver = app(OlsDriver::class);
+
+        $driver->apply($this->app_, '/home/shopuser/shop.test');
+        $runs->exchangeArray([]);
+        $driver->remove($this->app_);
+
+        $order = collect($runs)->pluck('command')->map(fn ($c) => $c[0] ?? '')->values()->all();
+
+        // The mirror of apply: stop OLS referring to the site before removing
+        // what it refers to.
+        expect(array_search('cat', $order, true))->toBeLessThan(array_search('rm', $order, true));
+    });
+
+    it('does not delete the vhost files when the shared entry did not go', function () {
+        // The markers are comments, and the OLS WebAdmin console strips comments when it rewrites
+        // the file. The entries then survive outside the region, `unregister()` changes nothing,
+        // and deleting the file it still points at breaks config_test for every site.
+        fakeOls("listener Default {\n  address *:80\n  map shop shop.test\n}\n\nvirtualHost shop {\n  vhRoot /x/\n}\n");
+
+        app(OlsDriver::class)->remove($this->app_);
+
+        // Only the panel's own copy of the shared config, discarded once no longer needed.
+        Process::assertNotRan(fn ($p) => ($p->command[0] ?? '') === 'rm' && ! str_ends_with((string) last((array) $p->command), '.panel-bak'));
+    });
+
+    it('refuses to rm -rf anything that is not inside the vhost root', function () {
+        fakeOls(olsConfig());
+        // Both, not just the domain: the config is named after the slug and
+        // only falls back to the domain, so blanking one still leaves a name.
+        $this->app_->forceFill(['slug' => null, 'domain' => ''])->save();
+
+        // With neither, the target is the vhost root itself — deleting every
+        // site's configuration on the server. Validation upstream stops this
+        // today; the guard means it stays stopped.
+        expect(fn () => app(OlsDriver::class)->remove($this->app_))
+            ->toThrow(HttpException::class);
+
+        // Only the panel's own copy of the shared config, discarded once no longer needed.
+        Process::assertNotRan(fn ($p) => ($p->command[0] ?? '') === 'rm' && ! str_ends_with((string) last((array) $p->command), '.panel-bak'));
+    });
+
+    it('renders a vhost pointing at the site, its user and its lsphp', function () {
+        fakeOls(olsConfig());
+
+        $config = app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop.test');
+
+        expect($config)
+            ->toContain('docRoot                   /home/shopuser/shop.test')
+            ->toContain('vhDomain                  shop.test')
+            // lsphp84, not lsphp8.4 — LiteSpeed drops the dot everywhere —
+            // and named for this site. See the test below.
+            ->toContain('extprocessor lsphp84-shop {')
+            ->toContain('add                     lsapi:lsphp84-shop php')
+            // bin/lsphp, not bin/php: the CLI does not speak LSAPI, so a
+            // vhost pointed at it would run no PHP at all.
+            ->toContain('path                    '.$this->lsws.'/lsphp84/bin/lsphp')
+            // OLS spawns the process itself, so it has to be told who as.
+            ->toContain('extUser                 shopuser');
+    });
+
+    /*
+     * Every vhost used to name its processor `lsphp84`. OpenLiteSpeed keeps one external app per
+     * name, so the first vhost loaded supplied the extUser and socket for all of them: sites' PHP
+     * ran as another site's user, which could read their files.
+     */
+    it('gives each site a processor of its own, and routes its PHP to that one', function () {
+        fakeOls(olsConfig());
+
+        $other = Application::forceCreate([
+            'system_user_id' => SystemUser::create(['username' => 'bloguser', 'home_path' => '/home/bloguser'])->id,
+            'name' => 'Blog', 'slug' => 'blog', 'domain' => 'blog.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'web_root' => '/',
+            'status' => 'pending', 'php_version' => '8.4',
+        ]);
+
+        $names = [];
+
+        foreach ([[$this->app_, 'shopuser'], [$other, 'bloguser']] as [$site, $user]) {
+            $config = app(OlsDriver::class)->renderConfig($site, "/home/{$user}/{$site->slug}");
+
+            preg_match('/^extprocessor (\S+) \{/m', $config, $defined);
+            preg_match('/^\s*add\s+lsapi:(\S+) php$/m', $config, $handled);
+
+            // The handler must name the processor this vhost defines, and that
+            // processor must run as this site's own user.
+            expect($handled[1] ?? null)->toBe($defined[1] ?? 'none')
+                ->and($config)->toContain("extUser                 {$user}");
+
+            $names[] = $defined[1];
+        }
+
+        expect($names[0])->not->toBe($names[1]);
+    });
+
+    it('uses OpenLiteSpeed regex context syntax, not nginx', function () {
+        fakeOls(olsConfig());
+
+        $config = app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop.test');
+
+        // `context ~ /re/` is nginx; OLS spells it `exp:` and the wrong one fails the config test.
+        // `panel` is listed because the Basic-Auth hash lives in `.panel/.htpasswd` inside the
+        // served directory; nginx/Apache cover it with a lookahead, OLS has to name it.
+        // Unanchored: `^/` refused /.env and served /sub/.env.
+        expect($config)->toContain('context exp:/\.(git|svn|hg|bzr|env|panel) {')
+            ->and($config)->not->toContain('context exp:^/\.(git')
+            ->and($config)->not->toContain('context ~')
+            // .well-known must stay reachable or certificates cannot be issued.
+            // The deny rule names the directories it blocks rather than using a
+            // lookahead, so it must not name this one — and the challenge path
+            // is served explicitly, since node and static sites have no
+            // document root for certbot to drop a token into.
+            ->and($config)->not->toContain('bzr|env|well-known')
+            ->and($config)->toContain('context /.well-known/acme-challenge {');
+    });
+
+    it('creates the log directory the vhost names', function () {
+        $runs = fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_, '/home/shopuser/shop/public_html');
+
+        // OLS does not create it and silently falls back to the server-wide log, so a site's
+        // errors land where nobody looks.
+        //
+        // Under the site's own root (slug), not its domain: the vhost root is also what
+        // `restrained 1` confines the vhost to, and a domain-named one put the document root
+        // outside it.
+        // Every mkdir, not just the first: apply() also guarantees `.panel/`, so picking one
+        // command makes this assertion depend on call order.
+        expect(collect($runs)->pluck('command')
+            ->filter(fn ($c) => ($c[0] ?? '') === 'mkdir')
+            ->flatten()
+            ->all())
+            ->toContain('/home/shopuser/shop/logs');
+    });
+
+    it('generates rewrites into the vhost rather than relying on .htaccess', function () {
+        fakeOls(olsConfig());
+
+        $config = app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop.test');
+
+        // OLS needs a full restart after any .htaccess change, which would
+        // turn editing permalinks into server downtime — so everything that
+        // can live in the vhost does.
+        expect($config)
+            // Apache's mod_rewrite, which OLS implements — not a translation
+            // of nginx's try_files. The loop guard keeps its leading slash
+            // because OLS does not strip one at vhost level.
+            ->toContain('RewriteRule ^/index\\.php$ - [L]')
+            ->toContain('RewriteRule . /index.php [L]')
+            ->not->toContain('QSA');
+    });
+
+    it('reads .htaccess for WordPress, because LSCache has no other way in', function () {
+        fakeOls(olsConfig());
+
+        // The plugin writes its cache rules to .htaccess and OLS's cache
+        // module reads them from there. With autoload off, LSCache installs,
+        // activates, reports itself enabled — and caches nothing. That is the
+        // reason people choose OLS, so it cannot be silently off.
+        expect(app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop.test'))
+            ->toContain('autoLoadHtaccess        1');
+    });
+
+    it('does not read .htaccess for anything else', function () {
+        fakeOls(olsConfig());
+        $this->app_->update(['site_type' => 'php']);
+
+        // A blank PHP site gets its whole rewrite from the vhost, so an
+        // .htaccess someone drops in should not start costing restarts.
+        expect(app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop.test'))
+            ->toContain('autoLoadHtaccess        0');
+    });
+
+    it('serves no PHP from a static site', function () {
+        fakeOls(olsConfig());
+        $this->app_->update(['serving_profile' => 'static']);
+
+        $config = app(OlsDriver::class)->renderConfig($this->app_, '/home/shopuser/shop.test');
+
+        // A static site that can execute PHP is one upload away from not
+        // being static.
+        expect($config)->not->toContain('scripthandler')
+            ->and($config)->not->toContain('lsapi');
+    });
+});
+
+describe('the lsphp stack', function () {
+    it('is the stack on an OpenLiteSpeed server', function () {
+        expect(app(PhpStackManager::class)->stack())->toBeInstanceOf(LsphpPhpStack::class)
+            ->and(app(PhpStack::class)->key())->toBe('lsphp');
+    });
+
+    it('detects versions from the lsws tree and expands the compact name', function () {
+        // A real interpreter, not just the directory — this test is about the
+        // 83 → 8.3 expansion, and a bare folder is no longer a version.
+        File::makeDirectory($this->lsws.'/lsphp83/bin', 0755, true);
+        File::put($this->lsws.'/lsphp83/bin/lsphp', '');
+
+        expect(app(LsphpPhpStack::class)->versions())->toBe(['8.4', '8.3'])
+            ->and(app(LsphpPhpStack::class)->installed('8.4'))->toBeTrue();
+    });
+
+    /*
+     * `sudo -n update-alternatives --set php /usr/local/lsws/lsphp85/bin/php` fails with "no
+     * alternatives for php": `--set` selects a choice inside an existing link group, ondrej's
+     * php8.x-cli registers that group, and LiteSpeed's packages never call update-alternatives.
+     * So without ondrej PHP there was nothing to set.
+     */
+    it('creates the alternatives group before selecting it', function () {
+        $runs = new ArrayObject;
+
+        Process::fake(function ($process) use ($runs) {
+            $runs[] = $process->command;
+
+            return Process::result(exitCode: 0);
+        });
+
+        app(PhpRuntime::class)->setDefault('8.4');
+
+        $calls = collect($runs)->filter(fn ($c) => ($c[0] ?? '') === 'update-alternatives')->values();
+        $binary = $this->lsws.'/lsphp84/bin/php';
+
+        // --install first, and in that order: the set cannot work until the
+        // group exists.
+        expect($calls[0])->toBe(['update-alternatives', '--install', '/usr/bin/php', 'php', $binary, '84'])
+            ->and($calls[1])->toBe(['update-alternatives', '--set', 'php', $binary]);
+    });
+
+    /*
+     * The alternative alone is not enough: install.sh creates /usr/local/bin/php on this stack
+     * (for PHARs with an `#!/usr/bin/env php` shebang) and /usr/local/bin precedes /usr/bin, so
+     * that symlink, not the alternative, is what `php` resolves through.
+     */
+    it('moves the symlink that actually wins on PATH', function () {
+        $runs = new ArrayObject;
+
+        Process::fake(function ($process) use ($runs) {
+            $runs[] = $process->command;
+
+            return Process::result(exitCode: 0);
+        });
+
+        app(PhpRuntime::class)->setDefault('8.4');
+
+        expect(collect($runs))
+            ->toContain(['ln', '-sfn', $this->lsws.'/lsphp84/bin/php', '/usr/local/bin/php']);
+    });
+
+    it('registers the phar lsphp actually ships', function () {
+        $runs = new ArrayObject;
+
+        Process::fake(function ($process) use ($runs) {
+            $runs[] = $process->command;
+
+            return Process::result(exitCode: 0);
+        });
+
+        app(PhpRuntime::class)->setDefault('8.4');
+
+        // `<tree>/bin/phar8.4` is there on every lsphp tree.
+        $phar = $this->lsws.'/lsphp84/bin/phar8.4';
+
+        expect(collect($runs))
+            ->toContain(['update-alternatives', '--install', '/usr/bin/phar', 'phar', $phar, '84'])
+            ->toContain(['update-alternatives', '--set', 'phar', $phar]);
+    });
+
+    it('still changes php when the derived phar path is wrong', function () {
+        // The phar filename is derived, not detected, so a tree that spells it
+        // differently must leave phar alone rather than fail the change the
+        // user asked for.
+        $runs = new ArrayObject;
+
+        Process::fake(function ($process) use ($runs) {
+            $runs[] = $process->command;
+            $command = $process->command;
+
+            return in_array('phar', $command, true)
+                ? Process::result(exitCode: 2, errorOutput: 'update-alternatives: error: alternative path ... does not exist')
+                : Process::result(exitCode: 0);
+        });
+
+        app(PhpRuntime::class)->setDefault('8.4');
+
+        expect(collect($runs))
+            ->toContain(['update-alternatives', '--set', 'php', $this->lsws.'/lsphp84/bin/php'])
+            ->toContain(['ln', '-sfn', $this->lsws.'/lsphp84/bin/php', '/usr/local/bin/php']);
+    });
+
+    it('reads back the default it just set', function () {
+        // The version used to be pattern-matched out of the path with `php(\d+\.\d+)`, true of
+        // /usr/bin/php8.4 and false of every lsphp path: LiteSpeed names the tree `lsphp84` with
+        // no dot and ends the path in a bare `php`. Without the fix no row would be marked default.
+        $binary = $this->lsws.'/lsphp84/bin/php';
+
+        Process::fake(fn ($process) => ($process->command[0] ?? '') === 'update-alternatives'
+            ? Process::result(output: "Name: php\nLink: /usr/bin/php\nValue: {$binary}\n")
+            : Process::result(exitCode: 0));
+
+        expect(app(PhpRuntime::class)->default())->toBe('8.4');
+    });
+
+    it('claims no default when the selected binary is not a version it knows', function () {
+        // A hand-made symlink, or a version removed while it was still
+        // selected. Naming one of the listed versions anyway would mark the
+        // wrong row as default.
+        Process::fake(fn ($process) => ($process->command[0] ?? '') === 'update-alternatives'
+            ? Process::result(output: "Value: /opt/somebody/elses/php\n")
+            : Process::result(exitCode: 0));
+
+        expect(app(PhpRuntime::class)->default())->toBeNull();
+    });
+
+    /*
+     * install.sh links /usr/local/bin/php to the panel's lsphp and registers no alternative, so
+     * reading only update-alternatives left fresh OLS servers with no default on the PHP screen.
+     */
+    it('reads the default from the php link on PATH when no alternative is registered', function () {
+        $link = $this->lsws.'/usr-local-bin-php';
+        symlink($this->lsws.'/lsphp84/bin/php', $link);
+        config(['server.php_path_link' => $link]);
+
+        Process::fake(fn ($process) => ($process->command[0] ?? '') === 'update-alternatives'
+            ? Process::result(errorOutput: 'update-alternatives: error: no alternatives for php', exitCode: 2)
+            : Process::result(exitCode: 0));
+
+        expect(app(PhpRuntime::class)->default())->toBe('8.4');
+    });
+
+    it('falls back to update-alternatives when the php link is not a version it knows', function () {
+        File::makeDirectory($this->lsws.'/lsphp83/bin', 0755, true);
+        File::put($this->lsws.'/lsphp83/bin/php', '');
+        File::put($this->lsws.'/lsphp83/bin/lsphp', '');
+
+        $link = $this->lsws.'/usr-local-bin-php';
+        symlink('/opt/somebody/elses/php', $link);
+        config(['server.php_path_link' => $link]);
+
+        Process::fake(fn ($process) => ($process->command[0] ?? '') === 'update-alternatives'
+            ? Process::result(output: "Value: {$this->lsws}/lsphp83/bin/php\n")
+            : Process::result(exitCode: 0));
+
+        expect(app(PhpRuntime::class)->default())->toBe('8.3');
+    });
+
+    it('fails the lsphp config test when php could not parse its ini', function () {
+        // `lsphp -c php.ini -v` exits 0 over a syntax error and runs with every directive after it
+        // ignored.
+        Process::fake(fn () => Process::result(
+            output: "PHP 8.4.25 (cli) (built: Sep 12 2026)\n",
+            errorOutput: "PHP:  syntax error, unexpected end of file, expecting TC_DOLLAR_CURLY or TC_QUOTED_STRING or '\"' in {$this->lsws}/lsphp84/etc/php/8.4/litespeed/php.ini on line 4\n",
+        ));
+
+        expect(app(LsphpPhpStack::class)->configTest('8.4')->failed())->toBeTrue();
+    });
+
+    it('cannot switch an installed extension off, and says so', function () {
+        expect(app(PhpExtensionManager::class)->togglesExtensions())->toBeFalse();
+    });
+
+    it('does not report a version whose directory has no interpreter in it', function () {
+        // The dashboard offered PHP 8.3 on a box that only had 8.4: a `lsphp83/` tree is left
+        // behind by a removed version, and LiteSpeed's packaging creates the tree before the
+        // interpreter lands in it, so the directory is not the evidence. An offered version can
+        // be assigned to a site, and the vhost then points at a binary that is not there.
+        File::makeDirectory($this->lsws.'/lsphp83/bin', 0755, true);
+
+        expect(app(LsphpPhpStack::class)->versions())->toBe(['8.4'])
+            ->and(app(LsphpPhpStack::class)->installed('8.3'))->toBeFalse();
+
+        // The CLI alone is not enough either: the vhost needs the LSAPI build,
+        // and `bin/php` cannot serve a request.
+        File::put($this->lsws.'/lsphp83/bin/php', '');
+
+        expect(app(LsphpPhpStack::class)->versions())->toBe(['8.4']);
+    });
+
+    it('ignores anything in the tree that is not a version', function () {
+        File::makeDirectory($this->lsws.'/lsphp', 0755, true);
+        File::makeDirectory($this->lsws.'/conf', 0755, true);
+
+        expect(app(LsphpPhpStack::class)->versions())->toBe(['8.4']);
+    });
+
+    it('names packages the way LiteSpeed does', function () {
+        $stack = app(LsphpPhpStack::class);
+
+        expect($stack->packagePrefix('8.4'))->toBe('lsphp84-')
+            ->and($stack->extensionPackage('8.4', 'mysql'))->toBe('lsphp84-mysql')
+            // The interpreter package has no suffix at all.
+            ->and($stack->versionPackages('8.4')[0])->toBe('lsphp84');
+    });
+
+    it('has no per-version service, so PHP adds no rows to Services', function () {
+        $stack = app(LsphpPhpStack::class);
+
+        // lshttpd spawns LSPHP; there is nothing to start or stop per version,
+        // and a row whose buttons do nothing is worse than no row.
+        expect($stack->serviceName('8.4'))->toBeNull()
+            ->and($stack->versionForService('lsphp84'))->toBeNull()
+            ->and($stack->logPath('8.4'))->toBeNull();
+    });
+
+    it('reports no FPM unit on the PHP screen', function () {
+        $runs = fakeOls(olsConfig());
+
+        $versions = app(PhpOverview::class)->read()['versions'];
+
+        // Linking the PHP screen to a `php8.4-fpm` that does not exist would
+        // send the user to a Services row that is not there.
+        expect(collect($versions)->pluck('service')->unique()->all())->toBe([null]);
+    });
+
+    it('applies an ini change by restarting the web server', function () {
+        $runs = fakeOls(olsConfig());
+
+        app(LsphpPhpStack::class)->reload('8.4');
+
+        expect(collect($runs)->pluck('command'))
+            ->toContain(['/usr/local/lsws/bin/lswsctrl', 'restart']);
+    });
+
+    it('installs an extension without trying to enable it afterwards', function () {
+        Process::fake(fn ($process) => Process::result(output: ''));
+
+        // apt drops the ini where LSPHP already reads it. Calling enable()
+        // here would refuse and report `enable_failed` for an install that
+        // actually worked — which is what this did before.
+        app(PhpExtensionManager::class)->install('8.4', 'redis');
+
+        Process::assertRan(fn ($p) => ($p->command[0] ?? '') === 'apt-get'
+            && in_array('lsphp84-redis', $p->command, true));
+        Process::assertNotRan(fn ($p) => str_contains((string) ($p->command[0] ?? ''), 'phpenmod'));
+    });
+
+    it('restarts the web server so the new extension is actually loaded', function () {
+        // The install put the package on disk and showed it enabled in the UI, while every
+        // running LSPHP worker went on without it until recycled. The guard tested `serviceName()`,
+        // which is null here (no per-version unit); LSPHP reloads by restarting the web server
+        // that spawns it. The test above asserts what must NOT run; this one asserts what must.
+        Process::fake(fn ($process) => Process::result(output: ''));
+
+        app(PhpExtensionManager::class)->install('8.4', 'redis');
+
+        Process::assertRan(fn ($p) => str_contains((string) ($p->command[0] ?? ''), 'lswsctrl')
+            && in_array('restart', (array) $p->command, true));
+    });
+
+    it('refuses to toggle extensions rather than pretending to', function () {
+        // phpenmod only understands /etc/php; pointed at the lsws tree it
+        // exits zero having changed nothing. Saying so beats reporting a
+        // success that never happened.
+        expect(fn () => app(LsphpPhpStack::class)->extensionToggleCommand('8.4', ['redis'], true))
+            ->toThrow(PhpConfigException::class);
+    });
+
+    it('finds the binaries in the lsws tree when they are there', function () {
+        $stack = app(LsphpPhpStack::class);
+
+        expect($stack->binaryPath('8.4'))->toBe($this->lsws.'/lsphp84/bin/php')
+            // The LSAPI build for the vhost, the CLI for installers. Not
+            // interchangeable.
+            ->and($stack->handlerPath('8.4'))->toBe($this->lsws.'/lsphp84/bin/lsphp');
+    });
+
+    it('falls through to the other places LSPHP gets installed', function () {
+        // Some builds put it outside the lsws tree, and note the dot where the lsws tree uses
+        // `lsphp84`. A single hardcoded pattern is right on the common install and quietly wrong
+        // on the rest.
+        File::delete($this->lsws.'/lsphp84/bin/php');
+
+        $elsewhere = $this->lsws.'/usr-bin';
+        File::makeDirectory($elsewhere, 0755, true);
+        File::put($elsewhere.'/lsphp8.4', '');
+
+        config(['server.php_stacks.lsphp.binary_candidates' => [
+            '{root}/lsphp{compact}/bin/php',
+            $elsewhere.'/lsphp{version}',
+        ]]);
+
+        expect(app(LsphpPhpStack::class)->binaryPath('8.4'))->toBe($elsewhere.'/lsphp8.4');
+    });
+
+    it('names the path it expected when nothing is found', function () {
+        File::deleteDirectory($this->lsws);
+
+        // An absolute path that is missing tells the operator which file we
+        // looked for. A bare `lsphp8.4` on PATH would fail as "command not
+        // found", which reads like a broken panel rather than a missing
+        // package.
+        expect(app(LsphpPhpStack::class)->binaryPath('8.4'))
+            ->toBe($this->lsws.'/lsphp84/bin/php');
+    });
+
+    it('expands compact package names into real versions', function () {
+        // Left as `84`, it never matches the `8.4` that versions() reports, so
+        // an installed version stays listed as installable forever — and the
+        // value posted back fails the major.minor rule, so it can never be
+        // installed either.
+        expect(app(LsphpPhpStack::class)->installableVersions("lsphp84 - LiteSpeed PHP\nlsphp83 - LiteSpeed PHP\n"))
+            ->toBe(['8.4', '8.3']);
+    });
+
+    it('validates an ini with that version own binary, not with the web server', function () {
+        $stack = app(LsphpPhpStack::class);
+
+        // `openlitespeed -t` checks the web server's config and would pass
+        // a php.ini we had just broken.
+        expect($stack->configTestCommand('8.4'))->toBe([
+            $this->lsws.'/lsphp84/bin/php',
+            '-c',
+            $this->lsws.'/lsphp84/etc/php/8.4/litespeed/php.ini',
+            '-v',
+        ]);
+    });
+});
+
+describe('the site type catalog', function () {
+    // These tests are about what the *web server* restricts. Without a
+    // reachable SQL engine every type that needs one is greyed for a reason
+    // that has nothing to do with OpenLiteSpeed, and the assertion below stops
+    // measuring the thing it names.
+    beforeEach(function () {
+        fakeUsableSqlEngine();
+
+        // Same reasoning for PHP: a type is greyed when no installed version is
+        // in its range (PrestaShop stops at 8.1), and without this the answer
+        // came from whatever /etc/php the machine running the suite has.
+        $versions = Mockery::mock(PhpVersionManager::class)->makePartial();
+        $versions->shouldReceive('versions')->andReturn(['8.4', '8.1']);
+        app()->instance(PhpVersionManager::class, $versions);
+    });
+
+    it('offers every site type, because nothing in them depends on the web server', function () {
+        $catalog = collect(app(SiteTypeManager::class)->catalog());
+
+        // No installer or site type mentions .htaccess, mod_rewrite or Apache, declares extension
+        // requirements, or relies on a web-server concept in the SiteType contract, so a shorter
+        // list here would be a guess about risk dressed as a capability limit.
+        // NodeBB is the exception: it takes MongoDB alone, and this fixture answers only for SQL.
+        expect($catalog->where('available', false)->pluck('name')->all())->toBe(['nodebb'])
+            ->and($catalog->firstWhere('name', 'nodebb')['unavailable_reason'])
+            ->toBe('This application needs MongoDB / PostgreSQL, which this server does not have.')
+            ->and($catalog)->toHaveCount(18);
+    });
+
+    it('can still restrict a web server that genuinely needs it', function () {
+        config(['server.web_server_drivers.openlitespeed.site_types' => ['wordpress', 'static']]);
+
+        $catalog = collect(app(SiteTypeManager::class)->catalog());
+        $joomla = $catalog->firstWhere('name', 'joomla');
+
+        expect($catalog->where('available', true)->pluck('name')->sort()->values()->all())
+            ->toBe(['static', 'wordpress'])
+            // Greyed with a reason, not hidden — hiding reads as a missing
+            // feature rather than a deliberate limit.
+            ->and($joomla['unavailable_reason'])->toBe('This application is not available on OpenLiteSpeed servers yet.')
+            // The one block with no way out, and the only one the card grid
+            // could previously not tell apart from a missing database.
+            ->and($joomla['unavailable_code'])->toBe('web_server')
+            // Nothing installable fixes a web-server block, so the card must
+            // not offer an action that cannot work.
+            ->and($joomla['installable_runtime'])->toBeNull();
+    });
+
+    it('refuses to create a type the web server does not offer', function () {
+        config(['server.web_server_drivers.openlitespeed.site_types' => ['wordpress']]);
+
+        $this->seed(PermissionSeeder::class);
+        $user = User::factory()->admin()->create();
+        $token = $user->createToken('t')->plainTextToken;
+
+        SystemUser::create([
+            'username' => 'u1', 'home_path' => '/home/u1',
+            'shell' => '/bin/bash', 'sudo' => false,
+        ]);
+
+        // The grid and the endpoint read the same method, so a card the user
+        // could click can never be refused for a reason the grid did not show.
+        $this->withHeaders(['Authorization' => 'Bearer '.$token])
+            ->postJson('/api/applications', [
+                'system_user_id' => SystemUser::query()->value('id'),
+                'name' => 'Shop', 'domain' => 'j.test', 'site_type' => 'joomla',
+            ])
+            ->assertJsonValidationErrors('site_type');
+    });
+
+    it('does not restrict nginx, which serves everything we ship', function () {
+        ServerCapability::query()->update(['web_server' => 'nginx']);
+
+        $catalog = collect(app(SiteTypeManager::class)->catalog());
+
+        // No `site_types` list on a driver means no restriction — the OLS
+        // limit must not leak into the servers that were already fine. NodeBB
+        // is blocked by its database, not by nginx.
+        expect($catalog->where('available', false)->pluck('name')->all())->toBe(['nodebb']);
+    });
+});
+
+it('still resolves FPM on an nginx server', function () {
+    ServerCapability::query()->update(['web_server' => 'nginx']);
+
+    // The whole point of the driver split: adding OLS must not change what a
+    // normal box does.
+    expect((new PhpStackManager(app(ServerCapabilities::class)))->stack()->key())->toBe('fpm');
+});
+
+/*
+ * The isolation boundary on this stack.
+ *
+ * On nginx and Apache a site is confined by its own php-fpm pool: `user =` is mandatory. On
+ * OpenLiteSpeed the equivalent is `extUser` in the vhost's own extprocessor, and nothing refuses
+ * a vhost that omits it: OLS runs the process as the default user `nobody`, shared by every
+ * other site, so each site can read every other site's `.env`.
+ *
+ * These are the assertions that stop that shipping.
+ */
+describe('site isolation', function () {
+    beforeEach(function () {
+        $user = SystemUser::create([
+            'username' => 'shopuser', 'home_path' => '/home/shopuser',
+            'shell' => '/bin/bash', 'sudo' => false,
+        ]);
+
+        $this->app_ = Application::forceCreate([
+            'system_user_id' => $user->id, 'name' => 'Shop',
+            'slug' => 'shop', 'domain' => 'shop.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'web_root' => '/',
+            'status' => 'pending', 'php_version' => '8.4',
+        ]);
+    });
+
+    it('gives each site its own user and group', function () {
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        $vhost = collect(test()->files)
+            ->first(fn ($contents, $path) => str_ends_with((string) $path, 'vhconf.conf'));
+
+        expect($vhost)
+            ->toContain('extUser                 shopuser')
+            ->toContain('extGroup                shopuser');
+    });
+
+    it('names the socket by slug, never by domain', function () {
+        // `domain` is nullable and NOT unique, so two sites on one domain shared the socket their
+        // isolation depends on, and a site with no domain bound `lsphp84-.sock`, which every
+        // other domainless site would also want.
+        $config = app(OlsDriver::class)
+            ->renderConfig($this->app_, '/home/shopuser/shop/public_html');
+
+        expect($config)->toContain('uds://tmp/lshttpd/lsphp84-shop.sock')
+            ->not->toContain('shop.test.sock');
+    });
+
+    it('keeps the socket bindable when the slug is long', function () {
+        // sun_path caps a unix socket at 108 bytes including the terminator (99 characters bound,
+        // 109 failed with "AF_UNIX path too long"). A site name may be 255, so an unbounded slug
+        // produces a vhost OpenLiteSpeed cannot start.
+        // forceFill, not update: `slug` is not fillable, so update() is a silent no-op here.
+        $this->app_->forceFill(['slug' => str_repeat('a', 120)])->save();
+
+        $config = app(OlsDriver::class)
+            ->renderConfig($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        preg_match('#uds://(\S+\.sock)#', $config, $matches);
+
+        expect($matches)->not->toBeEmpty();
+        expect(strlen('/'.$matches[1]))->toBeLessThan(100);
+    });
+
+    it('does not let two long slugs collide onto one socket', function () {
+        // Truncation alone would reintroduce exactly the sharing this change
+        // removes: two 120-character slugs with the same first 40 characters
+        // would be the same socket.
+        $shared = str_repeat('a', 110);
+
+        $this->app_->forceFill(['slug' => $shared.'one'])->save();
+        $first = app(OlsDriver::class)
+            ->renderConfig($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        $this->app_->forceFill(['slug' => $shared.'two'])->save();
+        $second = app(OlsDriver::class)
+            ->renderConfig($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        preg_match('#uds://(\S+\.sock)#', $first, $a);
+        preg_match('#uds://(\S+\.sock)#', $second, $b);
+
+        expect($a[1])->not->toBe($b[1]);
+    });
+
+    it('refuses to write a vhost for an application with no system user', function () {
+        fakeOls(olsConfig());
+
+        // Not a hypothetical shape: an application row can outlive its system
+        // user, and the vhost writer runs from more than one path.
+        $orphan = $this->app_->fresh(['phpSettings']);
+        $orphan->setRelation('systemUser', null);
+
+        expect(fn () => app(OlsDriver::class)->apply($orphan, '/home/shopuser/shop/public_html'))
+            ->toThrow(RuntimeException::class, 'refusing to write an OpenLiteSpeed vhost that would run as nobody');
+    });
+});
+
+/*
+ * LSAPI pool sizing.
+ *
+ * `maxConns` is how many connections OpenLiteSpeed will open to the pool; PHP_LSAPI_CHILDREN is
+ * how many workers LSPHP forks to answer them. They describe one pool and must agree.
+ */
+describe('LSAPI pool', function () {
+    beforeEach(function () {
+        $user = SystemUser::create([
+            'username' => 'shopuser', 'home_path' => '/home/shopuser',
+            'shell' => '/bin/bash', 'sudo' => false,
+        ]);
+
+        $this->app_ = Application::forceCreate([
+            'system_user_id' => $user->id, 'name' => 'Shop',
+            'slug' => 'shop', 'domain' => 'shop.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'web_root' => '/',
+            'status' => 'pending', 'php_version' => '8.4',
+        ]);
+    });
+
+    it('tells LSPHP the same pool size it gives OpenLiteSpeed', function () {
+        config()->set('server.web_server_drivers.openlitespeed.lsapi_children', 17);
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        $vhost = collect(test()->files)
+            ->first(fn ($contents, $path) => str_ends_with((string) $path, 'vhconf.conf'));
+
+        expect($vhost)
+            ->toContain('maxConns                17')
+            ->toContain('PHP_LSAPI_CHILDREN=17');
+    });
+
+    it('recycles workers, the way every fpm pool the panel writes does', function () {
+        config()->set('server.web_server_drivers.openlitespeed.lsapi_max_requests', 1234);
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        $vhost = collect(test()->files)
+            ->first(fn ($contents, $path) => str_ends_with((string) $path, 'vhconf.conf'));
+
+        expect($vhost)->toContain('PHP_LSAPI_MAX_REQUESTS=1234');
+    });
+
+    it('never renders a pool that accepts nothing', function () {
+        // maxConns 0 is a vhost that answers no PHP request at all, and a
+        // misconfigured or empty env value is the way to reach it.
+        config()->set('server.web_server_drivers.openlitespeed.lsapi_children', 0);
+        fakeOls(olsConfig());
+
+        app(OlsDriver::class)->apply($this->app_->fresh(['phpSettings', 'systemUser']), '/home/shopuser/shop/public_html');
+
+        $vhost = collect(test()->files)
+            ->first(fn ($contents, $path) => str_ends_with((string) $path, 'vhconf.conf'));
+
+        expect($vhost)->not->toContain('maxConns                0');
+    });
+});

@@ -1,0 +1,222 @@
+<?php
+
+use App\Http\Middleware\CentralOnly;
+use App\Http\Middleware\CentralSystemGuard;
+use App\Http\Middleware\CheckPermission;
+use App\Http\Middleware\EnsureServerHostsContainers;
+use App\Http\Middleware\EnsureServerHostsPhpSites;
+use App\Http\Middleware\EnsureServerManagesDatabases;
+use App\Http\Middleware\EnsureServerRunsHostApplications;
+use App\Http\Middleware\NotCentral;
+use App\Http\Middleware\SetLocale;
+use App\Http\Middleware\ThrottleRequestsPerRoute;
+use App\Http\Middleware\TrimStringsPreservingCpuLineBreaks;
+use App\Services\Admin\ApiErrorLogWriter;
+use Illuminate\Auth\Middleware\Authenticate;
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Foundation\Http\Middleware\TrimStrings;
+use Illuminate\Http\Exceptions\ThrottleRequestsException;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        web: __DIR__.'/../routes/web.php',
+        api: __DIR__.'/../routes/api.php',
+        commands: __DIR__.'/../routes/console.php',
+        health: '/up',
+    )
+    ->withMiddleware(function (Middleware $middleware): void {
+        // Pure API backend, no web login route to redirect guests to.
+        $middleware->redirectGuestsTo(fn (Request $request): ?string => null);
+        // statefulApi() enables Sanctum cookie/session auth for requests from
+        // SANCTUM_STATEFUL_DOMAINS, alongside Bearer token auth (both work).
+        $middleware->statefulApi();
+        // CentralSystemGuard is GLOBAL, not a group or route layer.
+        //
+        // It has to run before `auth:sanctum`, and being first in the `api`
+        // group does not achieve that: `Authenticate` sits in Laravel's
+        // middleware priority list, so the sorter pulls it ahead of anything
+        // that is not also in that list. Registering the guard in the priority
+        // list did not hold either. Global middleware runs before route and
+        // group middleware are dispatched at all, so the ordering stops being
+        // something to keep in step.
+        //
+        // Safe to run on every request precisely because it is inert unless a
+        // valid central token is presented — see the middleware itself.
+        $middleware->prepend(CentralSystemGuard::class);
+
+        // SetLocale is PREPENDED, not appended.
+        //
+        // Appended, it ran after SubstituteBindings -- so every exception route
+        // model binding raises was rendered before the locale had been read.
+        // A French client asking for a row that does not exist got the English
+        // 404, and no amount of translating the message would have changed it.
+        // Nothing here depends on running after the binding, and reading one
+        // request header is safe as early as possible.
+        $middleware->api(prepend: ['throttle:api', SetLocale::class]);
+
+        // Whole files, saved by an editor: php.ini (`contents`) and the file
+        // manager (`content`). Trimming them dropped the final newline on
+        // every save, and the file manager also lost leading indentation.
+        $middleware->trimStrings(except: ['contents', 'content']);
+
+        // A terminal CPU newline must fail validation, not disappear into a
+        // valid decimal before the FormRequest sees it (RC-F02).
+        $middleware->replace(TrimStrings::class, TrimStringsPreservingCpuLineBreaks::class);
+
+        // The panel takes itself down to update, and these are the routes that
+        // have to keep answering while it does.
+        //
+        // `artisan down` is step two of an update, so from that moment every
+        // API call returned 503 — including the progress feed the update page
+        // polls, and the button itself. The page could not show the run it
+        // exists to show, and pressing update during one answered "Couldn't
+        // start the update" when the truth was "step 12 of 16". That is the
+        // single most confusing thing about this feature, and it is this line.
+        //
+        // `api/health` is here for a sharper reason: the release flow verifies
+        // *before* leaving maintenance (swap, restart, verify, maintenance_off
+        // — the order is deliberate, so a bad release rolls back while users
+        // are still seeing the maintenance page). Its verification curls
+        // /api/health, so with health behind the maintenance gate that flow
+        // could never pass its own check and would roll back every time.
+        //
+        // Declared here rather than as `artisan down --except=…` so it cannot
+        // be set in one of the two update scripts and forgotten in the other.
+        // Everything else still returns 503, which is the point of maintenance
+        // mode: no writes reach a half-updated panel.
+        $middleware->preventRequestsDuringMaintenance(except: [
+            'api/health',
+            'api/admin/panel-update',
+            'api/admin/panel-update/*',
+        ]);
+
+        // One call, not several: alias() replaces the list rather than
+        // adding to it, so a second call silently drops the first.
+        $middleware->alias([
+            'permission' => CheckPermission::class,
+            // Refuses database management where the stack hosts nothing that
+            // uses one. See the class for why it is middleware rather than a
+            // check in twenty-nine controller actions.
+            'manages-databases' => EnsureServerManagesDatabases::class,
+            // The mirror of the above: Docker's own screens, on a server that
+            // hosts containers.
+            'hosts-containers' => EnsureServerHostsContainers::class,
+            // And the same for PHP's own screens. A Docker box has PHP
+            // installed — the panel is a Laravel application — but serves no
+            // PHP sites, so managing versions and ini files there is managing
+            // nothing.
+            'hosts-php' => EnsureServerHostsPhpSites::class,
+            // Node's screens, on a server that runs anything on the host at all.
+            // Not "hosts Node sites": a LEMP box needs Node to build a PHP site's
+            // assets. See the class.
+            'runs-host-apps' => EnsureServerRunsHostApplications::class,
+            'central' => CentralSystemGuard::class,
+            'central.only' => CentralOnly::class,
+            'not.central' => NotCentral::class,
+            // One counter per route for `throttle:N,M`; see the class.
+            'throttle' => ThrottleRequestsPerRoute::class,
+        ]);
+    })
+    ->withExceptions(function (Exceptions $exceptions): void {
+        $exceptions->reportable(function (Throwable $exception): void {
+            app(ApiErrorLogWriter::class)->record($exception, request());
+        });
+
+        $exceptions->shouldRenderJsonWhen(
+            fn (Request $request) => $request->is('api/*'),
+        );
+
+        // A 404 must not name the class it failed to load.
+        //
+        // `prepareException` rewrites ModelNotFoundException as
+        // `new NotFoundHttpException($e->getMessage())` -- carrying "No query
+        // results for model [App\Models\Application] 99999" into the HTTP
+        // exception. `convertExceptionToArray` then returns the message of any
+        // HttpException *regardless of app.debug*, so APP_DEBUG=false does not
+        // cover this: every bound route on the panel was answering 404 with an
+        // internal FQCN and a primary key.
+        //
+        // REGISTERED AGAINST NotFoundHttpException, NOT ModelNotFoundException.
+        // Render callbacks run after prepareException has already converted it,
+        // so a callback typed on the model exception never fires -- it reads
+        // correctly and silently does nothing.
+        //
+        // Deliberately vague about *why* it was not found. Binding raises the
+        // same exception for a row that does not exist and a row a scoped
+        // binding excluded, so separating them would answer "does this id
+        // exist?" for records the caller cannot read.
+        //
+        // Nothing is lost by discarding the original text. ApiErrorLogWriter
+        // ignores anything under 500, so a 404 was never recorded anywhere
+        // either way -- and the message only ever held the model class and the
+        // id, both of which the request line already gives an operator.
+        $exceptions->render(function (NotFoundHttpException $e, Request $request): ?JsonResponse {
+            if (! $request->is('api/*')) {
+                return null;
+            }
+
+            return response()->json(['message' => __('errors/http.not_found')], 404);
+        });
+
+        // Same leak, smaller blast radius: the default names the matched route
+        // pattern and every verb it accepts, which maps the API for anyone
+        // probing it.
+        $exceptions->render(function (MethodNotAllowedHttpException $e, Request $request): ?JsonResponse {
+            if (! $request->is('api/*')) {
+                return null;
+            }
+
+            return response()->json(['message' => __('errors/http.method_not_allowed')], 405);
+        });
+
+        // A refusal that says nothing is a refusal the client has to guess at.
+        //
+        // `abort(403)` and a FormRequest `authorize()` returning false both
+        // produce an empty message, and there are 115 of the latter — so the
+        // panel received `{"message": ""}` for most refusals and had to write
+        // its own wording without knowing what had been refused.
+        //
+        // Only fills a message that is missing. CheckPermission names the
+        // permission it wanted, and several requests explain a specific
+        // refusal; overwriting either with a generic line would trade a good
+        // sentence for a safe one.
+        //
+        // Typed on HttpException and filtered by status, not on
+        // AccessDeniedHttpException: `abort(403)` throws a plain HttpException,
+        // so a callback on the narrower class reads correctly and never fires.
+        // It was written that way first, and the test that caught it is the one
+        // that drives a real route — the version asserting on the translation
+        // file passed against a hook that did nothing.
+        $exceptions->render(function (HttpException $e, Request $request): ?JsonResponse {
+            if ($e->getStatusCode() !== 403 || ! $request->is('api/*') || trim($e->getMessage()) !== '') {
+                return null;
+            }
+
+            return response()->json(['message' => __('errors/http.forbidden')], 403);
+        });
+
+        // Laravel's throttle answers "Too Many Attempts." in English whatever
+        // the user's language (found on the login form, 2026-10-01), and says
+        // nothing about when to try again. Same status, same Retry-After and
+        // rate-limit headers; only the sentence is ours.
+        $exceptions->render(function (ThrottleRequestsException $e, Request $request): ?JsonResponse {
+            if (! $request->is('api/*')) {
+                return null;
+            }
+
+            $seconds = max(1, (int) ($e->getHeaders()['Retry-After'] ?? 60));
+
+            return response()->json(
+                ['message' => trans_choice('errors/http.too_many_requests', $seconds, ['seconds' => $seconds])],
+                429,
+                $e->getHeaders(),
+            );
+        });
+    })->create();

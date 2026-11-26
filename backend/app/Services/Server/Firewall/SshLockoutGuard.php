@@ -1,0 +1,93 @@
+<?php
+
+namespace App\Services\Server\Firewall;
+
+use App\Contracts\Firewall;
+use App\Models\FirewallRule;
+use App\Support\SshPort;
+use Illuminate\Validation\ValidationException;
+
+/**
+ * Refuses the one firewall edit that cannot be undone from the panel: removing
+ * the last rule letting SSH in while the firewall is enforcing deny-incoming.
+ *
+ * Asks whether a way in survives, not who created the rule: `FirewallRule::isProtected()`
+ * only covers seeded rules, so it misses a hand-made port-22 rule and range rules (`20:30`).
+ */
+class SshLockoutGuard
+{
+    public function __construct(private Firewall $firewall) {}
+
+    /**
+     * Throw if `$rule` is the last thing allowing SSH in.
+     *
+     * `$replacement` is the post-edit version of the same rule for an update —
+     * changing a rule that still covers the SSH port afterwards is fine.
+     */
+    public function assertSurvives(FirewallRule $rule, ?FirewallRule $replacement = null): void
+    {
+        // Nothing is being blocked, so nothing can be locked out. This is also
+        // the escape hatch: disable the firewall and the rule is editable.
+        if (! $this->firewall->status()['enabled']) {
+            return;
+        }
+
+        $port = SshPort::current();
+
+        if (! $this->covers($rule, $port)) {
+            return;
+        }
+
+        if ($replacement && $this->covers($replacement, $port)) {
+            return;
+        }
+
+        $stillOpen = FirewallRule::query()
+            ->where('id', '!=', $replacement?->id ?? $rule->id)
+            ->where('action', 'allow')
+            ->where('enabled', true)
+            ->get()
+            ->contains(fn (FirewallRule $other) => $this->covers($other, $port));
+
+        if (! $stillOpen) {
+            throw ValidationException::withMessages([
+                'rule' => [__('errors/firewall.ssh_lockout', ['port' => $port])],
+            ]);
+        }
+    }
+
+    /**
+     * Whether the SSH port is reachable through the firewall right now: the
+     * firewall is off, or an enabled allow rule covers the port. For warning
+     * that a key just added cannot be used yet, not for refusing anything.
+     */
+    public function sshPortOpen(): bool
+    {
+        if (! $this->firewall->status()['enabled']) {
+            return true;
+        }
+
+        $port = SshPort::current();
+
+        return FirewallRule::query()->where('action', 'allow')->where('enabled', true)->get()
+            ->contains(fn (FirewallRule $rule) => $this->covers($rule, $port));
+    }
+
+    /**
+     * Whether this rule lets SSH through on `$port`. A source-restricted rule counts: it is still
+     * a way in, and refusing to let someone tighten their own last rule would be a trap.
+     */
+    private function covers(FirewallRule $rule, int $port): bool
+    {
+        if ($rule->action !== 'allow' || ! $rule->enabled) {
+            return false;
+        }
+
+        // SSH is TCP; a udp-only rule never carries it.
+        if ($rule->protocol === 'udp') {
+            return false;
+        }
+
+        return $port >= $rule->port_from && $port <= ($rule->port_to ?: $rule->port_from);
+    }
+}

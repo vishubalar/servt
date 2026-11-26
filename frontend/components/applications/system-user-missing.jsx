@@ -1,0 +1,40 @@
+"use client";
+
+import { useState } from "react";
+import { useTranslations } from "next-intl";
+import { Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { FailurePanel } from "@/components/ui/failure-panel";
+import { PageHeader } from "@/components/ui/page-header";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { DeleteApplicationDialog } from "@/components/applications/delete-application-dialog";
+
+export function SystemUserMissing({ application, canDelete }) {
+  const t = useTranslations("applications.systemUserMissing");
+  const ta = useTranslations("applications");
+  const [deleteOpen, setDeleteOpen] = useState(false);
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={application.name} />
+      <FailurePanel
+        title={t("title")}
+        description={t("description", { name: application.name })}
+        action={
+          <ReasonTooltip reason={canDelete ? null : DENIED}>
+            <Button variant="destructive" onClick={() => setDeleteOpen(true)} disabled={!canDelete}>
+              <Trash2 className="size-4" />
+              {ta("actions.delete")}
+            </Button>
+          </ReasonTooltip>
+        }
+      />
+      <DeleteApplicationDialog
+        application={application}
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        redirectTo="/applications"
+      />
+    </div>
+  );
+}

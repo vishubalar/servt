@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'install_started' => 'fail2ban स्थापित किया जा रहा है। इसमें कुछ समय लगेगा।',
+
+    'bantime' => [
+        '10m' => '10 मिनट',
+        '1h' => '1 घंटा',
+        '1d' => '1 दिन',
+        '1w' => '1 सप्ताह',
+        'permanent' => 'स्थायी',
+    ],
+
+    'created_successfully' => 'Fail2ban सफलतापूर्वक कॉन्फ़िगर हो गया!',
+    'test_failed' => 'Fail2ban कॉन्फ़िगरेशन परीक्षण विफल रहा।',
+    'rejected' => 'Fail2ban ने यह कॉन्फ़िगरेशन अस्वीकार कर दिया, इसलिए कुछ भी नहीं बदला गया।',
+    'already_disabled' => 'इस एप्लिकेशन के लिए Fail2ban पहले से ही अक्षम है।',
+    'disabled_successfully' => 'Fail2ban सफलतापूर्वक अक्षम कर दिया गया!',
+
+    'validation' => [
+        'jail_content_required' => 'jail कॉन्फ़िगरेशन आवश्यक है।',
+        'jail_content_string' => 'jail कॉन्फ़िगरेशन टेक्स्ट होना चाहिए।',
+        'jail_content_max' => 'jail कॉन्फ़िगरेशन बहुत बड़ा है (अधिकतम 65535 अक्षर)।',
+        'filter_content_required' => 'फ़िल्टर कॉन्फ़िगरेशन आवश्यक है।',
+        'filter_content_string' => 'फ़िल्टर कॉन्फ़िगरेशन टेक्स्ट होना चाहिए।',
+        'filter_content_max' => 'फ़िल्टर कॉन्फ़िगरेशन बहुत बड़ा है (अधिकतम 65535 अक्षर)।',
+        'foreign_jail' => 'यह जेल केवल इसी एप्लिकेशन का अपना जेल कॉन्फ़िगर कर सकता है। [:section] को [{name}] से बदलें (यह :name बन जाएगा)।',
+        'foreign_filter' => 'यह जेल केवल इसी एप्लिकेशन का अपना फ़िल्टर इस्तेमाल कर सकता है। filter = :filter को filter = {filter} से बदलें (यह :name बन जाएगा)।',
+        'disallowed_setting' => 'एप्लिकेशन jail में ":setting" सेटिंग की अनुमति नहीं है। अनुमत: :allowed।',
+    ],
+    // FB-wp: the default filter is WordPress's.
+    'app_default_filter_wordpress_only' => 'इस एप्लिकेशन के लिए अभी कोई लॉगिन नियम नहीं है, इसलिए किसी को बैन नहीं किया जाता। इसके लॉगिन पेज के लिए एक नियम जोड़ें।',
+];

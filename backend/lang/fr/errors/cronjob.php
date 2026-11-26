@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'sync_failed' => "Échec de l'application de la tâche cron sur le serveur.",
+    // One sentence per privileged step. They all used to share
+    // `sync_failed`, so a full disk and a missing group read the same.
+    'step' => [
+        'log_dir' => "Le répertoire de journaux des tâches cron n'a pas pu être créé. Vérifiez l'espace disque et que /var/log est accessible en écriture.",
+        'log_touch' => 'Le fichier journal de la tâche cron n\'a pas pu être créé dans /var/log/cronjobs. Vérifiez qu\'il reste de l\'espace disque et que le dossier est accessible en écriture.',
+        'log_chown' => "Le fichier journal n'a pas pu être attribué au compte qui exécute la tâche. Vérifiez que ce compte existe toujours.",
+        'log_chmod' => "Les permissions du fichier journal n'ont pas pu être définies.",
+        'rotation' => "La politique de rotation des journaux n'a pas pu être installée, la tâche n'a donc pas été planifiée : sa sortie grandirait sans limite.",
+        'write' => "Le fichier cron n'a pas pu être écrit. Vérifiez l'espace disque disponible.",
+        'chmod' => "Les permissions du fichier cron n'ont pas pu être définies. Cron ignore un fichier auquel il ne fait pas confiance, la tâche n'a donc pas été planifiée.",
+        'remove' => "Le fichier cron n'a pas pu être supprimé, la tâche reste planifiée sur le serveur.",
+        'remove_stale' => "L'ancien fichier cron n'a pas pu être supprimé après le renommage. Rien n'a été modifié, la tâche n'est donc pas planifiée deux fois.",
+        'detach_source' => "Le fichier cron d'origine dont cette tâche a été importée n'a pas pu être supprimé. Rien n'a été modifié, la commande ne s'exécute donc pas deux fois.",
+        'run_now' => 'La tâche n\'a pas pu être lancée. Recherchez la référence ci-dessous dans le journal système du serveur.',
+        'read_history' => 'Le journal de la tâche n\'a pas pu être lu, ses exécutions ne peuvent donc pas être affichées.',
+    ],
+    'invalid_expression' => "La planification n'est pas une expression cron valide.",
+    'invalid_user' => "L'utilisateur sélectionné n'existe pas sur le serveur.",
+    'user_not_allowed' => 'Seul l\'administrateur du panneau peut exécuter une tâche cron avec un compte qui n\'est pas un utilisateur système du panneau.',
+    'unresolved_placeholder' => "La commande contient encore le marqueur {path} ou {php} — remplacez-le par le répertoire de l'application et son binaire PHP.",
+    'no_newline' => 'Cette valeur ne peut pas contenir de sauts de ligne.',
+    'reserved_name' => 'Ce nom est réservé et ne peut pas être utilisé.',
+    'shell_comment' => 'La commande contient un commentaire shell (un # au début d\'un mot). Cron couperait la ligne à cet endroit et la tâche ne s\'exécuterait pas correctement. Supprimez le commentaire ou placez le # entre guillemets.',
+    'run_paused' => 'Cette tâche cron est en pause. Activez-la avant de l\'exécuter.',
+    'run_already_running' => 'Cette tâche cron est déjà en cours via « Exécuter maintenant ». Attendez la fin de cette exécution.',
+    'switch_not_this_site' => 'Cette tâche cron n\'appartient pas à ce site.',
+    'switch_unknown_php' => 'La tâche cron :name n\'indique pas de PHP que le panneau peut changer. Modifiez plutôt sa commande.',
+    'switch_too_long' => 'La tâche cron :name dépasserait 1000 caractères avec le nouveau chemin PHP. Modifiez plutôt sa commande.',
+];

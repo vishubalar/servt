@@ -1,0 +1,289 @@
+"use client";
+
+import { useState } from "react";
+import { useRefresh } from "@/hooks/use-refresh";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { Loader2, Trash2 } from "lucide-react";
+import { RuntimeStatusBadge, removeFailed, versionState } from "@/components/runtime/version-status";
+import { SupportCell, UsedByCell, VersionCell } from "@/components/runtime/versions-table";
+import { SUBGRID } from "@/lib/runtime/version-rows";
+
+const WRAP = "h-auto text-left whitespace-normal";
+import { cn } from "@/lib/utils";
+import {
+  setDefaultNodeVersion,
+  removeNodeVersion,
+  installNodeVersion,
+  updateNodeNpm,
+} from "@/lib/api/node";
+import { failedWithNothingInstalled } from "@/lib/runtime/failed-install";
+import { apiMessage } from "@/lib/api/error-message";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { InstallOutput } from "@/components/runtime/install-output";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+
+export function VersionSummary({ version, canManage, lifecycleAvailable = false }) {
+  const t = useTranslations("node");
+  const { refreshAndWait } = useRefresh();
+  const [confirming, setConfirming] = useState(false);
+  const [running, setRunning] = useState(null);
+  const pending = running !== null;
+  const npm = version.npm_version ?? null;
+  const npmLatest = version.npm_latest ?? null;
+  const npmKnown = Boolean(npm && npmLatest);
+  const npmBehind = !npmKnown
+    ? false
+    : typeof version.npm_update_available === "boolean"
+      ? version.npm_update_available
+      :
+        npm !== npmLatest;
+  const npmCurrent = npmKnown && !npmBehind;
+
+  const usedBy = version.in_use_by ?? 0;
+
+  const installState = versionState(version);
+
+  const notReadyReason =
+    installState === "installing"
+      ? t("versions.stillInstalling")
+      : installState === "removing"
+        ? t("versions.stillRemoving")
+        : installState === "failed"
+          ? t("versions.installFailedShort")
+          : null;
+
+  const nothingToRemove = failedWithNothingInstalled(version);
+
+  const removeReason = !canManage
+    ? DENIED
+    : installState === "installing" || installState === "removing"
+      ? notReadyReason
+      : version.is_default
+        ? t("versions.isDefault")
+        : usedBy > 0
+          ? t("versions.usedBy", { count: usedBy })
+          : null;
+
+  async function dismiss() {
+    setRunning("dismiss");
+    try {
+      await removeNodeVersion(version.version);
+      await refreshAndWait();
+      toast.success(t("versions.dismissed", { version: version.version }));
+    } catch (error) {
+      toast.error(apiMessage(error, t("versions.dismissFailed")));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function retry() {
+    setRunning("retry");
+    try {
+      await installNodeVersion(version.version);
+      await refreshAndWait();
+      toast.success(t("versions.retrying", { version: version.version }));
+    } catch (error) {
+      toast.error(apiMessage(error, t("versions.installFailedShort")));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function makeDefault() {
+    setRunning("default");
+    try {
+      await setDefaultNodeVersion(version.version);
+      await refreshAndWait();
+      toast.success(t("versions.defaultSet", { version: version.version }));
+    } catch (error) {
+      toast.error(apiMessage(error, t("versions.defaultFailed")));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function remove() {
+    setRunning("remove");
+    try {
+      await removeNodeVersion(version.version);
+      await refreshAndWait();
+      toast.success(t("versions.removed", { version: version.version }));
+      setConfirming(false);
+    } catch (error) {
+      toast.error(apiMessage(error, t("versions.removeFailed")));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function upgradeNpm() {
+    setRunning("npm");
+    try {
+      const before = npm;
+      const { data } = await updateNodeNpm(version.version);
+      const after = data?.npm_version ?? null;
+      await refreshAndWait();
+      toast.success(
+        after && before && after === before
+          ? t("npm.alreadyLatest", { version: after })
+          : t("npm.updated", { version: after ?? "" }),
+      );
+    } catch (error) {
+      toast.error(apiMessage(error, t("npm.failed")));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  return (
+    <li className={cn("relative px-4 py-3", SUBGRID)}>
+      <div className={cn("grid gap-y-2 @3xl/versions:items-center", SUBGRID)}>
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="font-medium">{t("versions.name", { version: version.version })}</span>
+          {version.is_default ? (
+            <Badge variant="muted" className="font-normal">
+              {t("versions.default")}
+            </Badge>
+          ) : null}
+          <RuntimeStatusBadge version={version} namespace="node" className={WRAP} />
+        </div>
+
+        {lifecycleAvailable ? (
+          <SupportCell
+            version={version}
+            namespace="node"
+            lifecycleAvailable={lifecycleAvailable}
+            label={t("table.colSupport")}
+            quiet={["current", "lts"]}
+          />
+        ) : null}
+
+        <VersionCell label={t("table.colNpm")}>
+          {npm ? (
+            <span className="flex min-w-0 flex-wrap items-center gap-2">
+              <span className="font-mono text-xs">
+                {npmBehind
+                  ? t("npm.upgrade", { current: npm, latest: npmLatest })
+                  : t("npm.installed", { version: npm })}
+              </span>
+              {npmCurrent ? (
+                <span className="text-xs text-muted-foreground">{t("table.npmCurrent")}</span>
+              ) : (
+                <ReasonTooltip
+                  reason={canManage ? (notReadyReason ?? null) : DENIED}
+                >
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!canManage || pending || Boolean(notReadyReason) || npmCurrent}
+                    onClick={upgradeNpm}
+                  >
+                    {running === "npm" ? <Loader2 className="size-4 animate-spin" /> : null}
+                    <span aria-hidden>{t("table.npmUpdate")}</span>
+                    <span className="sr-only">{t("npm.action")}</span>
+                  </Button>
+                </ReasonTooltip>
+              )}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          )}
+        </VersionCell>
+
+        <UsedByCell version={version} namespace="node" label={t("table.colUsedBy")} />
+
+        <div className="flex flex-wrap items-center gap-2 @3xl/versions:justify-end">
+          {version.is_default ? null : (
+            <ReasonTooltip reason={canManage ? notReadyReason : DENIED}>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!canManage || pending || Boolean(notReadyReason)}
+                onClick={makeDefault}
+              >
+                {running === "default" ? <Loader2 className="size-4 animate-spin" /> : null}
+                {t("versions.makeDefault")}
+              </Button>
+            </ReasonTooltip>
+          )}
+
+          {nothingToRemove ? (
+            <ReasonTooltip reason={canManage ? null : DENIED}>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!canManage || pending}
+                onClick={retry}
+              >
+                {running === "retry" ? <Loader2 className="size-4 animate-spin" /> : null}
+                {t("versions.retry")}
+              </Button>
+            </ReasonTooltip>
+          ) : null}
+          {nothingToRemove ? (
+            <ReasonTooltip reason={canManage ? null : DENIED}>
+              <Button variant="ghost" size="sm" disabled={!canManage || pending} onClick={dismiss}>
+                {running === "dismiss" ? <Loader2 className="size-4 animate-spin" /> : null}
+                {t("versions.dismiss")}
+              </Button>
+            </ReasonTooltip>
+          ) : (
+            <ReasonTooltip reason={removeReason}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-destructive/80 hover:bg-destructive/10 hover:text-destructive"
+                disabled={Boolean(removeReason) || pending}
+                onClick={() => setConfirming(true)}
+              >
+                {t("versions.remove")}
+              </Button>
+            </ReasonTooltip>
+          )}
+        </div>
+      </div>
+
+      {removeFailed(version) || (installState && (version.started_at_human || version.output)) ? (
+        <div className="mt-2 space-y-1 text-xs @3xl/versions:col-span-full">
+          {removeFailed(version) ? (
+            <p className="text-destructive">
+              {version.message ?? t("versions.removeFailed")}
+              {version.reference ? (
+                <span className="ml-1.5 font-mono whitespace-nowrap text-muted-foreground">
+                  {version.reference}
+                </span>
+              ) : null}
+            </p>
+          ) : null}
+          {installState && installState !== "failed" && version.started_at_human ? (
+            <p className="text-muted-foreground">
+              {t(installState === "removing" ? "versions.removingSince" : "versions.installingSince", {
+                when: version.started_at_human,
+              })}
+            </p>
+          ) : null}
+          {installState && version.output ? (
+            <InstallOutput text={version.output.trimEnd()} />
+          ) : null}
+        </div>
+      ) : null}
+
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={(open) => !pending && setConfirming(open)}
+        icon={Trash2}
+        tone="destructive"
+        title={t("versions.confirmRemoveTitle", { version: version.version })}
+        description={t("versions.confirmRemoveBody")}
+        cancelLabel={t("versions.confirmCancel")}
+        confirmLabel={t("versions.remove")}
+        pending={running === "remove"}
+        onConfirm={remove}
+      />
+    </li>
+  );
+}

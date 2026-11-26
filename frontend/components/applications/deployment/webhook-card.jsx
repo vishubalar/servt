@@ -1,0 +1,465 @@
+import { useState } from "react";
+import { PANEL_CARD } from "@/lib/theme/card-chrome";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import {
+  CircleCheck,
+  Eye,
+  EyeOff,
+  Info,
+  Loader2,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  TriangleAlert,
+  Webhook,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { updateWebhook } from "@/lib/api/deployment";
+import { applicationSchema } from "@/lib/schemas/application";
+import { apiMessage } from "@/lib/api/error-message";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { CopyButton } from "@/components/ui/copy-button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+const TOKEN_MIN = 16;
+
+function ReadOnlyField({ label, value, hint, secret = false }) {
+  const tc = useTranslations("common");
+  const [reveal, setReveal] = useState(false);
+  return (
+    <div className="space-y-1.5">
+      <Label className="text-xs text-muted-foreground" hint={hint}>
+        {label}
+      </Label>
+      <div className="flex items-center gap-1.5">
+        <div className="relative flex-1">
+          <Input
+            readOnly
+            value={value ?? ""}
+            type={secret && !reveal ? "password" : "text"}
+            className={cn("font-mono text-xs", secret && "pr-10")}
+          />
+          {secret ? (
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={() => setReveal((v) => !v)}
+              aria-label={reveal ? tc("hidePassword") : tc("showPassword")}
+              className="absolute inset-y-0 right-0 flex w-10 items-center justify-center rounded-r-lg text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground focus-visible:outline-none"
+            >
+              {reveal ? (
+                <EyeOff className="size-4" />
+              ) : (
+                <Eye className="size-4" />
+              )}
+            </button>
+          ) : null}
+        </div>
+        <CopyButton value={value ?? ""} className="size-9 shrink-0" />
+      </div>
+    </div>
+  );
+}
+
+function Instructions({ label, text, placeholder }) {
+  return (
+    <div className="space-y-1.5">
+      <Label className="text-xs text-muted-foreground">{label}</Label>
+      <div className="flex items-start gap-2 rounded-lg border bg-muted/40 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
+        <Info className="mt-0.5 size-3.5 shrink-0" />
+        <p>{text || placeholder}</p>
+      </div>
+    </div>
+  );
+}
+
+export function WebhookCard({ application, providers, canManage, onChange }) {
+  const t = useTranslations("applications.deployment");
+  const tc = useTranslations("common");
+  const webhook = application.webhook ?? { enabled: false };
+  const enabled = Boolean(webhook.enabled);
+  const configured = Boolean(webhook.provider);
+
+  const [providerName, setProviderName] = useState(
+    webhook.provider ?? (providers.length === 1 ? providers[0].name : ""),
+  );
+  const [gitlabToken, setGitlabToken] = useState("");
+  const [upgradeOpen, setUpgradeOpen] = useState(false);
+  const [rotateOpen, setRotateOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [manualReason, setManualReason] = useState(null);
+
+  const selectedProvider = providers.find((p) => p.name === providerName) ?? null;
+  const activeProvider = providers.find((p) => p.name === webhook.provider) ?? null;
+  const wantsToken = selectedProvider?.secret_source === "either";
+  const verifiedBySignature = webhook.verification === "signature";
+  const typedToken = gitlabToken.trim();
+  const tokenTooShort = typedToken.length > 0 && typedToken.length < TOKEN_MIN;
+
+  async function save(payload, { successKey, failKey }) {
+    setBusy(true);
+    try {
+      const { data } = await updateWebhook(application.id, payload);
+      const parsed = applicationSchema.safeParse(data?.application);
+      if (parsed.success) onChange(parsed.data);
+      const registration = data?.webhook_registration ?? null;
+      setManualReason(registration?.status === "manual" ? (registration.message ?? null) : null);
+      toast.success(
+        registration?.status === "registered" && successKey !== "webhook.rotated"
+          ? t("webhook.added")
+          : t(successKey),
+      );
+      return true;
+    } catch (error) {
+      toast.error(apiMessage(error, t(failKey)));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggle(next) {
+    if (next) {
+      await save(
+        { enabled: true, provider: webhook.provider },
+        { successKey: "webhook.saved", failKey: "webhook.enableFailed" },
+      );
+    } else {
+      await save(
+        { enabled: false },
+        { successKey: "webhook.disabledDone", failKey: "webhook.disableFailed" },
+      );
+    }
+  }
+
+  async function enable() {
+    if (!providerName) return;
+    const payload = { enabled: true, provider: providerName };
+    if (wantsToken && gitlabToken.trim()) payload.secret = gitlabToken.trim();
+    const ok = await save(payload, {
+      successKey: "webhook.saved",
+      failKey: "webhook.enableFailed",
+    });
+    if (ok) setGitlabToken("");
+  }
+
+  async function rotate() {
+    const ok = await save(
+      { enabled: true, provider: webhook.provider, rotate: true },
+      { successKey: "webhook.rotated", failKey: "webhook.rotateFailed" },
+    );
+    if (ok) setRotateOpen(false);
+  }
+
+  async function applyToken() {
+    if (!gitlabToken.trim()) return;
+    const ok = await save(
+      { enabled: true, provider: webhook.provider, secret: gitlabToken.trim() },
+      { successKey: "webhook.saved", failKey: "webhook.enableFailed" },
+    );
+    if (ok) {
+      setGitlabToken("");
+      setUpgradeOpen(false);
+    }
+  }
+
+  return (
+    <Card className={PANEL_CARD}>
+      <CardHeader>
+        <CardTitle icon={Webhook} className="flex items-center gap-2.5">
+          {t("webhook.title")}
+        </CardTitle>
+        <CardDescription>
+          {t("webhook.subtitle", { branch: application.branch ?? "main" })}
+        </CardDescription>
+        {configured ? (
+          <CardAction className="flex items-center gap-2">
+            {canManage ? (
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">
+                  {enabled ? t("webhook.on") : t("webhook.off")}
+                </span>
+                <Switch
+                  checked={enabled}
+                  onCheckedChange={toggle}
+                  disabled={busy}
+                  aria-label={t("webhook.title")}
+                />
+              </div>
+            ) : (
+              <Badge variant={enabled ? "success" : "muted"} className="font-normal">
+                {enabled ? t("webhook.on") : t("webhook.off")}
+              </Badge>
+            )}
+          </CardAction>
+        ) : canManage && providers.length ? (
+          <CardAction>
+            <ReasonTooltip
+              reason={
+                busy ? null : !providerName ? tc("chooseAnOption") : wantsToken && tokenTooShort ? t("webhook.tokenTooShort") : null
+              }
+            >
+              <Button onClick={enable} disabled={!providerName || busy || (wantsToken && tokenTooShort)}>
+                {busy ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Webhook className="size-4" />
+                )}
+                {t("webhook.enable")}
+              </Button>
+            </ReasonTooltip>
+          </CardAction>
+        ) : null}
+      </CardHeader>
+
+      <CardContent className="space-y-4">
+        {enabled ? (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              {verifiedBySignature ? (
+                <Badge variant="success" className="gap-1.5 font-normal">
+                  <ShieldCheck className="size-3.5" />
+                  {t("webhook.verifiedSignature")}
+                </Badge>
+              ) : (
+                <Badge variant="warning" className="gap-1.5 font-normal">
+                  <ShieldAlert className="size-3.5" />
+                  {t("webhook.verifiedToken")}
+                </Badge>
+              )}
+              {activeProvider ? (
+                <span className="text-sm text-muted-foreground">
+                  {activeProvider.title}
+                </span>
+              ) : null}
+            </div>
+
+            {!verifiedBySignature &&
+            canManage &&
+            activeProvider?.secret_source === "either" ? (
+              <div className="space-y-2 rounded-lg border border-warning/40 bg-warning/5 p-3">
+                <p className="text-xs leading-5 text-warning">
+                  {t("webhook.tokenUpgrade")}
+                </p>
+                {upgradeOpen ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Input
+                      value={gitlabToken}
+                      onChange={(e) => setGitlabToken(e.target.value)}
+                      placeholder={t("webhook.gitlabTokenPlaceholder")}
+                      autoComplete="off"
+                      className="w-full max-w-xs font-mono text-xs"
+                    />
+                    <ReasonTooltip
+                      reason={busy ? null : !typedToken ? tc("enterAValue") : tokenTooShort ? t("webhook.tokenTooShort") : null}
+                    >
+                      <Button
+                        size="sm"
+                        onClick={applyToken}
+                        disabled={!typedToken || tokenTooShort || busy}
+                      >
+                        {busy ? <Loader2 className="size-4 animate-spin" /> : null}
+                        {t("webhook.saveToken")}
+                      </Button>
+                    </ReasonTooltip>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        setUpgradeOpen(false);
+                        setGitlabToken("");
+                      }}
+                    >
+                      {t("cancel")}
+                    </Button>
+                  </div>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setUpgradeOpen(true)}
+                  >
+                    {t("webhook.useSigningToken")}
+                  </Button>
+                )}
+              </div>
+            ) : null}
+
+            {webhook.registered ? (
+              <div className="flex items-start gap-2.5 rounded-lg border border-success/30 bg-success/5 p-3 text-sm">
+                <CircleCheck className="mt-0.5 size-4 shrink-0 text-success" />
+                <div className="space-y-0.5">
+                  <p className="font-medium">{t("webhook.added")}</p>
+                  <p className="text-muted-foreground">
+                    {t("webhook.addedBody", {
+                      provider: activeProvider?.title ?? webhook.provider ?? "",
+                      branch: application.branch ?? "main",
+                    })}
+                  </p>
+                  <p className="pt-1 text-xs text-muted-foreground">
+                    {t("webhook.lastDelivered")}:{" "}
+                    <span className="font-medium text-foreground">
+                      {webhook.last_delivered_at_human ??
+                        webhook.last_delivered_at ??
+                        t("webhook.noDeliveries")}
+                    </span>
+                  </p>
+                </div>
+              </div>
+            ) : (
+            <>
+            {manualReason ? (
+              <div className="flex items-start gap-2.5 rounded-lg border border-warning/40 bg-warning/5 p-3 text-sm">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warning" />
+                <p>{manualReason}</p>
+              </div>
+            ) : null}
+            <div className="grid gap-5 lg:grid-cols-2 lg:items-start">
+              <div className="space-y-4">
+                <ReadOnlyField
+                  label={t("webhook.url")}
+                  hint={t("webhook.urlHint")}
+                  value={webhook.url}
+                />
+                {webhook.secret ? (
+                  <ReadOnlyField
+                    label={t("webhook.secret")}
+                    value={webhook.secret}
+                    secret
+                  />
+                ) : !canManage ? (
+                  <p className="text-xs text-muted-foreground">{t("webhook.secretWithheld")}</p>
+                ) : null}
+                <p className="text-xs text-muted-foreground">
+                  {t("webhook.lastDelivered")}:{" "}
+                  <span className="font-medium text-foreground">
+                    {webhook.last_delivered_at_human ??
+                      webhook.last_delivered_at ??
+                      t("webhook.noDeliveries")}
+                  </span>
+                </p>
+              </div>
+
+              {activeProvider?.instructions ? (
+                <Instructions
+                  label={t("webhook.howTo")}
+                  text={activeProvider.instructions}
+                />
+              ) : null}
+            </div>
+            </>
+            )}
+
+            {canManage ? (
+              <div className="border-t pt-4">
+                <Button
+                  variant="outline"
+                  onClick={() => setRotateOpen(true)}
+                  disabled={busy}
+                >
+                  <RefreshCw className="size-4" />
+                  {t("webhook.rotate")}
+                </Button>
+              </div>
+            ) : null}
+          </>
+        ) : configured ? (
+          <p className="text-sm text-muted-foreground">
+            {t("webhook.offBody", { branch: application.branch ?? "main" })}
+          </p>
+        ) : !canManage ? (
+          <p className="text-sm text-muted-foreground">
+            {t("webhook.disabledBody")}
+          </p>
+        ) : providers.length ? (
+          <div className="space-y-4">
+            <div className="space-y-3">
+              <p className="max-w-prose text-sm text-muted-foreground">
+                {providers.length === 1
+                  ? t("webhook.disabledBodyNamed", { provider: providers[0].title })
+                  : t("webhook.disabledBody")}
+              </p>
+              {providers.length === 1 ? null : (
+                <div className="space-y-1.5">
+                  <Label className="text-sm" hint={t("webhook.providerHint")}>{t("webhook.provider")}</Label>
+                  <Select value={providerName} onValueChange={setProviderName}>
+                    <SelectTrigger className="w-full">
+                      <SelectValue
+                        placeholder={t("webhook.providerPlaceholder")}
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {providers.map((p) => (
+                        <SelectItem key={p.name} value={p.name}>
+                          {p.title}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {wantsToken ? (
+                <div className="space-y-1.5">
+                  <Label htmlFor="gitlab-token" className="text-sm" hint={t("webhook.gitlabTokenHint")}>
+                    {t("webhook.gitlabToken")}
+                  </Label>
+                  <Input
+                    id="gitlab-token"
+                    value={gitlabToken}
+                    onChange={(e) => setGitlabToken(e.target.value)}
+                    placeholder={t("webhook.gitlabTokenPlaceholder")}
+                    autoComplete="off"
+                    className="font-mono text-xs"
+                  />
+                </div>
+              ) : null}
+
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-destructive">
+            {t("webhook.providersUnavailable")}
+          </p>
+        )}
+      </CardContent>
+
+      <ConfirmDialog
+        open={rotateOpen}
+        onOpenChange={setRotateOpen}
+        icon={RefreshCw}
+        title={t("webhook.rotateConfirmTitle")}
+        description={
+          webhook.registered
+            ? t("webhook.rotateConfirmBodyRegistered", { provider: activeProvider?.title ?? webhook.provider ?? "" })
+            : t("webhook.rotateConfirmBody")
+        }
+        cancelLabel={t("cancel")}
+        confirmLabel={busy ? t("webhook.rotating") : t("webhook.rotate")}
+        pending={busy}
+        onConfirm={rotate}
+      />
+    </Card>
+  );
+}

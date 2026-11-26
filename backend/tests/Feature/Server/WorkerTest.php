@@ -1,0 +1,1639 @@
+<?php
+
+use App\Contracts\PhpStack;
+use App\Jobs\InstallSupervisor;
+use App\Models\Application;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Models\Worker;
+use App\Services\Applications\SiteTypeManager;
+use App\Services\Server\Applications\FrameworkDetector;
+use App\Services\Server\Applications\WorkerSupervisor;
+use App\Services\Server\LogManager;
+use App\Services\Server\Php\Stacks\LsphpPhpStack;
+use App\Services\Server\ServerOps;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+
+/**
+ * Fake server state, held statically rather than on the test case: writes made through Pest's
+ * `test()` proxy from inside an HTTP request do not reliably reach the test.
+ */
+class WorkerFake
+{
+    /**
+     * How many copies of each program supervisord currently has up.
+     *
+     * A count, not a set of unit names: "three of four running" must be representable.
+     *
+     * @var array<string, int>
+     */
+    public static array $running = [];
+
+    /** @var array<int, string> Every command the panel ran, in order. */
+    public static array $ran = [];
+
+    public static string $env = '';
+
+    /** @var array<int, string> Paths that exist on the fake filesystem. */
+    public static array $present = [];
+
+    /**
+     * Whether supervisord is on the box.
+     *
+     * Default true, as on a fresh install; a panel upgraded from an older release may have none.
+     */
+    public static bool $supervisorInstalled = true;
+
+    /**
+     * Binaries this server's sudoers grant does not cover.
+     *
+     * Separate from `$supervisorInstalled`: the two look identical through `which`, but one is a
+     * package to install and the other a grant to rewrite.
+     *
+     * @var array<int, string>
+     */
+    public static array $denied = [];
+
+    public static function reset(): void
+    {
+        self::$running = [];
+        self::$ran = [];
+        self::$env = "APP_ENV=production\nCACHE_STORE=redis\n";
+        self::$present = ['/home/workerowner/queued-site/public_html/artisan'];
+        self::$supervisorInstalled = true;
+        self::$denied = [];
+    }
+
+    /** The program name out of `sv-worker-shop-queue:*`. */
+    public static function program(string $target): string
+    {
+        return explode(':', $target)[0];
+    }
+
+    /**
+     * What `supervisorctl status` prints for a program.
+     *
+     * Real output, because the panel parses it: one line per process, state in the second column.
+     */
+    public static function statusOutput(string $program): string
+    {
+        $count = self::$running[$program] ?? 0;
+        $lines = [];
+
+        for ($i = 0; $i < $count; $i++) {
+            $lines[] = sprintf('%s:%s_%02d   RUNNING   pid %d, uptime 0:04:11', $program, $program, $i, 1000 + $i);
+        }
+
+        return implode("\n", $lines);
+    }
+}
+
+/*
+ * The tests that matter are about the multiple (`numprocs`): asking for four starts four,
+ * lowering the count stops the surplus, and "three of four" is its own state, not a green dot.
+ */
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    $systemUser = SystemUser::create(['username' => 'workerowner', 'home_path' => '/home/workerowner']);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Queued Site',
+        'slug' => 'queued-site',
+        'domain' => 'queued.test',
+        'site_type' => 'git',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+        'php_version' => '8.4',
+    ]);
+
+    WorkerFake::reset();
+});
+
+function fakeWorkerSupervisor(): void
+{
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+        [$binary] = $args;
+
+        WorkerFake::$ran[] = implode(' ', $args);
+
+        // Before anything else, because this is what sudo does: the binary is
+        // never reached, so no fake behaviour below it may run either.
+        if (in_array($binary, WorkerFake::$denied, true)) {
+            return Process::result(errorOutput: "sudo: a password is required\n", exitCode: 1);
+        }
+
+        if ($binary === 'which') {
+            return Process::result(exitCode: WorkerFake::$supervisorInstalled ? 0 : 1);
+        }
+
+        if ($binary === 'test') {
+            $path = $args[2] ?? '';
+            $exists = in_array($path, WorkerFake::$present, true)
+                || $path === test()->application->rootPath().'/.env';
+
+            return Process::result(exitCode: $exists ? 0 : 1);
+        }
+
+        if ($binary === 'cat') {
+            return Process::result(output: WorkerFake::$env);
+        }
+
+        if ($binary === 'supervisorctl') {
+            $verb = $args[1] ?? '';
+            $program = WorkerFake::program($args[2] ?? '');
+
+            if ($verb === 'status') {
+                if (! isset($args[2])) {
+                    return Process::result(output: implode("\n", array_map(fn ($name) => WorkerFake::statusOutput($name), array_keys(WorkerFake::$running))));
+                }
+                // Exit 3 is supervisorctl's "some processes are not running", which is what it
+                // answers for a stopped program; a fake returning 0 would never exercise that.
+                $output = WorkerFake::statusOutput($program);
+
+                return Process::result(output: $output, exitCode: $output === '' ? 3 : 0);
+            }
+
+            // Starting brings up as many copies as the row asks for (`numprocs`); stopping clears
+            // them. Read from the database so "lower the count and re-apply" is a real transition.
+            if (in_array($verb, ['start', 'restart'], true)) {
+                $slug = str_starts_with($program, 'sv-worker-') ? substr($program, strlen('sv-worker-')) : $program;
+                $processes = (int) (Worker::query()->where('program', $program)->orWhere(fn ($query) => $query->whereNull('program')->where('slug', $slug))->value('processes') ?? 0);
+
+                WorkerFake::$running[$program] = $processes;
+            }
+
+            if ($verb === 'stop') {
+                unset(WorkerFake::$running[$program]);
+            }
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function workerUrl(string $suffix = ''): string
+{
+    return '/api/applications/'.test()->application->id.'/workers'.$suffix;
+}
+
+function workerPayload(array $overrides = []): array
+{
+    return array_merge([
+        'name' => 'Queue worker',
+        'command' => 'php8.4 artisan queue:work --sleep=3 --tries=3',
+        'kind' => 'queue',
+        'processes' => 1,
+    ], $overrides);
+}
+
+it('offers presets for the framework it finds, not a blank box', function () {
+    fakeWorkerSupervisor();
+
+    $response = $this->actingAs($this->admin)->getJson(workerUrl())->assertOk();
+    $presets = collect($response->json('presets'));
+
+    // The empty state is the feature: nobody should have to remember
+    // `--sleep=3 --tries=3` to get a queue running.
+    expect($presets->pluck('key')->all())->toBe(['queue', 'horizon', 'custom'])
+        ->and($presets->firstWhere('key', 'queue')['command'])->toContain('artisan queue:work')
+        ->and($presets->firstWhere('key', 'queue')['title'])->toBe('Queue worker');
+});
+
+it('orders workers without case bias', function () {
+    fakeWorkerSupervisor();
+
+    foreach (['Case Zebra', 'case apple', 'CASE Banana'] as $name) {
+        Worker::create([
+            'application_id' => $this->application->id,
+            'name' => $name,
+            'command' => 'php8.4 artisan queue:work',
+            'kind' => 'custom',
+        ]);
+    }
+
+    $names = collect($this->actingAs($this->admin)->getJson(workerUrl())->assertOk()->json('workers'))
+        ->pluck('name')->all();
+
+    expect($names)->toBe(['case apple', 'CASE Banana', 'Case Zebra']);
+});
+
+it('finds Craft above its served web directory and runs the worker there', function () {
+    $this->application->update(['site_type' => 'craftcms', 'web_root' => '/web']);
+    WorkerFake::$present = ['/home/workerowner/queued-site/public_html/craft'];
+    fakeWorkerSupervisor();
+
+    $presets = collect($this->actingAs($this->admin)->getJson(workerUrl())->assertOk()->json('presets'));
+
+    expect($presets->pluck('key')->all())->toBe(['queue', 'custom'])
+        ->and($presets->firstWhere('key', 'queue')['command'])->toBe('php8.4 craft queue/listen');
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+        'command' => 'php8.4 craft queue/listen',
+        'kind' => 'queue',
+    ]))->assertCreated();
+
+    // The supervisor program's `directory`, which is where Craft's own CLI
+    // lives — above the served `web/`, not inside it. The worker has to run
+    // from the project root or `craft` is not on the path it starts in.
+    Process::assertRan(fn ($process) => str_contains((string) $process->input, 'directory=/home/workerowner/queued-site/public_html')
+        && str_contains((string) $process->input, 'command=/usr/bin/php8.4 craft queue/listen'));
+
+    $worker = Worker::firstOrFail();
+    WorkerFake::$ran = [];
+    $this->actingAs($this->admin)->postJson(workerUrl("/{$worker->id}/restart"))->assertOk();
+
+    expect(collect(WorkerFake::$ran)->contains(fn (string $command) => str_contains($command, 'artisan queue:restart')))
+        ->toBeFalse()
+        ->and(collect(WorkerFake::$ran)->contains(fn (string $command) => str_contains($command, "restart {$worker->program}:*")))
+        ->toBeTrue();
+});
+
+it('finds Statamic above its public web directory', function () {
+    $this->application->update(['site_type' => 'statamic', 'web_root' => '/public']);
+    WorkerFake::$present = [
+        '/home/workerowner/queued-site/public_html/please',
+        '/home/workerowner/queued-site/public_html/artisan',
+        '/home/workerowner/queued-site/public_html/bootstrap/cache/config.php',
+    ];
+    fakeWorkerSupervisor();
+
+    $presets = collect($this->actingAs($this->admin)->getJson(workerUrl())->assertOk()->json('presets'));
+    $detector = app(FrameworkDetector::class);
+
+    expect($presets->pluck('key')->all())->toBe(['queue', 'horizon', 'custom'])
+        ->and($presets->firstWhere('key', 'queue')['command'])->toContain('artisan queue:work')
+        ->and($detector->requiresApply($this->application, FrameworkDetector::STATAMIC))->toBeTrue()
+        ->and($detector->applyCommand($this->application, FrameworkDetector::STATAMIC))
+        ->toBe(['php8.4', '/home/workerowner/queued-site/public_html/artisan', 'config:clear']);
+});
+
+it('finds a brownfield Laravel project above its public web directory', function () {
+    $this->application->update(['web_root' => '/public']);
+    WorkerFake::$present = [
+        '/home/workerowner/queued-site/public_html/artisan',
+        '/home/workerowner/queued-site/public_html/bootstrap/cache/config.php',
+    ];
+    fakeWorkerSupervisor();
+
+    $detector = app(FrameworkDetector::class);
+
+    expect($detector->detect($this->application))->toBe(FrameworkDetector::LARAVEL)
+        ->and($detector->root($this->application))->toBe('/home/workerowner/queued-site/public_html')
+        ->and($detector->requiresApply($this->application, FrameworkDetector::LARAVEL))->toBeTrue()
+        ->and($detector->applyCommand($this->application, FrameworkDetector::LARAVEL))
+        ->toBe(['php8.4', '/home/workerowner/queued-site/public_html/artisan', 'config:clear']);
+});
+
+it('keeps current flat git deployments rooted in the served directory', function () {
+    $this->application->update(['web_root' => '/public']);
+    WorkerFake::$present = ['/home/workerowner/queued-site/public_html/public/artisan'];
+    fakeWorkerSupervisor();
+
+    $detector = app(FrameworkDetector::class);
+
+    expect($detector->detect($this->application))->toBe(FrameworkDetector::LARAVEL)
+        ->and($detector->root($this->application))->toBe('/home/workerowner/queued-site/public_html/public');
+});
+
+it('keeps n8n and Node-RED on the custom worker preset', function (string $siteType) {
+    $this->application->update([
+        'site_type' => $siteType,
+        'serving_profile' => 'node',
+        'web_root' => '/',
+    ]);
+    WorkerFake::$present = ['/home/workerowner/queued-site/public_html/package.json'];
+    fakeWorkerSupervisor();
+
+    expect($this->actingAs($this->admin)->getJson(workerUrl())->assertOk()->json('presets.*.key'))
+        ->toBe(['custom']);
+})->with(['n8n', 'nodered']);
+
+it('creates a worker and starts as many copies as asked for', function () {
+    fakeWorkerSupervisor();
+
+    $response = $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload(['processes' => 3]))
+        ->assertCreated();
+
+    expect($response->json('worker.running'))->toBe(3)
+        ->and($response->json('worker.state'))->toBe('running');
+
+    // supervisor owns the copies via `numprocs`, so the evidence is how many
+    // it reports running — not a unit name per copy, which no longer exists.
+    $worker = Worker::first();
+    expect(WorkerFake::$running[$worker->program] ?? 0)->toBe(3);
+});
+
+it('gives a queue worker time to finish its job, and a custom one the usual 30 seconds (bug #74)', function () {
+    fakeWorkerSupervisor();
+
+    // supervisord kills a worker that outlives stopwaitsecs; at 30 seconds a
+    // restart killed any queued job longer than that, mid-run.
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+        'name' => 'Sync', 'kind' => 'custom', 'command' => 'php8.4 artisan app:sync',
+    ]))->assertCreated();
+
+    expect(Worker::where('kind', 'queue')->value('stop_wait_seconds'))->toBe(Worker::MAX_STOP_WAIT)
+        ->and(Worker::where('kind', 'custom')->value('stop_wait_seconds'))->toBe(30);
+});
+
+it('accepts a stop wait up to an hour, and no more', function () {
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['stop_wait_seconds' => 3600]))->assertCreated();
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['name' => 'Second', 'kind' => 'custom', 'stop_wait_seconds' => 3601]))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('stop_wait_seconds');
+});
+
+it('reports a partly-running pool as its own state', function () {
+    fakeWorkerSupervisor();
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['processes' => 3]));
+
+    $worker = Worker::first();
+
+    // One copy died. A green dot would hide this, and a half-dead worker pool
+    // is exactly the state nobody notices until the queue backs up.
+    WorkerFake::$running[$worker->program] = 2;
+
+    $status = app(WorkerSupervisor::class)->status($worker->load('application.systemUser'));
+
+    expect($status)->toMatchArray(['running' => 2, 'requested' => 3, 'state' => 'degraded']);
+});
+
+it('stops the surplus when the process count is lowered', function () {
+    fakeWorkerSupervisor();
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['processes' => 4]));
+    $worker = Worker::first();
+
+    $this->actingAs($this->admin)
+        ->putJson(workerUrl('/'.$worker->id), workerPayload(['processes' => 2]))
+        ->assertOk();
+
+    // Two copies must actually stop; nothing else would notice four processes still consuming
+    // the queue. Supervisor retires them on `update`.
+    expect(WorkerFake::$running[$worker->program] ?? 0)->toBe(2);
+
+    // And the pair that does it, in that order — `update` alone acts on a
+    // config supervisord has not re-read, so the change would appear to save
+    // and do nothing.
+    $commands = implode(' | ', WorkerFake::$ran);
+    expect($commands)->toContain('supervisorctl reread')
+        ->and($commands)->toContain('supervisorctl update');
+});
+
+it('refuses a worker whose unit will not stay up', function () {
+    // Every command reports success, but the unit is never active — exactly
+    // what a mistyped command does, and the reason `start` alone cannot be
+    // trusted to mean the worker is running.
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if ($args[0] === 'supervisorctl' && ($args[1] ?? '') === 'status' && isset($args[2])) {
+            return Process::result(output: ($args[2] ?? '').': ERROR (no such process)', exitCode: 4);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    // A command that will not run is the user's to fix, not a server fault: 422 with a reason
+    // and the reference, not a bare 500.
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload())
+        ->assertStatus(422)
+        ->assertJsonPath('reason', 'worker_did_not_start')
+        ->assertJsonPath('message', fn (string $message) => str_contains($message, 'so it was not added'))
+        ->assertJsonStructure(['reference', 'output', 'errors' => ['command']]);
+});
+
+it('quotes what a worker printed before it died', function () {
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        return match (true) {
+            ($args[0] ?? '') === 'tail' => Process::result(output: "PHP 8.4.1 (cli)\nCould not open input file: artisan\n"),
+            ($args[0] ?? '') === 'supervisorctl' && ($args[1] ?? '') === 'status' && isset($args[2]) => Process::result(output: ($args[2] ?? '').': ERROR (no such process)', exitCode: 4),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload())
+        ->assertStatus(422)
+        ->assertJsonPath('output', 'Could not open input file: artisan');
+
+    expect(Worker::count())->toBe(0);
+});
+
+describe('restarting', function () {
+    it('asks a queue worker to finish its job rather than killing it', function () {
+        fakeWorkerSupervisor();
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload());
+        $worker = Worker::first();
+
+        WorkerFake::$ran = [];
+        $this->actingAs($this->admin)->postJson(workerUrl("/{$worker->id}/restart"))->assertOk();
+
+        // `queue:restart` lets the worker finish the job it is holding and
+        // exit; a unit restart could kill it mid-payment.
+        expect(collect(WorkerFake::$ran)->contains(fn (string $c) => str_contains($c, 'artisan queue:restart')))
+            ->toBeTrue();
+    });
+
+    it('asks as the account the worker runs as, never the panel\'s', function (string $kind, string $command, string $verb) {
+        // As the panel's own account `queue:restart` could read the site's code but not write its
+        // `storage/`, so Laravel could not open its log and exited 1, and every graceful restart
+        // fell back to a hard supervisor restart that kills the running job.
+        fakeWorkerSupervisor();
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+            'name' => 'Q', 'command' => $command, 'kind' => $kind,
+        ]));
+        $worker = Worker::first();
+
+        WorkerFake::$ran = [];
+        $this->actingAs($this->admin)->postJson(workerUrl("/{$worker->id}/restart"))->assertOk();
+
+        $graceful = collect(WorkerFake::$ran)->first(fn (string $c) => str_contains($c, "artisan {$verb}"));
+
+        expect($graceful)->toStartWith('runuser -u workerowner -- ');
+    })->with([
+        'queue' => ['queue', 'php8.4 artisan queue:work', 'queue:restart'],
+        'horizon' => ['horizon', 'php8.4 artisan horizon', 'horizon:terminate'],
+    ]);
+
+    it('uses horizon:terminate for Horizon', function () {
+        fakeWorkerSupervisor();
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+            'name' => 'Horizon', 'command' => 'php8.4 artisan horizon', 'kind' => 'horizon',
+        ]));
+        $worker = Worker::first();
+
+        WorkerFake::$ran = [];
+        $this->actingAs($this->admin)->postJson(workerUrl("/{$worker->id}/restart"));
+
+        expect(collect(WorkerFake::$ran)->contains(fn (string $c) => str_contains($c, 'artisan horizon:terminate')))
+            ->toBeTrue();
+    });
+
+    it('restarts the unit for a command with no such protocol', function () {
+        fakeWorkerSupervisor();
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+            'name' => 'Custom', 'command' => '/usr/bin/myscript', 'kind' => 'custom',
+        ]));
+        $worker = Worker::first();
+
+        WorkerFake::$ran = [];
+        $this->actingAs($this->admin)->postJson(workerUrl("/{$worker->id}/restart"));
+
+        expect(collect(WorkerFake::$ran)->contains(fn (string $c) => str_contains($c, "restart {$worker->program}:*")))
+            ->toBeTrue();
+    });
+});
+
+describe('guardrails', function () {
+    it('refuses Horizon alongside a queue worker', function () {
+        fakeWorkerSupervisor();
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload());
+
+        // Horizon supervises its own workers, so both together means every job
+        // is handled twice — and neither tool can see the other.
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload([
+                'name' => 'Horizon', 'command' => 'php8.4 artisan horizon', 'kind' => 'horizon',
+            ]))
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('kind');
+    });
+
+    it('refuses a command with shell syntax in it', function () {
+        fakeWorkerSupervisor();
+
+        // systemd execs ExecStart directly — a pipe would be passed to the
+        // binary as a literal argument rather than doing what it looks like.
+        foreach (['php artisan queue:work | tee log', 'sh -c "x"; rm -rf /', 'php `whoami`'] as $command) {
+            $this->actingAs($this->admin)
+                ->postJson(workerUrl(), workerPayload(['command' => $command]))
+                ->assertStatus(422)
+                ->assertJsonValidationErrors('command');
+        }
+    });
+
+    it('caps how many copies can be asked for', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['processes' => 999]))
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('processes');
+    });
+
+    it('warns when queue:restart would silently do nothing', function () {
+        // `queue:restart` leaves a flag in the cache for workers to read, and the array driver
+        // does not survive the process that wrote it: the command succeeds, nothing restarts.
+        WorkerFake::$env = "APP_ENV=production\nCACHE_STORE=array\n";
+        fakeWorkerSupervisor();
+
+        $checks = collect($this->actingAs($this->admin)->getJson(workerUrl())->json('checks'));
+
+        expect($checks->pluck('code'))->toContain('cache_driver_array')
+            ->and($checks->firstWhere('code', 'cache_driver_array')['title'])
+            ->toBe('Workers cannot be restarted automatically');
+    });
+
+    it('says nothing about the cache when the driver is fine', function () {
+        fakeWorkerSupervisor();
+
+        expect($this->actingAs($this->admin)->getJson(workerUrl())->json('checks'))->toBe([]);
+    });
+});
+
+describe('which sites have workers', function () {
+    it('includes blank PHP and Craft, which run their own code', function () {
+        foreach (['php', 'craftcms', 'statamic', 'git'] as $type) {
+            // Not `toContain($needle, $message)` — the second argument there is
+            // another value to look for, not a failure message.
+            $features = app(SiteTypeManager::class)->find($type)->features();
+
+            expect(in_array('app_worker', $features, true))->toBeTrue("{$type} should have workers");
+        }
+    });
+
+    it('excludes marketplace apps that manage their own background work', function () {
+        foreach (['wordpress', 'joomla', 'static', 'phpmyadmin'] as $type) {
+            expect(app(SiteTypeManager::class)->find($type)->features())
+                ->not->toContain('app_worker');
+        }
+    });
+
+    it('is refused at the endpoint for a site that has none', function () {
+        fakeWorkerSupervisor();
+
+        $wordpress = Application::forceCreate([
+            'system_user_id' => $this->application->system_user_id,
+            'name' => 'Blog',
+            'slug' => 'blog', 'domain' => 'blog.test', 'site_type' => 'wordpress',
+            'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/',
+        ]);
+
+        $this->actingAs($this->admin)
+            ->getJson("/api/applications/{$wordpress->id}/workers")
+            ->assertNotFound();
+    });
+});
+
+describe('permissions', function () {
+    it('lets a viewer read but not change', function () {
+        fakeWorkerSupervisor();
+        $user = User::factory()->create();
+        grantPermission($user, 'app_worker', view: true, manage: false);
+
+        $this->actingAs($user)->getJson(workerUrl())->assertOk();
+        $this->actingAs($user)->postJson(workerUrl(), workerPayload())->assertForbidden();
+    });
+
+    it('denies a user with no grant', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs(User::factory()->create())->getJson(workerUrl())->assertForbidden();
+    });
+
+    it('denies an unauthenticated caller', function () {
+        fakeWorkerSupervisor();
+
+        // Its own test: an earlier actingAs in the same test leaves the guard
+        // resolved, and the request would answer for that user instead.
+        $this->getJson(workerUrl())->assertUnauthorized();
+    });
+});
+
+describe('a worker id from another application', function () {
+    it('is not editable, deletable or controllable through the wrong application', function () {
+        // Route model binding resolves {worker} from the whole table. Without a scope check,
+        // PUT /applications/1/workers/99 edits site 2's worker and logs it against site 1: an
+        // audit trail naming the wrong site, which is worse than none because it is believed.
+        fakeWorkerSupervisor();
+
+        $other = Application::forceCreate([
+            'system_user_id' => $this->application->system_user_id,
+            'name' => 'Other Site', 'slug' => 'other-site', 'domain' => 'other.test',
+            'site_type' => 'git', 'serving_profile' => 'php', 'status' => 'active',
+            'web_root' => '/', 'php_version' => '8.4',
+        ]);
+
+        $foreign = Worker::create([
+            'application_id' => $other->id,
+            'name' => 'Someone else\'s worker',
+            'command' => 'php8.4 artisan queue:work',
+            'kind' => 'custom',
+        ]);
+
+        // 404, not 403: from here that worker does not exist under this
+        // application, and "forbidden" would confirm it exists somewhere else.
+        $this->actingAs($this->admin)
+            ->putJson(workerUrl('/'.$foreign->id), workerPayload(['name' => 'Renamed']))
+            ->assertNotFound();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl('/'.$foreign->id.'/restart'))
+            ->assertNotFound();
+
+        $this->actingAs($this->admin)
+            ->deleteJson(workerUrl('/'.$foreign->id))
+            ->assertNotFound();
+
+        // Untouched, and still there.
+        expect($foreign->fresh())->not->toBeNull()
+            ->and($foreign->fresh()->name)->toBe('Someone else\'s worker');
+    });
+});
+
+it('refuses a name or directory that would be two systemd directives', function () {
+    // The name is rendered into `Description=` and the directory into `WorkingDirectory=`, in a
+    // file the panel writes and systemd executes: a newline there is a directive of the caller's
+    // choosing.
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload([
+            'name' => "Queue\nExecStartPre=/bin/sh -c 'id > /tmp/pwned'",
+        ]))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('name');
+
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload(['directory' => "/srv/app\nUser=root"]))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('directory');
+
+    expect(Worker::count())->toBe(0);
+});
+
+describe('the unit name', function () {
+    it('is the slug, so it says what it is when read on the box', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['name' => 'Email Queue']))->assertCreated();
+        $worker = Worker::query()->firstOrFail();
+
+        // `sv-worker-3` tells an operator in journalctl nothing. The
+        // application is in it because "queue" alone is ambiguous on a box
+        // with twenty sites.
+        expect($worker->slug)->toBe('queued-site-email-queue')
+            ->and(app(WorkerSupervisor::class)->program($worker))
+            ->toBe('email-queue');
+    });
+
+    it('does not move when the worker is renamed', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['name' => 'Email Queue']))->assertCreated();
+        $worker = Worker::query()->firstOrFail();
+        $before = app(WorkerSupervisor::class)->program($worker);
+
+        $this->actingAs($this->admin)
+            ->putJson(workerUrl('/'.$worker->id), workerPayload(['name' => 'Something Else']))
+            ->assertOk();
+
+        // The whole reason identity is not the name. Renaming under a
+        // name-derived unit means stop, disable, delete, write, enable, start
+        // on a running process — and a half-failure leaves an orphan still
+        // consuming the queue.
+        expect($worker->fresh()->name)->toBe('Something Else')
+            ->and($worker->fresh()->slug)->toBe('queued-site-email-queue')
+            ->and(app(WorkerSupervisor::class)->program($worker->fresh()))->toBe($before);
+    });
+
+    it('suffixes rather than collides when two names reduce to one slug', function () {
+        fakeWorkerSupervisor();
+
+        // The name is unique per application, but Str::slug() is lossy: these
+        // two reduce to the same string. Checking the name would let both
+        // claim one unit.
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['name' => 'My Queue']))->assertCreated();
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['name' => 'my-queue']))->assertCreated();
+
+        [$first, $second] = Worker::query()->orderBy('id')->get()->all();
+
+        expect($first->slug)->toBe('queued-site-my-queue')
+            ->and($second->slug)->toBe('queued-site-my-queue-2');
+    });
+});
+
+describe('a server without supervisord', function () {
+    it('installs supervisor itself rather than telling someone to run apt', function () {
+        // The panel has the sudo grant and knows the package name; it installs PHP versions,
+        // database engines and fail2ban this way, so it must not hand the user a shell command.
+        Queue::fake();
+
+        WorkerFake::$supervisorInstalled = false;
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertStatus(202);
+
+        Queue::assertPushed(InstallSupervisor::class);
+    });
+
+    it('does not create the worker while supervisor is still arriving', function () {
+        // 202 is "started", not "done". A row here would be a worker the panel
+        // lists and supervisord has never heard of.
+        Queue::fake();
+
+        WorkerFake::$supervisorInstalled = false;
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertStatus(202);
+
+        expect(Worker::query()->count())->toBe(0);
+    });
+
+    it('does not queue a second apt when one is already running', function () {
+        // apt is minutes long and the job is not re-entrant. A double click,
+        // or a second person on the same screen, must not stack installs.
+        Queue::fake();
+
+        WorkerFake::$supervisorInstalled = false;
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertStatus(202);
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertStatus(202);
+
+        Queue::assertPushed(InstallSupervisor::class, 1);
+    });
+
+    it('refuses to install over a supervisor that is already there', function () {
+        // Rather than spending minutes of apt proving what `which` answered.
+        Queue::fake();
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl('/install-supervisor'))
+            ->assertStatus(422);
+
+        Queue::assertNotPushed(InstallSupervisor::class);
+    });
+
+    it('needs the same grant as creating a worker', function () {
+        Queue::fake();
+        fakeWorkerSupervisor();
+
+        $viewer = User::factory()->create();
+        grantPermission($viewer, 'app_worker', view: true, manage: false);
+
+        $this->actingAs($viewer)
+            ->postJson(workerUrl('/install-supervisor'))
+            ->assertForbidden();
+    });
+
+    it('still refuses outright on a path that cannot install for you', function () {
+        // Creating now starts an install, but every other caller of apply() —
+        // editing a worker, a deploy restarting them — has no such option, and
+        // must not write a program file into a directory that is not there.
+        // The 422 and its message survive for exactly those.
+        $worker = Worker::create([
+            'application_id' => $this->application->id,
+            'name' => 'Queue worker',
+            'command' => 'php artisan queue:work',
+            'kind' => 'queue',
+            'processes' => 1,
+        ]);
+
+        WorkerFake::$supervisorInstalled = false;
+        fakeWorkerSupervisor();
+
+        $response = $this->actingAs($this->admin)
+            ->putJson(workerUrl('/'.$worker->id), workerPayload(['name' => 'Renamed']))
+            ->assertStatus(422);
+
+        // Not a 500, and not the shell's words.
+        expect($response->json('message'))->toContain('supervisor');
+    });
+
+    it('writes nothing before it refuses', function () {
+        // The whole point of checking first. Half a worker on disk, with a row
+        // in the database and no program to match, is worse than no worker.
+        Queue::fake();
+
+        WorkerFake::$supervisorInstalled = false;
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertStatus(202);
+
+        expect(collect(WorkerFake::$ran)->filter(fn (string $c): bool => str_contains($c, 'tee')))
+            ->toBeEmpty()
+            ->and(Worker::query()->count())->toBe(0);
+    });
+
+    it('creates normally when supervisord is there', function () {
+        // The guard must not be the thing that breaks a working server.
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), [
+                'name' => 'Queue worker',
+                'command' => 'php artisan queue:work',
+                'kind' => 'queue',
+                'processes' => 1,
+            ])
+            ->assertCreated();
+
+        expect(Worker::query()->count())->toBe(1);
+    });
+});
+
+describe('a server whose sudo grant is out of date', function () {
+    /*
+     * `sudo -n supervisorctl update` answers "a password is required" when the grant in
+     * /etc/sudoers.d predates the binary: the file is rewritten only by install.sh and the
+     * update's `sync_privileges` step, which is deliberately never fatal.
+     */
+
+    beforeEach(function () {
+        // phpunit.xml disables escalation suite-wide. With sudo off no command is elevated, so
+        // none can be refused and every assertion below would pass against the old failure.
+        config()->set('server.privilege.sudo', true);
+    });
+
+    it('names the grant rather than the feature', function () {
+        $worker = Worker::create([
+            'application_id' => $this->application->id,
+            'name' => 'Queue worker',
+            'command' => 'php artisan queue:work',
+            'kind' => 'queue',
+            'processes' => 1,
+        ]);
+
+        $worker->forceFill(['program' => 'queue-worker'])->save();
+        WorkerFake::$denied = ['supervisorctl'];
+        fakeWorkerSupervisor();
+
+        $response = $this->actingAs($this->admin)
+            ->putJson(workerUrl('/'.$worker->id), workerPayload(['name' => 'Renamed']))
+            ->assertStatus(500);
+
+        expect($response->json('code'))->toBe('server_sudo_denied')
+            ->and($response->json('message'))->toContain('panel:sudoers')
+            // Not "could not control the worker": nothing about the worker is
+            // wrong, and that sentence sends the reader to the wrong screen.
+            ->and($response->json('message'))->not->toBe(__('errors/application.worker_control_failed'));
+    });
+
+    it('does not mistake a refused probe for a missing package', function () {
+        // The expensive version of the same confusion: `which` refused and `which` finding
+        // nothing share an exit code, so reading only the status sends a server that already
+        // has supervisord to apt, and the next create fails in exactly the same place.
+        Queue::fake();
+
+        WorkerFake::$denied = ['which'];
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertStatus(500)
+            ->assertJsonPath('code', 'server_sudo_denied');
+
+        Queue::assertNotPushed(InstallSupervisor::class);
+        expect(Worker::query()->count())->toBe(0);
+    });
+
+    it('stops at the refusal instead of reporting the next command', function () {
+        // `reload()` is deliberately non-fatal, which is right for supervisord disagreeing with a
+        // config and wrong for a grant that refuses every command after it too: carrying on
+        // reported "the worker would not start" for a config that was never applied.
+        WorkerFake::$denied = ['supervisorctl'];
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertStatus(500);
+
+        $supervisorctl = collect(WorkerFake::$ran)
+            ->filter(fn (string $c): bool => str_starts_with($c, 'supervisorctl'));
+
+        expect($supervisorctl->first())->toBe('supervisorctl status')
+            ->and($supervisorctl)->toHaveCount(1);
+    });
+});
+
+describe('the log source on the Logs screen', function () {
+    /*
+     * Regression guard: under systemd a worker's log was read with `journalctl -t`; supervisor
+     * writes `stdout_logfile` and never touches journald, so moving the writer without the
+     * reader left every worker's log permanently empty (not failing, so nobody reports it).
+     */
+    it('points at the file supervisord is actually told to write', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['name' => 'Email Queue']))->assertCreated();
+        $worker = Worker::query()->firstOrFail();
+
+        // Read the path back out of the rendered program block rather than
+        // rebuilding it here: the point is that the reader and the writer agree,
+        // and a test that computes its own expectation cannot show that.
+        preg_match('/^stdout_logfile=(.+)$/m', app(WorkerSupervisor::class)->render($worker), $matches);
+        $written = trim($matches[1] ?? '');
+
+        $source = app(LogManager::class)->find("sv-worker-{$worker->slug}");
+
+        expect($written)->not->toBe('')
+            ->and($source)->not->toBeNull()
+            ->and($source['path'])->toBe($written)
+            ->and($source['kind'])->not->toBe('journal');
+    });
+
+    it('follows a log file the user chose', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload(['log_file' => '/var/log/mine.log']))->assertCreated();
+        $worker = Worker::query()->firstOrFail();
+
+        expect(app(LogManager::class)->find("sv-worker-{$worker->slug}")['path'])
+            ->toBe('/var/log/mine.log');
+    });
+
+    /*
+     * `{appRoot}/logs` is root:{site user} 0750 by `ApplicationLogDirectory`,
+     * deliberately — so the panel account, which is neither, reads it through
+     * sudo like a cron log. Asserted because getting this wrong shows the
+     * source as readable and 500s on click.
+     */
+    it('is read through sudo, because the log directory excludes the panel account', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+        $worker = Worker::query()->firstOrFail();
+
+        expect(app(LogManager::class)->find("sv-worker-{$worker->slug}")['kind'])
+            ->toBe('privileged');
+    });
+});
+
+describe('a create that fails on the server', function () {
+    /*
+     * A worker the panel lists and supervisord has never heard of: `store()` wrote the row and
+     * then applied it, and when applying threw the row stayed behind with nothing on the server
+     * to control. The method already refused to create a row when supervisord was missing; this
+     * covers the apply itself failing.
+     */
+
+    beforeEach(function () {
+        config()->set('server.privilege.sudo', true);
+    });
+
+    it('leaves no worker behind when supervisorctl is refused', function () {
+        WorkerFake::$denied = ['supervisorctl'];
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertStatus(500);
+
+        expect(Worker::query()->count())->toBe(0);
+    });
+
+    it('leaves no worker behind when the unit cannot be written', function () {
+        // The other half of `apply()`, and a different failure: the config
+        // file never reaches the disk, so there is not even a program for
+        // supervisord to refuse to start.
+        WorkerFake::$denied = ['tee'];
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertStatus(500);
+
+        expect(Worker::query()->count())->toBe(0);
+    });
+
+    it('still keeps the worker when the create succeeds', function () {
+        // Without this the fix could be "delete the row every time" and every
+        // assertion above would still pass.
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)
+            ->postJson(workerUrl(), workerPayload())
+            ->assertCreated();
+
+        expect(Worker::query()->count())->toBe(1);
+    });
+});
+
+/*
+| Which PHP a worker actually starts under.
+|
+| The path used to be `/usr/bin/`.$binary, true only on the FPM stacks: an OpenLiteSpeed box has
+| no ondrej PHP, and install.sh creates /usr/local/bin/php because nothing else puts a `php` on
+| PATH there. So every PHP worker on OLS pointed at a file that does not exist.
+|
+| The real LsphpPhpStack is bound rather than a stub: its `detect()` falls back to the first
+| configured candidate when nothing is on disk, so on a box with no lsws tree it returns the
+| documented path deterministically. A stub would only prove the test agrees with itself.
+*/
+
+function useLsphpStack(): void
+{
+    app()->instance(PhpStack::class, new LsphpPhpStack(app(ServerOps::class)));
+}
+
+it('starts a worker on LSPHP when the server runs OpenLiteSpeed', function () {
+    useLsphpStack();
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains(
+        (string) $process->input,
+        'command=/usr/local/lsws/lsphp84/bin/php artisan queue:work',
+    ));
+
+    // Said explicitly, because this is the whole bug: the old path must not
+    // survive anywhere in the program block.
+    Process::assertRan(fn ($process) => ! str_contains((string) $process->input, '/usr/bin/php'));
+});
+
+it('writes exactly what it wrote before on an nginx or apache server', function () {
+    // The FPM stack is the default binding, so this is the untouched path. Asserted rather than
+    // assumed: boxes that work today must not move.
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains(
+        (string) $process->input,
+        'command=/usr/bin/php8.4 artisan queue:work',
+    ));
+});
+
+it('honours the version the user typed over the version the site is set to', function () {
+    useLsphpStack();
+    fakeWorkerSupervisor();
+
+    // The site is on 8.4. Somebody who writes php8.2 means 8.2 — the old
+    // `/usr/bin/`.$binary honoured that, and resolving must not quietly
+    // "correct" them onto the site's version.
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload(['command' => 'php8.2 artisan queue:work']))
+        ->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains(
+        (string) $process->input,
+        'command=/usr/local/lsws/lsphp82/bin/php artisan queue:work',
+    ));
+});
+
+it('falls back to the site version for a bare php', function () {
+    useLsphpStack();
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload(['command' => 'php artisan queue:work']))
+        ->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains(
+        (string) $process->input,
+        'command=/usr/local/lsws/lsphp84/bin/php artisan queue:work',
+    ));
+});
+
+it('leaves a command that is not php alone', function () {
+    useLsphpStack();
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+        'command' => '/usr/local/bin/myscript --loop',
+        'kind' => 'custom',
+    ]))->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains((string) $process->input, 'command=/usr/local/bin/myscript --loop'));
+});
+
+it('keeps the typed name when the operator has blanked the binary pattern', function () {
+    // A blank SERVER_PHP_BINARY_PATTERN means "use whatever is on PATH", and FpmPhpStack answers
+    // the bare `php` for it. Typed `php8.2` must survive that: collapsing it to `php` would
+    // silently move the worker onto whatever version PATH gives.
+    //
+    // Deliberately a *versioned* name: with a bare `php` the resolved and unresolved answers are
+    // both "php", so the test could not tell the guard from its absence.
+    config(['server.php_binary_pattern' => '']);
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload(['command' => 'php8.2 artisan queue:work']))
+        ->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains((string) $process->input, 'command=php8.2 artisan queue:work'));
+});
+
+it('never writes an empty command when no candidate path is configured', function () {
+    // `detect()` answers '' when its candidate list is empty. Falling through with that would
+    // write `command= artisan queue:work`, a block supervisord cannot start. Keep the typed
+    // name and let PATH decide.
+    useLsphpStack();
+    config(['server.php_stacks.lsphp.binary_candidates' => []]);
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+
+    Process::assertRan(fn ($process) => str_contains((string) $process->input, 'command=php8.4 artisan queue:work'));
+});
+
+it('restarts a worker with the resolved php, not a bare versioned name', function () {
+    useLsphpStack();
+    fakeWorkerSupervisor();
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+
+    $worker = Worker::firstOrFail();
+    WorkerFake::$ran = [];
+
+    $this->actingAs($this->admin)->postJson(workerUrl("/{$worker->id}/restart"))->assertOk();
+
+    // `php8.4 artisan queue:restart` relied on a versioned name being on PATH,
+    // which no stack provides on OpenLiteSpeed — PATH there has `php` and
+    // nothing else. A second, separate failure from the program command.
+    expect(collect(WorkerFake::$ran)->contains(
+        fn (string $command) => str_contains($command, '/usr/local/lsws/lsphp84/bin/php')
+            && str_contains($command, 'artisan queue:restart'),
+    ))->toBeTrue();
+});
+
+/*
+ * Anyone allowed to manage workers could run one as root, point its log at /etc, or override the
+ * account in Extra config. The admin keeps v7's freedom; everyone else is held to the site's own
+ * account and folders.
+ */
+describe('who a worker may run as', function () {
+    beforeEach(function () {
+        $this->member = User::factory()->create();
+        grantPermission($this->member, 'app_worker', manage: true);
+    });
+
+    it('refuses another account for a non-admin', function (string $user) {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload(['user' => $user]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('user');
+    })->with(['root', 'panel', 'www-data']);
+
+    it('lets a non-admin run it as the site account', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload(['user' => 'workerowner']))->assertCreated();
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload(['name' => 'Second', 'kind' => 'custom']))->assertCreated();
+    });
+
+    it('lets the admin choose root, as v7 did', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['user' => 'root']))->assertCreated();
+    });
+
+    it('keeps a non-admin from editing a worker that runs as root', function () {
+        fakeWorkerSupervisor();
+        $id = $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['user' => 'root']))->json('worker.id');
+
+        // `user` left out: the stored root still counts.
+        $this->actingAs($this->member)->putJson(workerUrl("/{$id}"), workerPayload(['command' => 'bash -c id']))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('user');
+    });
+
+    it('keeps a non-admin inside the site folders', function (array $fields, string $error) {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload($fields))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors($error);
+    })->with([
+        'directory under /etc' => [['directory' => '/etc'], 'directory'],
+        'directory beside the home' => [['directory' => '/home/workerowner2'], 'directory'],
+        'log under /etc' => [['log_file' => '/etc/cron.d/x'], 'log_file'],
+        'log in the home, where a symlink can be planted' => [['log_file' => '/home/workerowner/w.log'], 'log_file'],
+        'command in extra config' => [['extra_config' => "command=/bin/sh\n"], 'extra_config'],
+        'log in extra config' => [['extra_config' => 'stdout_logfile = /etc/x'], 'extra_config'],
+    ]);
+
+    it('takes a non-admin path that stays inside', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload([
+            'directory' => '/home/workerowner/queued-site',
+            'log_file' => $this->application->logsPath().'/queue.log',
+            'extra_config' => "startsecs=5\n",
+        ]))->assertCreated();
+    });
+
+    it('refuses user= in extra config even for the admin', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['extra_config' => "  User = root\n"]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_user')]);
+    });
+
+    it('refuses environment= in extra config even for the admin (W12)', function () {
+        // The template writes its own environment= line, and supervisord will
+        // not load a program that has two.
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['extra_config' => "startsecs=5\n Environment = APP_ENV=\"production\"\n"]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_environment')]);
+    });
+
+    /*
+     * The checks above matched `key =` only, and supervisord's parser reads more than that:
+     * `user: root` came out as root. Each form below is one it reads as the key on the left.
+     */
+    it('refuses the account in extra config in every form supervisord reads, even for the admin', function (string $extra) {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['extra_config' => $extra]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_user')]);
+
+        expect(Worker::count())->toBe(0);
+    })->with([
+        'colon' => ['user: root'],
+        'colon after a space' => ['user : root'],
+        'upper case' => ['USER:root'],
+        'tabs' => ["user\t:\troot"],
+        'non-breaking space before the colon' => ["user\u{A0}: root"],
+        'after a lone carriage return' => ["startsecs=5\ruser: root"],
+        'after a CRLF' => ["startsecs=5\r\nuser=root"],
+        'second line, after a comment' => ["; harmless\nstartsecs=5\nuser: root"],
+    ]);
+
+    it('refuses environment in extra config with a colon too, even for the admin', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['extra_config' => "startsecs=5\nenvironment: HOME=\"/root\""]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_environment')]);
+    });
+
+    it('refuses an indented line, which supervisord appends to the panel environment line', function (string $extra) {
+        // The line above Extra config is the panel's `environment=`, and an
+        // indented line continues it: `LD_PRELOAD` landed in the worker's
+        // environment past the check for `environment=`.
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['extra_config' => $extra]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_indented')]);
+    })->with([
+        'spaces' => ["startsecs=5\n    LD_PRELOAD=\"/home/workerowner/x.so\""],
+        'a tab' => ["startsecs=5\n\tstopsignal=INT"],
+        'a non-breaking space' => ["startsecs=5\n\u{A0}stopsignal=INT"],
+        // Python counts \v as indentation; splitting on it as a line break
+        // (which `\R` does) hid this one.
+        'a vertical tab' => ["startsecs=5\n\x0BLD_PRELOAD=\"/home/workerowner/x.so\""],
+        'a form feed' => ["startsecs=5\n\x0Cstopsignal=INT"],
+    ]);
+
+    it('refuses extra config that is not UTF-8', function () {
+        fakeWorkerSupervisor();
+
+        // Form-encoded, because JSON cannot carry the byte.
+        $this->actingAs($this->admin)->post(workerUrl(), workerPayload(['extra_config' => "startsecs=5\n\xFFuser=root"]), ['Accept' => 'application/json'])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_encoding')]);
+    });
+
+    it('keeps a non-admin from setting a path or the command in extra config in any form', function (string $extra, string $key) {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload(['extra_config' => $extra]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_key', ['key' => $key])]);
+
+        expect(Worker::count())->toBe(0);
+    })->with([
+        'log with a colon' => ['stdout_logfile : /etc/cron.d/evil', 'stdout_logfile'],
+        'stderr log with a colon' => ["redirect_stderr=false\nstderr_logfile:/etc/y", 'stderr_logfile'],
+        'command with a colon' => ['command: /bin/sh -c id', 'command'],
+        'directory upper case' => ['DIRECTORY: /etc', 'directory'],
+        'log after a non-breaking space' => ["Stdout_Logfile\u{A0}= /etc/x", 'stdout_logfile'],
+        'log after a lone carriage return' => ["startsecs=5\rstdout_logfile=/etc/x", 'stdout_logfile'],
+    ]);
+
+    it('refuses the same on an edit', function () {
+        fakeWorkerSupervisor();
+        $id = $this->actingAs($this->member)->postJson(workerUrl(), workerPayload())->assertCreated()->json('worker.id');
+
+        $this->actingAs($this->member)->putJson(workerUrl("/{$id}"), workerPayload(['extra_config' => "startsecs=5\ruser: root"]))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['extra_config' => __('worker.errors.extra_config_user')]);
+
+        expect(Worker::findOrFail($id)->extra_config)->toBeNull();
+    });
+
+    it('still takes harmless settings in either form, and comments', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->member)->postJson(workerUrl(), workerPayload([
+            'extra_config' => "startsecs: 5\nstopsignal=INT\n; user=root is only a comment\n# so is user: root\nstartretries = 3 ; inline note",
+        ]))->assertCreated();
+    });
+
+    it('still lets the admin set paths in extra config, as v7 did', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload([
+            'user' => 'root',
+            'extra_config' => "stdout_logfile: /var/log/custom-worker.log\ndirectory = /srv/app",
+        ]))->assertCreated();
+
+        expect(Worker::firstOrFail()->user)->toBe('root');
+    });
+});
+
+describe('an edit that will not start (W-edit)', function () {
+    it('keeps the old command and brings the old worker back up', function () {
+        fakeWorkerSupervisor();
+
+        $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated();
+        $worker = Worker::query()->sole();
+        $program = $worker->program;
+
+        // From here on, any program whose command is the new one dies at
+        // start, as a mistyped binary does.
+        Process::fake(function ($process) use ($program) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+            WorkerFake::$ran[] = implode(' ', $args);
+
+            if ($args[0] === 'tee') {
+                WorkerFake::$env = (string) $process->input;
+            }
+
+            if ($args[0] === 'supervisorctl' && ($args[1] ?? '') === 'status') {
+                $output = WorkerFake::statusOutput($program);
+
+                return Process::result(output: $output, exitCode: $output === '' ? 3 : 0);
+            }
+
+            if ($args[0] === 'supervisorctl' && in_array($args[1] ?? '', ['start', 'restart'], true)) {
+                WorkerFake::$running[$program] = str_contains(WorkerFake::$env, 'no-such-binary') ? 0 : 1;
+            }
+
+            if ($args[0] === 'supervisorctl' && ($args[1] ?? '') === 'stop') {
+                unset(WorkerFake::$running[$program]);
+            }
+
+            return Process::result(exitCode: $args[0] === 'which' ? 0 : 0);
+        });
+
+        $this->actingAs($this->admin)
+            ->putJson(workerUrl('/'.$worker->id), workerPayload(['command' => 'no-such-binary --work']))
+            ->assertStatus(422)
+            ->assertJsonPath('reason', 'worker_did_not_start')
+            // An edit is rolled back, never "not added".
+            ->assertJsonPath('message', fn (string $message) => str_contains($message, 'the change was not saved and it keeps its previous command')
+                && ! str_contains($message, 'not added'));
+
+        expect($worker->fresh()->command)->toBe('php8.4 artisan queue:work --sleep=3 --tries=3')
+            ->and(WorkerFake::$running[$program] ?? 0)->toBe(1)
+            ->and(WorkerFake::$env)->not->toContain('no-such-binary');
+    });
+});
+
+/*
+ * Switching a worker off stopped it, but its program still said autostart=true, so supervisord
+ * brought it back the next time it started: after every reboot.
+ */
+it('writes autostart=false for a worker that is switched off', function () {
+    fakeWorkerSupervisor();
+
+    $id = $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertCreated()->json('worker.id');
+    $worker = Worker::findOrFail($id)->load('application.systemUser');
+
+    expect(app(WorkerSupervisor::class)->render($worker))->toContain('autostart=true');
+
+    $this->actingAs($this->admin)->putJson(workerUrl("/{$id}"), workerPayload(['enabled' => false]))->assertOk();
+
+    expect(app(WorkerSupervisor::class)->render($worker->fresh()->load('application.systemUser')))->toContain('autostart=false');
+});
+
+it('still honours auto start being off for a worker that is on', function () {
+    fakeWorkerSupervisor();
+
+    $id = $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['auto_start' => false]))->assertCreated()->json('worker.id');
+
+    expect(app(WorkerSupervisor::class)->render(Worker::findOrFail($id)->load('application.systemUser')))->toContain('autostart=false');
+});
+
+it('rewrites a switched-off worker written before the fix on the next sites:resync, and leaves a running one', function () {
+    fakeWorkerSupervisor();
+
+    $off = Worker::findOrFail($this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['name' => 'Off']))->json('worker.id'));
+    $on = Worker::findOrFail($this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['name' => 'On']))->json('worker.id'));
+    // These are historical workers from before the program column/v7 layout,
+    // not freshly managed v7 or adopted programs that must stay untouched.
+    $off->forceFill(['program' => null, 'enabled' => false])->save();
+    $on->forceFill(['program' => null])->save();
+
+    // What a server updated from before the fix has on disk for both.
+    $stale = fn (Worker $w) => str_replace('autostart=false', 'autostart=true', app(WorkerSupervisor::class)->render($w->fresh()->load('application.systemUser')));
+    // The running one's file differs too, so only the guard keeps it as it is.
+    $disk = [app(WorkerSupervisor::class)->configPath($off) => $stale($off), app(WorkerSupervisor::class)->configPath($on) => $stale($on)."; edited by hand\n"];
+    $written = [];
+
+    Process::fake(function ($process) use ($disk, &$written) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        return match ($args[0]) {
+            'cat' => isset($disk[$args[1] ?? '']) ? Process::result(output: $disk[$args[1]]) : Process::result(exitCode: 1),
+            'tee' => (function () use ($args, &$written) {
+                $written[] = $args[1];
+
+                return Process::result();
+            })(),
+            default => Process::result(),
+        };
+    });
+
+    $this->artisan('sites:resync')->expectsOutputToContain('Switched-off workers: 1 kept off at boot.')->assertSuccessful();
+
+    expect($written)->toContain(app(WorkerSupervisor::class)->configPath($off))
+        ->and($written)->not->toContain(app(WorkerSupervisor::class)->configPath($on));
+});
+
+it('keeps a worker named syslog in its own namespaced log source', function () {
+    fakeWorkerSupervisor();
+    $response = $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload(['name' => 'syslog']))->assertCreated();
+    $worker = Worker::query()->sole();
+    $key = $response->json('worker.log_identifier');
+    $source = app(LogManager::class)->find($key);
+    expect($worker->program)->toBe('syslog')
+        ->and($key)->toBe('sv-worker-'.$worker->slug)
+        ->and($source['group'])->toBe('worker')
+        ->and($source['path'])->toEndWith('/logs/supervisor-syslog.log');
+});
+
+it('retains failed-create ownership when cleanup cannot be verified', function (string $failure) {
+    $rereads = 0;
+    $updates = 0;
+    $running = false;
+    $restarts = 0;
+    Process::fake(function ($process) use ($failure, &$rereads, &$updates, &$running, &$restarts) {
+        $args = (array) $process->command;
+        if ($args[0] === 'test') {
+            return Process::result(exitCode: 1);
+        }
+        if ($args[0] === 'rm' && $failure === 'remove') {
+            return Process::result(exitCode: 1);
+        }
+        if ($args[0] === 'supervisorctl') {
+            $program = explode(':', $args[2] ?? '')[0];
+            if ($args[1] === 'reread' && ++$rereads === 2) {
+                return Process::result(exitCode: 1);
+            }
+            if ($args[1] === 'update' && ++$updates === 2 && $failure === 'reload') {
+                return Process::result(exitCode: 1);
+            }
+            if ($args[1] === 'restart') {
+                $restarts++;
+                $running = true;
+            }
+            if ($args[1] === 'stop') {
+                if ($failure === 'stop') {
+                    return Process::result(exitCode: 1);
+                }
+                $running = false;
+            }
+            if ($args[1] === 'status') {
+                if (! isset($args[2])) {
+                    return Process::result();
+                }
+
+                return Process::result(output: $program.':'.$program.'_00 '.($running ? 'RUNNING pid 123' : 'STOPPED'), exitCode: $running ? 0 : 3);
+            }
+        }
+
+        return Process::result();
+    });
+
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())->assertStatus(500);
+    expect(Worker::query()->count())->toBe(1);
+    $worker = Worker::query()->sole();
+    expect($worker->program)->toBe('queue-worker')
+        ->and($restarts)->toBe(1);
+    // A retry cannot silently allocate queue-worker-2 while the first still
+    // exists: the retained row reserves both its label and program.
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())
+        ->assertUnprocessable()->assertJsonValidationErrors('name');
+    expect(Worker::query()->count())->toBe(1)->and($restarts)->toBe(1);
+})->with(['stop', 'remove', 'reload']);
+
+it('does not discard program ownership when deletion fails', function (string $failure) {
+    $worker = Worker::create(workerPayload() + ['application_id' => $this->application->id])->refresh();
+    $worker->forceFill(['program' => 'queue-worker'])->save();
+    $running = true;
+    Process::fake(function ($process) use ($failure, &$running) {
+        $args = (array) $process->command;
+        if ($args[0] === 'rm' && $failure === 'remove') {
+            return Process::result(exitCode: 1);
+        }
+        if ($args[0] === 'supervisorctl') {
+            $program = explode(':', $args[2] ?? '')[0];
+            if ($args[1] === 'stop') {
+                if ($failure === 'stop') {
+                    return Process::result(exitCode: 1);
+                }
+                $running = false;
+            }
+            if ($args[1] === 'update' && $failure === 'reload') {
+                return Process::result(exitCode: 1);
+            }
+            if ($args[1] === 'status') {
+                return Process::result(output: $program.':'.$program.'_00 '.($running ? 'RUNNING pid 123' : 'STOPPED'), exitCode: $running ? 0 : 3);
+            }
+        }
+
+        return Process::result();
+    });
+    $this->actingAs($this->admin)->deleteJson(workerUrl('/'.$worker->id))->assertStatus(500);
+    expect(Worker::query()->whereKey($worker->id)->value('program'))->toBe('queue-worker');
+    $this->actingAs($this->admin)->postJson(workerUrl(), workerPayload())
+        ->assertUnprocessable()->assertJsonValidationErrors('name');
+})->with(['stop', 'remove', 'reload']);
+
+/*
+ * A program supervisord never loaded (a new worker whose command exits before its first reload)
+ * answers `status name:*` with "no such group", exit 4, and `stop name:*` with the same and
+ * exit 1. Only "no such process" used to be accepted: adding such a worker gave a 500 and left
+ * its row behind, and deleting that row then failed for good.
+ */
+it('refuses a new worker that never loaded with a 422 and keeps no row', function () {
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if ($args[0] === 'supervisorctl' && ($args[1] ?? '') === 'status' && isset($args[2])) {
+            return Process::result(output: explode(':', $args[2])[0].': ERROR (no such group)', exitCode: 4);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->actingAs($this->admin)
+        ->postJson(workerUrl(), workerPayload())
+        ->assertStatus(422)
+        ->assertJsonPath('reason', 'worker_did_not_start');
+
+    expect(Worker::count())->toBe(0);
+});
+
+it('deletes a worker whose program supervisord does not have loaded', function () {
+    $worker = Worker::create(workerPayload() + ['application_id' => $this->application->id])->refresh();
+    $worker->forceFill(['program' => 'queue-worker'])->save();
+    Process::fake(function ($process) {
+        $args = (array) $process->command;
+        if ($args[0] === 'supervisorctl' && in_array($args[1] ?? '', ['stop', 'status'], true) && isset($args[2])) {
+            return Process::result(output: explode(':', $args[2])[0].': ERROR (no such group)', exitCode: $args[1] === 'stop' ? 1 : 4);
+        }
+
+        return Process::result();
+    });
+
+    $this->actingAs($this->admin)->deleteJson(workerUrl('/'.$worker->id))->assertNoContent();
+
+    expect(Worker::query()->whereKey($worker->id)->exists())->toBeFalse();
+});
+
+it('still refuses to delete a worker whose program supervisord reports as running', function () {
+    $worker = Worker::create(workerPayload() + ['application_id' => $this->application->id])->refresh();
+    $worker->forceFill(['program' => 'queue-worker'])->save();
+    Process::fake(function ($process) {
+        $args = (array) $process->command;
+        if ($args[0] === 'supervisorctl' && ($args[1] ?? '') === 'stop') {
+            return Process::result(exitCode: 1);
+        }
+        if ($args[0] === 'supervisorctl' && ($args[1] ?? '') === 'status') {
+            return Process::result(output: 'queue-worker:queue-worker_00 RUNNING pid 123', exitCode: 0);
+        }
+
+        return Process::result();
+    });
+
+    $this->actingAs($this->admin)->deleteJson(workerUrl('/'.$worker->id))->assertStatus(500);
+    expect(Worker::query()->whereKey($worker->id)->exists())->toBeTrue();
+});

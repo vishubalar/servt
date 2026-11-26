@@ -1,0 +1,1997 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>White-Label Pre-Install Configurator</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --bg-elevated: #121620;
+      --bg-subtle: #181d2a;
+      --bg-input: #0e1118;
+      --border: #252c3d;
+      --border-strong: #343e56;
+      --text: #eef1f7;
+      --text-muted: #98a2b8;
+      --text-dim: #6f7a93;
+      --brand: #3B82F6;
+      --brand-fg: #ffffff;
+      --brand-soft: rgba(59, 130, 246, 0.14);
+      --danger: #ef4444;
+      --danger-soft: rgba(239, 68, 68, 0.14);
+      --warn: #f59e0b;
+      --warn-soft: rgba(245, 158, 11, 0.14);
+      --ok: #22c55e;
+      --ok-soft: rgba(34, 197, 94, 0.14);
+      --shadow: 0 14px 36px rgba(0, 0, 0, 0.42);
+      --radius: 12px;
+      --radius-sm: 8px;
+      --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    html[data-theme="light"] {
+      --bg: #f4f6fa;
+      --bg-elevated: #ffffff;
+      --bg-subtle: #eef1f6;
+      --bg-input: #f8f9fc;
+      --border: #dce1ec;
+      --border-strong: #c2cadb;
+      --text: #111827;
+      --text-muted: #4b5563;
+      --text-dim: #6b7280;
+      --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 24px;
+      background: color-mix(in srgb, var(--bg-elevated) 90%, transparent);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .topbar-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background: var(--brand);
+      color: var(--brand-fg);
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 16px;
+      flex-shrink: 0;
+      box-shadow: 0 4px 12px color-mix(in srgb, var(--brand) 35%, transparent);
+    }
+
+    .topbar-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .topbar-sub {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-muted);
+    }
+
+    .pill.online {
+      border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+      background: var(--ok-soft);
+      color: var(--ok);
+    }
+
+    .pill.offline {
+      border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+      background: var(--warn-soft);
+      color: var(--warn);
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text);
+      border-radius: var(--radius-sm);
+      padding: 8px 13px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      transition: transform 0.08s ease, border-color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+    }
+
+    .btn:hover:not(:disabled) {
+      border-color: var(--border-strong);
+      background: color-mix(in srgb, var(--bg-subtle) 75%, var(--text) 6%);
+    }
+
+    .btn:active:not(:disabled) {
+      transform: translateY(1px);
+    }
+
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: var(--brand);
+      border-color: transparent;
+      color: var(--brand-fg);
+      box-shadow: 0 6px 18px color-mix(in srgb, var(--brand) 28%, transparent);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--brand) 90%, #ffffff 10%);
+      border-color: transparent;
+    }
+
+    .btn-sm {
+      padding: 5px 10px;
+      font-size: 12px;
+    }
+
+    .layout {
+      max-width: 1420px;
+      margin: 0 auto;
+      padding: 22px 24px 48px;
+      display: grid;
+      grid-template-columns: minmax(380px, 1.05fr) minmax(420px, 1.15fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    @media (max-width: 1060px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+      .preview-sticky {
+        position: static !important;
+      }
+    }
+
+    .stack {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .card-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .card-desc {
+      margin: 2px 0 0;
+      font-size: 12.5px;
+      color: var(--text-muted);
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+
+    .field:last-child {
+      margin-bottom: 0;
+    }
+
+    .field-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    label {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    input[type="text"],
+    input[type="url"],
+    input[type="email"] {
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13.5px;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    input[type="text"]:focus,
+    input[type="url"]:focus,
+    input[type="email"]:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 22%, transparent);
+    }
+
+    input.mono {
+      font-family: var(--font-mono);
+      font-size: 13px;
+    }
+
+    .color-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    input[type="color"] {
+      width: 46px;
+      height: 38px;
+      padding: 2px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .swatches {
+      display: grid;
+      grid-template-columns: repeat(10, 1fr);
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    @media (max-width: 520px) {
+      .swatches {
+        grid-template-columns: repeat(5, 1fr);
+      }
+    }
+
+    .swatch {
+      height: 28px;
+      border-radius: 7px;
+      border: 2px solid transparent;
+      cursor: pointer;
+      transition: transform 0.1s ease, box-shadow 0.15s ease;
+      position: relative;
+    }
+
+    .swatch:hover {
+      transform: translateY(-1px);
+    }
+
+    .swatch.active {
+      border-color: var(--text);
+      box-shadow: 0 0 0 2px var(--bg-elevated), 0 0 0 4px var(--brand);
+    }
+
+    .wcag-box {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+    }
+
+    .wcag-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .wcag-label {
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .wcag-chip {
+      width: 14px;
+      height: 14px;
+      border-radius: 4px;
+      border: 1px solid rgba(128, 128, 128, 0.35);
+      display: inline-grid;
+      place-items: center;
+      font-size: 9px;
+      font-weight: 800;
+      flex-shrink: 0;
+    }
+
+    .badge {
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+    }
+
+    .badge.pass { background: var(--ok-soft); color: var(--ok); }
+    .badge.large { background: var(--warn-soft); color: var(--warn); }
+    .badge.fail { background: var(--danger-soft); color: var(--danger); }
+
+    .upload-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    @media (max-width: 600px) {
+      .upload-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .dropzone {
+      border: 1.5px dashed var(--border-strong);
+      border-radius: var(--radius-sm);
+      padding: 11px;
+      background: var(--bg-input);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.15s ease, background 0.15s ease;
+      cursor: pointer;
+    }
+
+    .dropzone:hover,
+    .dropzone.dragover {
+      border-color: var(--brand);
+      background: color-mix(in srgb, var(--brand) 7%, var(--bg-input));
+    }
+
+    .dropzone-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .dropzone-title {
+      font-size: 12.5px;
+      font-weight: 600;
+    }
+
+    .dropzone-surface {
+      height: 58px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 8px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .dropzone-surface.light-surface {
+      background: #ffffff;
+      color: #475569;
+    }
+
+    .dropzone-surface.dark-surface {
+      background: #0f172a;
+      color: #94a3b8;
+    }
+
+    .dropzone-surface img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+
+    .dropzone-empty {
+      font-size: 11px;
+      opacity: 0.75;
+    }
+
+    .dropzone-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    .dropzone-file {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 155px;
+      font-family: var(--font-mono);
+    }
+
+    .clear-link {
+      background: none;
+      border: none;
+      padding: 0;
+      color: var(--warn);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    details.card summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-weight: 700;
+      font-size: 14px;
+      user-select: none;
+    }
+
+    details.card summary::-webkit-details-marker { display: none; }
+
+    .chevron {
+      transition: transform 0.2s ease;
+      color: var(--text-muted);
+    }
+
+    details[open] .chevron {
+      transform: rotate(180deg);
+    }
+
+    .details-body {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .action-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .alert {
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      font-size: 13px;
+      border: 1px solid var(--border);
+      display: none;
+    }
+
+    .alert.show { display: block; }
+    .alert.success {
+      background: var(--ok-soft);
+      border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+      color: var(--text);
+    }
+    .alert.error {
+      background: var(--danger-soft);
+      border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+      color: var(--text);
+    }
+
+    .file-list {
+      margin: 8px 0 0;
+      padding-left: 18px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* Sticky Preview Column */
+    .preview-sticky {
+      position: sticky;
+      top: 78px;
+    }
+
+    .preview-tabs {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+
+    .tab-group {
+      display: inline-flex;
+      padding: 3px;
+      border-radius: 9px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      gap: 3px;
+    }
+
+    .tab-btn {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .tab-btn.active {
+      background: var(--bg-elevated);
+      color: var(--text);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    }
+
+    .preview-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Browser Chrome Mockup */
+    .browser-frame {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #0f131c;
+    }
+
+    .browser-top {
+      background: #171c28;
+      border-bottom: 1px solid #262e40;
+      padding: 8px 12px 0;
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+    }
+
+    .traffic-dots {
+      display: flex;
+      gap: 6px;
+      padding-bottom: 10px;
+    }
+
+    .traffic-dots span {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #353f56;
+    }
+
+    .browser-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 14px;
+      border-radius: 8px 8px 0 0;
+      background: #0f131c;
+      color: #e2e8f0;
+      font-size: 12px;
+      font-weight: 600;
+      max-width: 240px;
+      border: 1px solid #262e40;
+      border-bottom: none;
+    }
+
+    .browser-tab img {
+      width: 15px;
+      height: 15px;
+      object-fit: contain;
+      flex-shrink: 0;
+    }
+
+    .browser-tab span {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Simulated Panel Shell */
+    .sim-shell {
+      --sim-bg: #0c1017;
+      --sim-surface: #131924;
+      --sim-sidebar: #0f141e;
+      --sim-border: #20293a;
+      --sim-ink: #f1f5f9;
+      --sim-muted: #94a3b8;
+      --sim-primary: var(--brand);
+      --sim-primary-fg: var(--brand-fg);
+      --sim-primary-soft: color-mix(in srgb, var(--sim-primary) 16%, transparent);
+
+      display: grid;
+      grid-template-columns: 184px 1fr;
+      min-height: 410px;
+      background: var(--sim-bg);
+      color: var(--sim-ink);
+      transition: grid-template-columns 0.18s ease;
+    }
+
+    .sim-shell.collapsed {
+      grid-template-columns: 62px 1fr;
+    }
+
+    .sim-shell.sim-light {
+      --sim-bg: #f8fafc;
+      --sim-surface: #ffffff;
+      --sim-sidebar: #ffffff;
+      --sim-border: #e2e8f0;
+      --sim-ink: #0f172a;
+      --sim-muted: #64748b;
+    }
+
+    .sim-sidebar {
+      background: var(--sim-sidebar);
+      border-right: 1px solid var(--sim-border);
+      padding: 14px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .sim-logo-wrap {
+      height: 32px;
+      display: flex;
+      align-items: center;
+      padding: 0 6px;
+      overflow: hidden;
+    }
+
+    .sim-shell.collapsed .sim-logo-wrap {
+      justify-content: center;
+      padding: 0;
+    }
+
+    .sim-logo-wrap img {
+      max-height: 26px;
+      max-width: 146px;
+      object-fit: contain;
+    }
+
+    .sim-shell.collapsed .sim-logo-wrap img {
+      max-width: 28px;
+      max-height: 28px;
+    }
+
+    .sim-nav {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .sim-nav-item {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 10px;
+      border-radius: 7px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--sim-muted);
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .sim-shell.collapsed .sim-nav-item {
+      justify-content: center;
+      padding: 8px;
+    }
+
+    .sim-shell.collapsed .sim-nav-label {
+      display: none;
+    }
+
+    .sim-nav-item.active {
+      background: var(--sim-primary-soft);
+      color: var(--sim-primary);
+      font-weight: 700;
+    }
+
+    .sim-nav-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 2px;
+      background: currentColor;
+      flex-shrink: 0;
+    }
+
+    .sim-main {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .sim-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--sim-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: var(--sim-surface);
+    }
+
+    .sim-breadcrumb {
+      font-size: 12.5px;
+      font-weight: 600;
+    }
+
+    .sim-cta {
+      border: none;
+      border-radius: 7px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      background: var(--sim-primary);
+      color: var(--sim-primary-fg);
+      cursor: default;
+    }
+
+    .sim-content {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .sim-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .sim-stat {
+      background: var(--sim-surface);
+      border: 1px solid var(--sim-border);
+      border-radius: 9px;
+      padding: 11px 12px;
+    }
+
+    .sim-stat-k {
+      font-size: 11px;
+      color: var(--sim-muted);
+    }
+
+    .sim-stat-v {
+      font-size: 18px;
+      font-weight: 800;
+      margin-top: 2px;
+    }
+
+    .sim-panel-card {
+      background: var(--sim-surface);
+      border: 1px solid var(--sim-border);
+      border-radius: 9px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .sim-server-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--sim-border);
+      font-size: 12px;
+    }
+
+    .sim-server-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+
+    .sim-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--sim-primary);
+    }
+
+    .sim-bar-track {
+      width: 78px;
+      height: 6px;
+      border-radius: 999px;
+      background: var(--sim-border);
+      overflow: hidden;
+    }
+
+    .sim-bar-fill {
+      height: 100%;
+      background: var(--sim-primary);
+      border-radius: 999px;
+    }
+
+    /* Login Preview */
+    .sim-login {
+      min-height: 410px;
+      background: radial-gradient(circle at top right, color-mix(in srgb, var(--brand) 16%, transparent), transparent 55%), var(--sim-bg);
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: var(--sim-ink);
+    }
+
+    .sim-login.sim-light {
+      --sim-bg: #f8fafc;
+      --sim-surface: #ffffff;
+      --sim-border: #e2e8f0;
+      --sim-ink: #0f172a;
+      --sim-muted: #64748b;
+    }
+
+    .sim-login:not(.sim-light) {
+      --sim-bg: #0b0e15;
+      --sim-surface: #131823;
+      --sim-border: #232c3d;
+      --sim-ink: #f1f5f9;
+      --sim-muted: #94a3b8;
+    }
+
+    .login-card {
+      width: 100%;
+      max-width: 340px;
+      background: var(--sim-surface);
+      border: 1px solid var(--sim-border);
+      border-top: 3px solid var(--brand);
+      border-radius: 12px;
+      padding: 22px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
+    }
+
+    .login-logo {
+      height: 28px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+    }
+
+    .login-logo img {
+      max-height: 26px;
+      max-width: 170px;
+      object-fit: contain;
+    }
+
+    .login-h {
+      margin: 0 0 4px;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .login-sub {
+      margin: 0 0 16px;
+      font-size: 12px;
+      color: var(--sim-muted);
+    }
+
+    .login-input {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--sim-border);
+      background: var(--sim-bg);
+      color: var(--sim-ink);
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+
+    .login-input.focused {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 25%, transparent);
+    }
+
+    .login-btn {
+      width: 100%;
+      padding: 9px 12px;
+      border: none;
+      border-radius: 7px;
+      background: var(--brand);
+      color: var(--brand-fg);
+      font-weight: 700;
+      font-size: 13px;
+      margin-top: 4px;
+    }
+
+    /* .env preview */
+    .env-preview-wrap {
+      background: #0b0e14;
+      color: #dbe4f3;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .env-preview-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 14px;
+      background: #141925;
+      border-bottom: 1px solid #232b3e;
+      font-size: 12px;
+      color: #94a3b8;
+      font-family: var(--font-mono);
+    }
+
+    pre.env-code {
+      margin: 0;
+      padding: 16px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.6;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="topbar-mark" id="topMark">W</div>
+      <div>
+        <h1 class="topbar-title">White-Label Pre-Install Configurator</h1>
+        <p class="topbar-sub">Customize brand identity, colors, logos &amp; deployment defaults before running <code style="font-family:var(--font-mono)">install.sh</code></p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="pill offline" id="connPill"><span class="dot"></span><span id="connText">Connecting...</span></span>
+      <button type="button" class="btn btn-sm" id="uiThemeBtn" aria-label="Toggle UI theme">Light UI</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="stack">
+      <div class="alert" id="statusAlert" role="status">
+        <div id="statusMessage"></div>
+        <ul class="file-list hidden" id="statusFiles"></ul>
+      </div>
+
+      <!-- 1. Brand Identity & Color -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">1. Brand Identity &amp; Theme Color</h2>
+            <p class="card-desc">Applied across the Laravel backend, Next.js frontend, error/site pages, and test expectations.</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field-row">
+            <label for="brandName">Brand Name</label>
+            <span class="hint" id="slugPreview">Slug: brand</span>
+          </div>
+          <input type="text" id="brandName" maxlength="80" placeholder="e.g. Acme Cloud Panel" autocomplete="off">
+        </div>
+
+        <div class="field">
+          <div class="field-row">
+            <label for="colorHex">Primary Brand Color (Hex)</label>
+            <span class="hint" id="fgHint">Button text: #16161A</span>
+          </div>
+          <div class="color-row">
+            <input type="color" id="colorPicker" value="#3B82F6" aria-label="Pick brand hex color">
+            <input type="text" id="colorHex" class="mono" maxlength="7" value="#3B82F6" placeholder="#3B82F6">
+          </div>
+          <div class="swatches" id="swatchGrid" aria-label="Preset brand colors"></div>
+
+          <div class="wcag-box" id="wcagBox">
+            <div class="wcag-item">
+              <span class="wcag-label"><span class="wcag-chip" id="chipWhite">A</span> White on Brand</span>
+              <span class="badge" id="ratioWhite">--</span>
+            </div>
+            <div class="wcag-item">
+              <span class="wcag-label"><span class="wcag-chip" id="chipDark">A</span> Dark on Brand</span>
+              <span class="badge" id="ratioDark">--</span>
+            </div>
+            <div class="wcag-item">
+              <span class="wcag-label"><span class="wcag-chip" id="chipOnDark">A</span> Brand on Dark UI</span>
+              <span class="badge" id="ratioOnDark">--</span>
+            </div>
+            <div class="wcag-item">
+              <span class="wcag-label"><span class="wcag-chip" id="chipOnLight">A</span> Brand on Light UI</span>
+              <span class="badge" id="ratioOnLight">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Brand Logos & Favicons -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">2. Brand Logos, Marks &amp; Favicons</h2>
+            <p class="card-desc">Drag &amp; drop or click to upload SVG, PNG, WebP, JPG, or ICO (max 2 MB per file).</p>
+          </div>
+        </div>
+        <div class="upload-grid" id="uploadGrid"></div>
+      </div>
+
+      <!-- 3. Repository / Deployment -->
+      <details class="card" id="repoDetails">
+        <summary>
+          <span>3. Repository &amp; Deployment (Optional)</span>
+          <svg class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div class="details-body">
+          <div class="field">
+            <label for="repoUrl">Git Repository URL (<code class="mono">install.sh</code> REPO_URL)</label>
+            <input type="text" id="repoUrl" class="mono" placeholder="https://github.com/your-org/your-panel.git">
+          </div>
+          <div class="field">
+            <div class="field-row">
+              <label for="releasesUrl">GitHub Releases API URL (<code class="mono">panel_update.php</code>)</label>
+              <span class="hint">Auto-updates from GitHub repo URL</span>
+            </div>
+            <input type="url" id="releasesUrl" class="mono" placeholder="https://api.github.com/repos/your-org/your-panel/releases/latest">
+          </div>
+          <div class="field">
+            <label for="appUrl">Default Panel / API URL (<code class="mono">APP_URL</code>)</label>
+            <input type="url" id="appUrl" class="mono" placeholder="https://panel.example.com">
+          </div>
+          <div class="field">
+            <label for="contactEmail">Support / Mail-From Email (<code class="mono">MAIL_FROM_ADDRESS</code>)</label>
+            <input type="email" id="contactEmail" placeholder="support@example.com">
+          </div>
+          <div class="field">
+            <div class="field-row">
+              <label for="centralUrl">Central API URL (<code class="mono">config/central.php</code>)</label>
+              <button type="button" class="clear-link" id="clearCentralBtn">Clear (disable Central override)</button>
+            </div>
+            <input type="url" id="centralUrl" class="mono" placeholder="Leave blank so your own white-label branding is never overridden">
+          </div>
+        </div>
+      </details>
+
+      <!-- 4. Actions -->
+      <div class="card">
+        <div class="action-bar">
+          <button type="button" class="btn btn-primary" id="applyBtn">Save &amp; Apply to Repo</button>
+          <button type="button" class="btn" id="downloadEnvBtn">Download branding.env</button>
+          <button type="button" class="btn" id="copyEnvBtn">Copy .env</button>
+        </div>
+        <p class="hint" style="margin: 10px 0 0;">
+          After applying, verify tests or commit your changes, then run <code style="font-family:var(--font-mono)">sudo bash install.sh</code> on your target Ubuntu server.
+        </p>
+      </div>
+    </section>
+
+    <!-- Right Column: Live Interactive Preview -->
+    <section class="card preview-sticky">
+      <div class="preview-tabs">
+        <div class="tab-group" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="panel">Panel Shell</button>
+          <button type="button" class="tab-btn" data-tab="login">Login Screen</button>
+          <button type="button" class="tab-btn" data-tab="env">.env Config</button>
+        </div>
+        <div class="preview-controls" id="previewControls">
+          <button type="button" class="btn btn-sm" id="sidebarToggleBtn">Collapse Sidebar</button>
+          <button type="button" class="btn btn-sm" id="previewThemeBtn">Light Preview</button>
+        </div>
+      </div>
+
+      <!-- Browser Mockup (Panel & Login) -->
+      <div class="browser-frame" id="browserFrame">
+        <div class="browser-top">
+          <div class="traffic-dots"><span></span><span></span><span></span></div>
+          <div class="browser-tab">
+            <img id="tabFavicon" alt="Favicon preview">
+            <span id="tabTitle">Dashboard · Control Panel</span>
+          </div>
+        </div>
+
+        <!-- Panel Shell View -->
+        <div class="sim-shell" id="panelView">
+          <aside class="sim-sidebar">
+            <div class="sim-logo-wrap">
+              <img id="simSidebarLogo" alt="Brand logo preview">
+            </div>
+            <nav class="sim-nav">
+              <div class="sim-nav-item active"><span class="sim-nav-dot"></span><span class="sim-nav-label">Dashboard</span></div>
+              <div class="sim-nav-item"><span class="sim-nav-dot"></span><span class="sim-nav-label">Servers</span></div>
+              <div class="sim-nav-item"><span class="sim-nav-dot"></span><span class="sim-nav-label">Sites &amp; Apps</span></div>
+              <div class="sim-nav-item"><span class="sim-nav-dot"></span><span class="sim-nav-label">Databases</span></div>
+              <div class="sim-nav-item"><span class="sim-nav-dot"></span><span class="sim-nav-label">SSL &amp; Backups</span></div>
+              <div class="sim-nav-item"><span class="sim-nav-dot"></span><span class="sim-nav-label">Settings</span></div>
+            </nav>
+          </aside>
+
+          <div class="sim-main">
+            <div class="sim-header">
+              <span class="sim-breadcrumb" id="simHeaderTitle">Control Panel · Fleet Overview</span>
+              <button type="button" class="sim-cta" id="simCtaBtn">+ Connect Server</button>
+            </div>
+            <div class="sim-content">
+              <div class="sim-stats">
+                <div class="sim-stat">
+                  <div class="sim-stat-k">Managed Servers</div>
+                  <div class="sim-stat-v">12</div>
+                </div>
+                <div class="sim-stat">
+                  <div class="sim-stat-k">Active Sites</div>
+                  <div class="sim-stat-v">48</div>
+                </div>
+                <div class="sim-stat">
+                  <div class="sim-stat-k">SSL Health</div>
+                  <div class="sim-stat-v" id="simStatAccent">100%</div>
+                </div>
+              </div>
+
+              <div class="sim-panel-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:700;">
+                  <span>Production Nodes</span>
+                  <span style="font-weight:600;color:var(--sim-muted)">Ubuntu 24.04 · PHP 8.4</span>
+                </div>
+                <div class="sim-server-row">
+                  <div class="sim-server-left"><span class="sim-status-dot"></span><span>lon-prod-01</span></div>
+                  <div class="sim-bar-track"><div class="sim-bar-fill" style="width:42%"></div></div>
+                </div>
+                <div class="sim-server-row">
+                  <div class="sim-server-left"><span class="sim-status-dot"></span><span>nyc-edge-02</span></div>
+                  <div class="sim-bar-track"><div class="sim-bar-fill" style="width:68%"></div></div>
+                </div>
+                <div class="sim-server-row">
+                  <div class="sim-server-left"><span class="sim-status-dot"></span><span>fra-db-01</span></div>
+                  <div class="sim-bar-track"><div class="sim-bar-fill" style="width:29%"></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Login Screen View -->
+        <div class="sim-login hidden" id="loginView">
+          <div class="login-card">
+            <div class="login-logo">
+              <img id="simLoginLogo" alt="Login brand logo preview">
+            </div>
+            <h3 class="login-h" id="loginHeading">Sign in to Control Panel</h3>
+            <p class="login-sub">Self-hosted infrastructure control panel</p>
+            <input type="text" class="login-input" value="admin@example.com" readonly tabindex="-1">
+            <input type="text" class="login-input focused" value="••••••••••••" readonly tabindex="-1">
+            <button type="button" class="login-btn" id="loginCtaBtn">Sign In</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- .env Config View -->
+      <div class="env-preview-wrap hidden" id="envView">
+        <div class="env-preview-bar">
+          <span>branding.env</span>
+          <span id="envLineCount">0 lines</span>
+        </div>
+        <pre class="env-code" id="envCode"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const PRESETS = [
+        { name: 'Blue', hex: '#3B82F6' },
+        { name: 'Cobalt', hex: '#2563EB' },
+        { name: 'Indigo', hex: '#4F46E5' },
+        { name: 'Violet', hex: '#7C3AED' },
+        { name: 'Teal', hex: '#0D9488' },
+        { name: 'Cyan', hex: '#0891B2' },
+        { name: 'Emerald', hex: '#10B981' },
+        { name: 'Amber', hex: '#D97706' },
+        { name: 'Rose', hex: '#E11D48' },
+        { name: 'Slate', hex: '#334155' },
+      ];
+
+      const UPLOAD_SLOTS = [
+        { key: 'logoLight', assetKey: 'logo', label: 'Horizontal Logo (Light)', surface: 'light', accept: '.svg,.png,.webp,.jpg,.jpeg', suffix: 'horizontal-light', fallbackExt: 'svg' },
+        { key: 'logoDark', assetKey: 'logo_dark', label: 'Horizontal Logo (Dark)', surface: 'dark', accept: '.svg,.png,.webp,.jpg,.jpeg', suffix: 'horizontal-dark', fallbackExt: 'svg' },
+        { key: 'iconLight', assetKey: 'icon', label: 'Compact Icon / Mark (Light)', surface: 'light', accept: '.svg,.png,.webp,.jpg,.jpeg', suffix: 'mark-light', fallbackExt: 'svg' },
+        { key: 'iconDark', assetKey: 'icon_dark', label: 'Compact Icon / Mark (Dark)', surface: 'dark', accept: '.svg,.png,.webp,.jpg,.jpeg', suffix: 'mark-dark', fallbackExt: 'svg' },
+        { key: 'faviconSvg', assetKey: 'favicon', label: 'Favicon (SVG)', surface: 'light', accept: '.svg,.png,.ico', suffix: 'favicon', fallbackExt: 'svg' },
+        { key: 'faviconPng', assetKey: 'favicon_png', label: 'Favicon (32x32 PNG)', surface: 'light', accept: '.png,.webp', suffix: 'favicon-32', fallbackExt: 'png' },
+        { key: 'faviconIco', assetKey: 'favicon_ico', label: 'backend/public/favicon.ico (Optional)', surface: 'light', accept: '.ico,.png', suffix: 'favicon', fallbackExt: 'ico', fullWidth: true },
+      ];
+
+      const MAX_ASSET_BYTES = 2 * 1024 * 1024;
+      const ALLOWED_MIMES = new Set([
+        'image/svg+xml',
+        'image/png',
+        'image/jpeg',
+        'image/webp',
+        'image/x-icon',
+        'image/vnd.microsoft.icon',
+      ]);
+
+      const state = {
+        online: false,
+        brandName: 'Control Panel',
+        primaryColor: '#3B82F6',
+        repoUrl: 'https://github.com/vishubalar/servt.git',
+        releasesUrl: 'https://api.github.com/repos/vishubalar/servt/releases/latest',
+        releasesManuallyEdited: false,
+        appUrl: 'http://localhost',
+        contactEmail: 'hello@example.com',
+        centralUrl: '',
+        currentAssets: {
+          logo: '/brand/panel-horizontal-light.svg',
+          logo_dark: '/brand/panel-horizontal-dark.svg',
+          icon: '/brand/panel-mark-light.svg',
+          icon_dark: '/brand/panel-mark-dark.svg',
+          favicon: '/brand/panel-favicon.svg',
+          favicon_png: '/brand/panel-favicon-32.png',
+          favicon_ico: '',
+        },
+        uploads: {},
+        previewTab: 'panel',
+        previewDark: true,
+        sidebarCollapsed: false,
+      };
+
+      const el = {
+        connPill: document.getElementById('connPill'),
+        connText: document.getElementById('connText'),
+        uiThemeBtn: document.getElementById('uiThemeBtn'),
+        topMark: document.getElementById('topMark'),
+        statusAlert: document.getElementById('statusAlert'),
+        statusMessage: document.getElementById('statusMessage'),
+        statusFiles: document.getElementById('statusFiles'),
+        brandName: document.getElementById('brandName'),
+        slugPreview: document.getElementById('slugPreview'),
+        colorPicker: document.getElementById('colorPicker'),
+        colorHex: document.getElementById('colorHex'),
+        fgHint: document.getElementById('fgHint'),
+        swatchGrid: document.getElementById('swatchGrid'),
+        chipWhite: document.getElementById('chipWhite'),
+        chipDark: document.getElementById('chipDark'),
+        chipOnDark: document.getElementById('chipOnDark'),
+        chipOnLight: document.getElementById('chipOnLight'),
+        ratioWhite: document.getElementById('ratioWhite'),
+        ratioDark: document.getElementById('ratioDark'),
+        ratioOnDark: document.getElementById('ratioOnDark'),
+        ratioOnLight: document.getElementById('ratioOnLight'),
+        uploadGrid: document.getElementById('uploadGrid'),
+        repoUrl: document.getElementById('repoUrl'),
+        releasesUrl: document.getElementById('releasesUrl'),
+        appUrl: document.getElementById('appUrl'),
+        contactEmail: document.getElementById('contactEmail'),
+        centralUrl: document.getElementById('centralUrl'),
+        clearCentralBtn: document.getElementById('clearCentralBtn'),
+        applyBtn: document.getElementById('applyBtn'),
+        downloadEnvBtn: document.getElementById('downloadEnvBtn'),
+        copyEnvBtn: document.getElementById('copyEnvBtn'),
+        previewControls: document.getElementById('previewControls'),
+        sidebarToggleBtn: document.getElementById('sidebarToggleBtn'),
+        previewThemeBtn: document.getElementById('previewThemeBtn'),
+        browserFrame: document.getElementById('browserFrame'),
+        panelView: document.getElementById('panelView'),
+        loginView: document.getElementById('loginView'),
+        envView: document.getElementById('envView'),
+        tabFavicon: document.getElementById('tabFavicon'),
+        tabTitle: document.getElementById('tabTitle'),
+        simSidebarLogo: document.getElementById('simSidebarLogo'),
+        simHeaderTitle: document.getElementById('simHeaderTitle'),
+        simCtaBtn: document.getElementById('simCtaBtn'),
+        simStatAccent: document.getElementById('simStatAccent'),
+        simLoginLogo: document.getElementById('simLoginLogo'),
+        loginHeading: document.getElementById('loginHeading'),
+        loginCtaBtn: document.getElementById('loginCtaBtn'),
+        envCode: document.getElementById('envCode'),
+        envLineCount: document.getElementById('envLineCount'),
+      };
+
+      function slugify(name) {
+        return (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'brand';
+      }
+
+      function hexToRgb(hex) {
+        const clean = hex.replace('#', '');
+        return {
+          r: parseInt(clean.slice(0, 2), 16),
+          g: parseInt(clean.slice(2, 4), 16),
+          b: parseInt(clean.slice(4, 6), 16),
+        };
+      }
+
+      function relLuminance({ r, g, b }) {
+        const linear = [r, g, b].map((v) => {
+          const c = v / 255;
+          return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+        });
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+      }
+
+      function contrastRatio(hexA, hexB) {
+        const lumA = relLuminance(hexToRgb(hexA));
+        const lumB = relLuminance(hexToRgb(hexB));
+        const lighter = Math.max(lumA, lumB);
+        const darker = Math.min(lumA, lumB);
+        return (lighter + 0.05) / (darker + 0.05);
+      }
+
+      function formatBadge(badgeEl, ratio) {
+        let level = 'Fail';
+        let cls = 'fail';
+        if (ratio >= 7.0) { level = 'AAA'; cls = 'pass'; }
+        else if (ratio >= 4.5) { level = 'AA'; cls = 'pass'; }
+        else if (ratio >= 3.0) { level = 'AA Lg'; cls = 'large'; }
+        badgeEl.className = `badge ${cls}`;
+        badgeEl.textContent = `${ratio.toFixed(2)}:1 ${level}`;
+      }
+
+      function pickForegroundHex(bgHex) {
+        return contrastRatio('#FFFFFF', bgHex) >= contrastRatio('#16161A', bgHex) ? '#FFFFFF' : '#16161A';
+      }
+
+      function deriveGitHubReleases(repoUrl) {
+        const m = (repoUrl || '').trim().match(
+          /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/i
+        );
+        return m ? `https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest` : null;
+      }
+
+      function formatEnvVal(val) {
+        if (!val) return '';
+        if (/[\s#"'`$\\]/.test(val)) {
+          return `"${val.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`;
+        }
+        return val;
+      }
+
+      function resolveAssetUrl(slotKey, assetKey) {
+        if (state.uploads[slotKey]) return state.uploads[slotKey].dataUrl;
+        const p = state.currentAssets[assetKey];
+        if (!p) return '';
+        if (state.online && p.startsWith('/brand/')) return p;
+        return '';
+      }
+
+      function computePredictedAssetPath(slot) {
+        const upload = state.uploads[slot.key];
+        if (upload) {
+          const slug = slugify(state.brandName);
+          if (slot.key === 'faviconIco') return 'backend/public/favicon.ico';
+          return `/brand/${slug}-${slot.suffix}.${upload.ext}`;
+        }
+        return state.currentAssets[slot.assetKey] || '';
+      }
+
+      function buildEnvText() {
+        const name = (state.brandName || '').trim() || 'Control Panel';
+        const color = /^#[0-9a-fA-F]{6}$/.test(state.primaryColor) ? state.primaryColor : '#3B82F6';
+        const lines = [
+          `# Generated by White-Label Pre-Install Configurator`,
+          `APP_NAME=${formatEnvVal(name)}`,
+          `BRANDING_NAME=${formatEnvVal(name)}`,
+          `BRANDING_PRIMARY_COLOR=${formatEnvVal(color)}`,
+          `BRANDING_LOGO=${computePredictedAssetPath(UPLOAD_SLOTS[0])}`,
+          `BRANDING_LOGO_DARK=${computePredictedAssetPath(UPLOAD_SLOTS[1])}`,
+          `BRANDING_ICON=${computePredictedAssetPath(UPLOAD_SLOTS[2])}`,
+          `BRANDING_ICON_DARK=${computePredictedAssetPath(UPLOAD_SLOTS[3])}`,
+          `BRANDING_FAVICON=${computePredictedAssetPath(UPLOAD_SLOTS[4])}`,
+        ];
+        if (state.appUrl.trim()) lines.push(`APP_URL=${state.appUrl.trim()}`);
+        if (state.contactEmail.trim()) lines.push(`MAIL_FROM_ADDRESS=${formatEnvVal(state.contactEmail.trim())}`);
+        if (state.releasesUrl.trim()) lines.push(`PANEL_RELEASES_URL=${state.releasesUrl.trim()}`);
+        lines.push(`CENTRAL_URL=${state.centralUrl.trim()}`);
+        if (state.repoUrl.trim()) lines.push(`# REPO_URL=${state.repoUrl.trim()}`);
+        return `${lines.join('\n')}\n`;
+      }
+
+      function inlineFallbackSvg(text, bg, fg) {
+        const safe = (text || 'S').slice(0, 2).toUpperCase().replace(/[^A-Z0-9]/g, 'S') || 'S';
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="${bg}"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="${fg}" font-family="system-ui,sans-serif" font-weight="800" font-size="28">${safe}</text></svg>`;
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      }
+
+      function showAlert(kind, message, items = []) {
+        el.statusAlert.className = `alert show ${kind}`;
+        el.statusMessage.textContent = message;
+        el.statusFiles.replaceChildren();
+        if (items.length > 0) {
+          el.statusFiles.classList.remove('hidden');
+          for (const item of items) {
+            const li = document.createElement('li');
+            li.textContent = item;
+            el.statusFiles.appendChild(li);
+          }
+        } else {
+          el.statusFiles.classList.add('hidden');
+        }
+      }
+
+      function hideAlert() {
+        el.statusAlert.className = 'alert';
+        el.statusMessage.textContent = '';
+        el.statusFiles.replaceChildren();
+      }
+
+      function renderSwatches() {
+        el.swatchGrid.replaceChildren();
+        const activeHex = state.primaryColor.toUpperCase();
+        for (const preset of PRESETS) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = `swatch${preset.hex.toUpperCase() === activeHex ? ' active' : ''}`;
+          btn.style.background = preset.hex;
+          btn.title = `${preset.name} (${preset.hex})`;
+          btn.setAttribute('aria-label', `${preset.name} ${preset.hex}`);
+          btn.addEventListener('click', () => {
+            state.primaryColor = preset.hex;
+            el.colorPicker.value = preset.hex;
+            el.colorHex.value = preset.hex;
+            renderAll();
+          });
+          el.swatchGrid.appendChild(btn);
+        }
+      }
+
+      function renderUploadGrid() {
+        el.uploadGrid.replaceChildren();
+        for (const slot of UPLOAD_SLOTS) {
+          const zone = document.createElement('div');
+          zone.className = 'dropzone';
+          if (slot.fullWidth) zone.style.gridColumn = '1 / -1';
+
+          const top = document.createElement('div');
+          top.className = 'dropzone-top';
+          const title = document.createElement('span');
+          title.className = 'dropzone-title';
+          title.textContent = slot.label;
+          top.appendChild(title);
+
+          if (state.uploads[slot.key]) {
+            const resetBtn = document.createElement('button');
+            resetBtn.type = 'button';
+            resetBtn.className = 'clear-link';
+            resetBtn.textContent = 'Reset';
+            resetBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              delete state.uploads[slot.key];
+              renderUploadGrid();
+              renderPreview();
+            });
+            top.appendChild(resetBtn);
+          }
+
+          const surface = document.createElement('div');
+          surface.className = `dropzone-surface ${slot.surface === 'dark' ? 'dark-surface' : 'light-surface'}`;
+          const previewSrc = resolveAssetUrl(slot.key, slot.assetKey);
+          if (previewSrc) {
+            const img = document.createElement('img');
+            img.src = previewSrc;
+            img.alt = slot.label;
+            surface.appendChild(img);
+          } else {
+            const empty = document.createElement('span');
+            empty.className = 'dropzone-empty';
+            empty.textContent = 'Drop image or click to browse';
+            surface.appendChild(empty);
+          }
+
+          const meta = document.createElement('div');
+          meta.className = 'dropzone-meta';
+          const fileSpan = document.createElement('span');
+          fileSpan.className = 'dropzone-file';
+          if (state.uploads[slot.key]) {
+            const kb = (state.uploads[slot.key].size / 1024).toFixed(1);
+            fileSpan.textContent = `${state.uploads[slot.key].filename} (${kb} KB)`;
+          } else {
+            fileSpan.textContent = state.currentAssets[slot.assetKey] || 'Not set';
+          }
+          const actionSpan = document.createElement('span');
+          actionSpan.textContent = state.uploads[slot.key] ? 'Staged' : 'Upload';
+          meta.append(fileSpan, actionSpan);
+
+          const fileInput = document.createElement('input');
+          fileInput.type = 'file';
+          fileInput.accept = slot.accept;
+          fileInput.className = 'hidden';
+
+          const handleFiles = (files) => {
+            if (!files || !files[0]) return;
+            readImageFile(slot, files[0]);
+          };
+
+          fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+          zone.addEventListener('click', () => fileInput.click());
+          zone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            zone.classList.add('dragover');
+          });
+          zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+          zone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            zone.classList.remove('dragover');
+            handleFiles(e.dataTransfer?.files);
+          });
+
+          zone.append(top, surface, meta, fileInput);
+          el.uploadGrid.appendChild(zone);
+        }
+      }
+
+      function inferMime(file) {
+        if (file.type && ALLOWED_MIMES.has(file.type.toLowerCase())) {
+          return file.type.toLowerCase();
+        }
+        const ext = (file.name.split('.').pop() || '').toLowerCase();
+        const byExt = {
+          svg: 'image/svg+xml',
+          png: 'image/png',
+          jpg: 'image/jpeg',
+          jpeg: 'image/jpeg',
+          webp: 'image/webp',
+          ico: 'image/x-icon',
+        };
+        return byExt[ext] || '';
+      }
+
+      function readImageFile(slot, file) {
+        hideAlert();
+        if (file.size > MAX_ASSET_BYTES) {
+          showAlert('error', `${slot.label}: "${file.name}" exceeds the 2 MB limit.`);
+          return;
+        }
+        const mime = inferMime(file);
+        if (!ALLOWED_MIMES.has(mime)) {
+          showAlert('error', `${slot.label}: Unsupported image type (${file.type || file.name}).`);
+          return;
+        }
+        const extMap = {
+          'image/svg+xml': 'svg',
+          'image/png': 'png',
+          'image/jpeg': 'jpg',
+          'image/webp': 'webp',
+          'image/x-icon': 'ico',
+          'image/vnd.microsoft.icon': 'ico',
+        };
+
+        const reader = new FileReader();
+        reader.onload = () => {
+          let dataUrl = String(reader.result || '');
+          if (dataUrl.startsWith('data:application/octet-stream;base64,')) {
+            dataUrl = `data:${mime};base64,${dataUrl.slice('data:application/octet-stream;base64,'.length)}`;
+          }
+          if (mime === 'image/svg+xml') {
+            const b64Part = dataUrl.split(',')[1] || '';
+            try {
+              const svgText = atob(b64Part);
+              if (/<script\b/i.test(svgText) || /(?:^|[\s/])on[a-z]{2,}\s*=/i.test(svgText)) {
+                showAlert('error', `${slot.label}: SVG rejected because it contains <script> or inline event handlers.`);
+                return;
+              }
+            } catch {
+              showAlert('error', `${slot.label}: Invalid SVG encoding.`);
+              return;
+            }
+          }
+          state.uploads[slot.key] = {
+            filename: file.name,
+            dataUrl,
+            ext: extMap[mime] || slot.fallbackExt,
+            size: file.size,
+          };
+          renderUploadGrid();
+          renderPreview();
+        };
+        reader.readAsDataURL(file);
+      }
+
+      function renderColorAndContrast() {
+        const valid = /^#[0-9a-fA-F]{6}$/.test(state.primaryColor);
+        const hex = valid ? state.primaryColor.toUpperCase() : '#3B82F6';
+        const fg = pickForegroundHex(hex);
+
+        document.documentElement.style.setProperty('--brand', hex);
+        document.documentElement.style.setProperty('--brand-fg', fg);
+        el.fgHint.textContent = `Recommended button text: ${fg}`;
+
+        el.chipWhite.style.background = hex;
+        el.chipWhite.style.color = '#FFFFFF';
+        el.chipDark.style.background = hex;
+        el.chipDark.style.color = '#16161A';
+        el.chipOnDark.style.background = '#0E0E12';
+        el.chipOnDark.style.color = hex;
+        el.chipOnLight.style.background = '#FFFFFF';
+        el.chipOnLight.style.color = hex;
+
+        formatBadge(el.ratioWhite, contrastRatio('#FFFFFF', hex));
+        formatBadge(el.ratioDark, contrastRatio('#16161A', hex));
+        formatBadge(el.ratioOnDark, contrastRatio(hex, '#0E0E12'));
+        formatBadge(el.ratioOnLight, contrastRatio(hex, '#FFFFFF'));
+
+        renderSwatches();
+      }
+
+      function renderPreview() {
+        const name = (state.brandName || '').trim() || 'Control Panel';
+        const hex = /^#[0-9a-fA-F]{6}$/.test(state.primaryColor) ? state.primaryColor : '#3B82F6';
+        const fg = pickForegroundHex(hex);
+        const fallbackImg = inlineFallbackSvg(name, hex, fg);
+
+        el.topMark.textContent = name.slice(0, 1).toUpperCase();
+        el.slugPreview.textContent = `Slug: ${slugify(name)}`;
+
+        const favSrc = resolveAssetUrl('faviconSvg', 'favicon') || resolveAssetUrl('faviconPng', 'favicon_png') || fallbackImg;
+        el.tabFavicon.src = favSrc;
+        el.tabTitle.textContent = state.previewTab === 'login' ? `Sign in · ${name}` : `Dashboard · ${name}`;
+
+        el.panelView.classList.toggle('sim-light', !state.previewDark);
+        el.loginView.classList.toggle('sim-light', !state.previewDark);
+        el.panelView.classList.toggle('collapsed', state.sidebarCollapsed);
+
+        const sidebarLogoSrc = state.sidebarCollapsed
+          ? (state.previewDark ? resolveAssetUrl('iconDark', 'icon_dark') : resolveAssetUrl('iconLight', 'icon')) || fallbackImg
+          : (state.previewDark ? resolveAssetUrl('logoDark', 'logo_dark') : resolveAssetUrl('logoLight', 'logo')) || fallbackImg;
+
+        const loginLogoSrc = (state.previewDark ? resolveAssetUrl('logoDark', 'logo_dark') : resolveAssetUrl('logoLight', 'logo')) || fallbackImg;
+
+        el.simSidebarLogo.src = sidebarLogoSrc;
+        el.simLoginLogo.src = loginLogoSrc;
+        el.simHeaderTitle.textContent = `${name} · Fleet Overview`;
+        el.loginHeading.textContent = `Sign in to ${name}`;
+        el.simStatAccent.style.color = hex;
+
+        const isEnv = state.previewTab === 'env';
+        el.browserFrame.classList.toggle('hidden', isEnv);
+        el.envView.classList.toggle('hidden', !isEnv);
+        el.previewControls.classList.toggle('hidden', isEnv);
+        el.panelView.classList.toggle('hidden', state.previewTab !== 'panel');
+        el.loginView.classList.toggle('hidden', state.previewTab !== 'login');
+        el.sidebarToggleBtn.classList.toggle('hidden', state.previewTab !== 'panel');
+
+        const envText = buildEnvText();
+        el.envCode.textContent = envText;
+        el.envLineCount.textContent = `${envText.trim().split('\n').length} lines`;
+      }
+
+      function renderAll() {
+        renderColorAndContrast();
+        renderPreview();
+      }
+
+      async function loadCurrent() {
+        try {
+          const res = await fetch('/api/current', { cache: 'no-store' });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          state.online = true;
+          el.connPill.className = 'pill online';
+          el.connText.textContent = 'Connected to local configurator';
+
+          state.brandName = data.name || 'Control Panel';
+          state.primaryColor = /^#[0-9a-fA-F]{6}$/.test(data.primary_color || '') ? data.primary_color : '#3B82F6';
+          state.repoUrl = data.repo_url || '';
+          state.releasesUrl = data.releases_url || '';
+          state.appUrl = data.app_url || '';
+          state.contactEmail = data.contact_email || '';
+          state.centralUrl = data.central_url ?? '';
+          if (data.assets) state.currentAssets = { ...state.currentAssets, ...data.assets };
+
+          el.brandName.value = state.brandName;
+          el.colorPicker.value = state.primaryColor;
+          el.colorHex.value = state.primaryColor;
+          el.repoUrl.value = state.repoUrl;
+          el.releasesUrl.value = state.releasesUrl;
+          el.appUrl.value = state.appUrl;
+          el.contactEmail.value = state.contactEmail;
+          el.centralUrl.value = state.centralUrl;
+        } catch {
+          state.online = false;
+          el.connPill.className = 'pill offline';
+          el.connText.textContent = 'Offline preview mode';
+          el.brandName.value = state.brandName;
+          el.colorPicker.value = state.primaryColor;
+          el.colorHex.value = state.primaryColor;
+          el.repoUrl.value = state.repoUrl;
+          el.releasesUrl.value = state.releasesUrl;
+          el.appUrl.value = state.appUrl;
+          el.contactEmail.value = state.contactEmail;
+          el.centralUrl.value = state.centralUrl;
+        }
+        renderUploadGrid();
+        renderAll();
+      }
+
+      // Event bindings
+      el.uiThemeBtn.addEventListener('click', () => {
+        const current = document.documentElement.getAttribute('data-theme');
+        const next = current === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', next);
+        el.uiThemeBtn.textContent = next === 'dark' ? 'Light UI' : 'Dark UI';
+      });
+
+      el.brandName.addEventListener('input', () => {
+        state.brandName = el.brandName.value;
+        renderPreview();
+      });
+
+      el.colorPicker.addEventListener('input', () => {
+        state.primaryColor = el.colorPicker.value.toUpperCase();
+        el.colorHex.value = state.primaryColor;
+        renderAll();
+      });
+
+      el.colorHex.addEventListener('input', () => {
+        let raw = el.colorHex.value.trim();
+        if (/^[0-9a-fA-F]{6}$/.test(raw)) {
+          raw = `#${raw}`;
+          el.colorHex.value = raw;
+        }
+        state.primaryColor = raw;
+        if (/^#[0-9a-fA-F]{6}$/.test(raw)) {
+          el.colorPicker.value = raw;
+          renderAll();
+        } else {
+          renderPreview();
+        }
+      });
+
+      el.repoUrl.addEventListener('input', () => {
+        state.repoUrl = el.repoUrl.value;
+        if (!state.releasesManuallyEdited) {
+          const derived = deriveGitHubReleases(state.repoUrl);
+          if (derived) {
+            state.releasesUrl = derived;
+            el.releasesUrl.value = derived;
+          }
+        }
+        renderPreview();
+      });
+
+      el.releasesUrl.addEventListener('input', () => {
+        state.releasesUrl = el.releasesUrl.value;
+        state.releasesManuallyEdited = Boolean(state.releasesUrl.trim());
+        renderPreview();
+      });
+
+      el.appUrl.addEventListener('input', () => {
+        state.appUrl = el.appUrl.value;
+        renderPreview();
+      });
+
+      el.contactEmail.addEventListener('input', () => {
+        state.contactEmail = el.contactEmail.value;
+        renderPreview();
+      });
+
+      el.centralUrl.addEventListener('input', () => {
+        state.centralUrl = el.centralUrl.value;
+        renderPreview();
+      });
+
+      el.clearCentralBtn.addEventListener('click', () => {
+        state.centralUrl = '';
+        el.centralUrl.value = '';
+        renderPreview();
+      });
+
+      document.querySelectorAll('.tab-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+          btn.classList.add('active');
+          state.previewTab = btn.dataset.tab;
+          renderPreview();
+        });
+      });
+
+      el.previewThemeBtn.addEventListener('click', () => {
+        state.previewDark = !state.previewDark;
+        el.previewThemeBtn.textContent = state.previewDark ? 'Light Preview' : 'Dark Preview';
+        renderPreview();
+      });
+
+      el.sidebarToggleBtn.addEventListener('click', () => {
+        state.sidebarCollapsed = !state.sidebarCollapsed;
+        el.sidebarToggleBtn.textContent = state.sidebarCollapsed ? 'Expand Sidebar' : 'Collapse Sidebar';
+        renderPreview();
+      });
+
+      el.downloadEnvBtn.addEventListener('click', () => {
+        const blob = new Blob([buildEnvText()], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'branding.env';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      });
+
+      el.copyEnvBtn.addEventListener('click', async () => {
+        const text = buildEnvText();
+        const prev = el.copyEnvBtn.textContent;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+          }
+          el.copyEnvBtn.textContent = 'Copied!';
+          setTimeout(() => { el.copyEnvBtn.textContent = prev; }, 1600);
+        } catch {
+          showAlert('error', 'Unable to copy to clipboard. Use Download branding.env instead.');
+        }
+      });
+
+      el.applyBtn.addEventListener('click', async () => {
+        hideAlert();
+        const brandName = el.brandName.value.trim();
+        const primaryColor = el.colorHex.value.trim();
+
+        if (!brandName) {
+          showAlert('error', 'Brand Name is required.');
+          return;
+        }
+        if (!/^#[0-9a-fA-F]{6}$/.test(primaryColor)) {
+          showAlert('error', 'Primary Brand Color must be a valid 6-digit hex code like #3B82F6.');
+          return;
+        }
+        if (!state.online) {
+          showAlert('error', 'Offline preview mode: start `node preinstall/server.mjs` and open http://127.0.0.1:3456 to write directly to the repository, or use Download branding.env.');
+          return;
+        }
+
+        const payload = {
+          brandName,
+          primaryColor,
+          repoUrl: el.repoUrl.value.trim(),
+          releasesUrl: el.releasesUrl.value.trim(),
+          appUrl: el.appUrl.value.trim(),
+          contactEmail: el.contactEmail.value.trim(),
+          centralUrl: el.centralUrl.value.trim(),
+        };
+
+        for (const slot of UPLOAD_SLOTS) {
+          if (state.uploads[slot.key]) {
+            payload[slot.key] = {
+              filename: state.uploads[slot.key].filename,
+              dataUrl: state.uploads[slot.key].dataUrl,
+            };
+          }
+        }
+
+        el.applyBtn.disabled = true;
+        el.applyBtn.textContent = 'Applying...';
+
+        try {
+          const res = await fetch('/api/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.error || `Request failed with status ${res.status}`);
+          }
+
+          state.uploads = {};
+          if (data.current) {
+            state.brandName = data.current.name || brandName;
+            state.primaryColor = data.current.primary_color || primaryColor;
+            state.currentAssets = { ...state.currentAssets, ...(data.current.assets || {}) };
+          }
+          renderUploadGrid();
+          renderAll();
+
+          const summaryItems = [
+            ...(data.savedAssets || []).map((a) => `asset: ${a}`),
+            ...(data.updatedFiles || []).map((f) => `updated: ${f}`),
+          ];
+          showAlert(
+            'success',
+            `Applied "${brandName}" (${primaryColor})! ${data.updatedFiles.length} file(s) updated, ${data.savedAssets.length} asset(s) saved.`,
+            summaryItems.length ? summaryItems : ['No files needed changes (already matched).']
+          );
+        } catch (err) {
+          showAlert('error', err.message || 'Failed to apply configuration.');
+        } finally {
+          el.applyBtn.disabled = false;
+          el.applyBtn.textContent = 'Save & Apply to Repo';
+        }
+      });
+
+      loadCurrent();
+    })();
+  </script>
+</body>
+</html>

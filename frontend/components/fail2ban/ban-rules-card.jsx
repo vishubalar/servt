@@ -1,0 +1,192 @@
+"use client";
+
+import { SlidersHorizontal } from "lucide-react";
+import { useState } from "react";
+import { useRefresh } from "@/hooks/use-refresh";
+import { useTranslations } from "next-intl";
+import { DENIED, DisabledReasonProvider } from "@/components/ui/reason-tooltip";
+import { toast } from "sonner";
+import { updateFail2ban } from "@/lib/api/fail2ban";
+import { PERMANENT_BANTIME } from "@/lib/schemas/fail2ban";
+import { humanDuration } from "@/lib/fail2ban/duration";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { CardSaveFooter } from "@/components/ui/card-save-footer";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { apiMessage } from "@/lib/api/error-message";
+
+export function BanRulesCard({ settings, presets, canManage }) {
+  const t = useTranslations("fail2ban");
+  const { refreshAndWait } = useRefresh();
+
+  const [bantime, setBantime] = useState(String(settings.bantime));
+  const [findtime, setFindtime] = useState(String(settings.findtime));
+  const [maxretry, setMaxretry] = useState(String(settings.maxretry));
+  const [saving, setSaving] = useState(false);
+  const pending = saving;
+
+  const isPermanent = Number(bantime) === PERMANENT_BANTIME;
+
+  const hasCurrent = presets.some((p) => String(p.seconds) === String(settings.bantime));
+
+  const inRange = (value, min, max) => /^\d+$/.test(value) && Number(value) >= min && Number(value) <= max;
+  const maxretryError = inRange(maxretry, 2, 100) ? null : t("settings.maxretryRange");
+  const findtimeError = inRange(findtime, 30, 86400) ? null : t("settings.findtimeRange");
+
+  const dirty =
+    String(settings.bantime) !== bantime ||
+    String(settings.findtime) !== findtime ||
+    String(settings.maxretry) !== maxretry;
+
+  async function save() {
+    setSaving(true);
+    try {
+      await updateFail2ban({
+        bantime: Number(bantime),
+        findtime: Number(findtime),
+        maxretry: Number(maxretry),
+        // No ignore_ips, so the server keeps its list and a stale page can't drop an address.
+      });
+      await refreshAndWait();
+      toast.success(t("settings.saved"));
+    } catch (error) {
+      toast.error(
+        apiMessage(error, t("settings.failed")),
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function discard() {
+    setBantime(String(settings.bantime));
+    setFindtime(String(settings.findtime));
+    setMaxretry(String(settings.maxretry));
+  }
+
+  const saveReason = !canManage
+    ? DENIED
+    : !dirty
+      ? t("disabled.noChanges")
+      : maxretryError || findtimeError;
+
+  return (
+    <DisabledReasonProvider denied={!canManage}>
+      <Card className="@container/ban-rules min-w-0 gap-0 py-0">
+        <CardHeader className="border-b px-5 py-4">
+          <CardTitle icon={SlidersHorizontal}>{t("settings.title")}</CardTitle>
+          <CardDescription>{t("settings.description")}</CardDescription>
+        </CardHeader>
+
+        <CardContent className="px-5 py-5">
+          <div className="grid gap-x-6 gap-y-5 @md/ban-rules:grid-cols-2">
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="f2b-maxretry">{t("settings.maxretry")}</Label>
+              <Input
+                id="f2b-maxretry"
+                placeholder="5"
+                type="number"
+                min={2}
+                max={100}
+                value={maxretry}
+                aria-invalid={maxretryError ? true : undefined}
+                aria-describedby={maxretryError ? "f2b-maxretry-hint f2b-maxretry-error" : "f2b-maxretry-hint"}
+                onChange={(e) => setMaxretry(e.target.value)}
+                disabled={!canManage || pending}
+              />
+              <p id="f2b-maxretry-hint" className="text-xs leading-relaxed text-muted-foreground">{t("settings.maxretryHint")}</p>
+              {maxretryError ? (
+                <p id="f2b-maxretry-error" className="text-xs text-destructive">{maxretryError}</p>
+              ) : null}
+            </div>
+
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="f2b-findtime">{t("settings.findtime")}</Label>
+              <Input
+                id="f2b-findtime"
+                placeholder="600"
+                type="number"
+                min={30}
+                max={86400}
+                value={findtime}
+                aria-invalid={findtimeError ? true : undefined}
+                aria-describedby={findtimeError ? "f2b-findtime-hint f2b-findtime-error" : "f2b-findtime-hint"}
+                onChange={(e) => setFindtime(e.target.value)}
+                disabled={!canManage || pending}
+              />
+              {findtimeError ? (
+                <p id="f2b-findtime-error" className="text-xs text-destructive">{findtimeError}</p>
+              ) : null}
+              <p id="f2b-findtime-hint" className="text-xs leading-relaxed text-muted-foreground">
+                {!findtimeError && humanDuration(t, findtime) ? `${humanDuration(t, findtime)} — ` : null}
+                {t("settings.findtimeHint")}
+              </p>
+            </div>
+
+            <div className="min-w-0 space-y-2">
+              <Label htmlFor="f2b-bantime">{t("settings.bantime")}</Label>
+              <Select value={bantime} onValueChange={setBantime} disabled={!canManage || pending}>
+                <SelectTrigger id="f2b-bantime" className="w-full" aria-describedby="f2b-bantime-hint">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {!hasCurrent ? (
+                    <SelectItem value={String(settings.bantime)}>
+                      {t("settings.currentSeconds", { seconds: settings.bantime })}
+                    </SelectItem>
+                  ) : null}
+                  {presets.map((p) => (
+                    <SelectItem key={p.key} value={String(p.seconds)}>
+                      {p.seconds === PERMANENT_BANTIME ? t("settings.permanent") : p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p id="f2b-bantime-hint" className="text-xs leading-relaxed text-muted-foreground">{t("settings.bantimeHint")}</p>
+            </div>
+
+            <div className="min-w-0 space-y-2">
+              <p className="text-sm font-medium">{t("settings.previewTitle")}</p>
+              <div className="space-y-2 rounded-lg bg-muted/60 p-3">
+                <p className="text-sm leading-relaxed">
+                  {maxretryError || findtimeError ? t("settings.previewInvalid") : t.rich(isPermanent ? "settings.summaryPermanent" : "settings.summary", {
+                    retries: maxretry || "—",
+                    window: humanDuration(t, findtime) ?? findtime,
+                    duration: humanDuration(t, bantime) ?? bantime,
+                    strong: (chunks) => <strong className="font-semibold">{chunks}</strong>,
+                  })}
+                </p>
+                <p className="text-xs leading-relaxed text-muted-foreground">{t("settings.previewHint")}</p>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+
+        <div>
+          <CardSaveFooter
+            saving={pending}
+            dirty={dirty}
+            saveReason={saveReason}
+            onSave={save}
+            onDiscard={discard}
+            saveLabel={t("settings.saveRules")}
+            savingNote={t("settings.savingNote")}
+          />
+        </div>
+      </Card>
+    </DisabledReasonProvider>
+  );
+}

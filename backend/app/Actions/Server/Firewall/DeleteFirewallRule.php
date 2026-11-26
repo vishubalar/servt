@@ -1,0 +1,54 @@
+<?php
+
+namespace App\Actions\Server\Firewall;
+
+use App\Contracts\Firewall;
+use App\Exceptions\Server\Firewall\FirewallOperationException;
+use App\Models\FirewallRule;
+use App\Services\ActivityLogger;
+use App\Services\Server\Firewall\ProtectedRuleGuard;
+use App\Services\Server\Firewall\SshLockoutGuard;
+
+class DeleteFirewallRule
+{
+    public function __construct(
+        private Firewall $firewall,
+        private ActivityLogger $activityLogger,
+        private SshLockoutGuard $sshLockoutGuard,
+        private ProtectedRuleGuard $protectedRuleGuard,
+    ) {}
+
+    public function execute(FirewallRule $rule): void
+    {
+        // System-seeded rules (SSH + defaults) can't be removed while the
+        // firewall is on. Lifted out of here so that editing one meets the
+        // same rule: the two used to disagree, and the unguarded half was the
+        // one the frontend actually showed.
+        $this->protectedRuleGuard->assertRemovable($rule);
+
+        // The origin check above asks who made the rule; this asks whether a
+        // way in survives without it. A user-made SSH rule passes the first
+        // and fails this one.
+        $this->sshLockoutGuard->assertSurvives($rule);
+
+        $ports = $rule->summary();
+
+        // Not wrapped in a transaction. `ufw` changes the running firewall the
+        // moment it returns, so a rollback afterwards could only undo the row —
+        // leaving the port open or closed with nothing in the panel saying so.
+        // The transaction never made the two systems atomic; it only held
+        // SQLite's single write lock for the seconds a ufw reload takes, which
+        // is long enough to fail an unrelated request with "database is
+        // locked". Removing first and deleting after gives the same ordering
+        // guarantee for none of that cost.
+        $result = $this->firewall->remove($rule);
+
+        if ($result->failed()) {
+            throw new FirewallOperationException($result->reference);
+        }
+
+        $rule->delete();
+
+        $this->activityLogger->log('firewall.rule_removed', null, ['ports' => $ports]);
+    }
+}

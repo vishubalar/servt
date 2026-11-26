@@ -1,0 +1,417 @@
+<?php
+
+use App\Services\Server\Applications\ComposeValidator;
+use App\Services\Server\ServerOps;
+use App\Services\Server\ServerOpsResult;
+use Illuminate\Contracts\Process\ProcessResult;
+
+/*
+ * A pasted compose file is untrusted input that becomes a root-run command.
+ *
+ * The validator parses it with `docker compose config --format json` (the daemon's own parser,
+ * not a YAML library), so validator and executor can never read a file differently. `config`
+ * also normalises (`- /:/host` and `{type: bind, source: /, target: /host}` both resolve to the
+ * second), so each rule is written once against one shape. The fixtures are that resolved shape.
+ */
+
+/** A ServerOps whose `docker compose config` returns this resolved document. */
+function composeOps(array $resolved, bool $answered = true): ServerOps
+{
+    $process = Mockery::mock(ProcessResult::class);
+    $process->shouldReceive('output')->andReturn(json_encode($resolved));
+    $process->shouldReceive('errorOutput')->andReturn('');
+
+    $ops = Mockery::mock(ServerOps::class);
+    $ops->shouldReceive('run')->andReturn(new ServerOpsResult(
+        ok: $answered,
+        reference: 'r',
+        result: $process,
+        answered: $answered,
+    ));
+
+    return $ops;
+}
+
+/**
+ * A ServerOps whose `docker compose config` refuses the file: exit 1, complaint on stderr
+ * (unlike {@see composeOps()} with `answered: false`, which carries no text).
+ */
+function composeFailure(string $stderr, bool $denied = false): ServerOps
+{
+    $process = Mockery::mock(ProcessResult::class);
+    $process->shouldReceive('output')->andReturn('');
+    $process->shouldReceive('errorOutput')->andReturn($stderr);
+    $process->shouldReceive('exitCode')->andReturn(1);
+
+    $ops = Mockery::mock(ServerOps::class);
+    $ops->shouldReceive('run')->andReturn(new ServerOpsResult(
+        ok: false,
+        reference: 'r',
+        result: $process,
+        denied: $denied,
+        answered: false,
+    ));
+
+    return $ops;
+}
+
+/** The sentence a refused file answers with, for the error text Docker gave. */
+function unparsableError(string $stderr, bool $denied = false): string
+{
+    return (new ComposeValidator(composeFailure($stderr, $denied)))->validate('x', ROOT)['errors'][0];
+}
+
+/** A ServerOps that answers each successive `config` call from a list. */
+function composeOpsSequence(array $documents): ServerOps
+{
+    $ops = Mockery::mock(ServerOps::class);
+    $index = 0;
+
+    $ops->shouldReceive('run')->andReturnUsing(function () use ($documents, &$index) {
+        $doc = $documents[min($index, count($documents) - 1)];
+        $index++;
+
+        $process = Mockery::mock(ProcessResult::class);
+        $process->shouldReceive('output')->andReturn(json_encode($doc));
+        $process->shouldReceive('errorOutput')->andReturn('');
+
+        return new ServerOpsResult(ok: true, reference: 'r', result: $process, answered: true);
+    });
+
+    return $ops;
+}
+
+const ROOT = '/home/shop/shop/public_html';
+
+it('accepts a file that keeps to its own directory and to loopback', function () {
+    $ops = composeOps(['services' => ['web' => [
+        'image' => 'nginx:alpine',
+        'ports' => [['host_ip' => '127.0.0.1', 'published' => '20001', 'target' => 80]],
+        'volumes' => [['type' => 'bind', 'source' => ROOT.'/data', 'target' => '/data']],
+    ]]]);
+
+    expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])->toBeTrue();
+});
+
+it('binds a public port to loopback instead of refusing the file', function () {
+    // `"3001:3001"` is the normal Docker idiom and every upstream compose file publishes that way,
+    // so it is rewritten to loopback rather than refused.
+    // Two parses: the first sees a public port, the second (after the rewrite) sees loopback.
+    $public = ['services' => ['web' => ['ports' => [['published' => '3001', 'target' => 3001]]]]];
+    $fixed = ['services' => ['web' => ['ports' => [['host_ip' => '127.0.0.1', 'published' => '3001', 'target' => 3001]]]]];
+
+    $ops = composeOpsSequence([$public, $fixed]);
+
+    $verdict = (new ComposeValidator($ops))->validate(
+        "services:\n  web:\n    image: nginx\n    ports:\n      - \"3001:3001\"\n",
+        ROOT,
+    );
+
+    expect($verdict['ok'])->toBeTrue()
+        ->and($verdict['rewrote_ports'])->toBeTrue()
+        // What gets written is the bound form, not what was typed.
+        ->and($verdict['compose'])->toContain('127.0.0.1:3001:3001');
+});
+
+it('refuses a public port the rewrite could not fix', function () {
+    // Safety does not rest on the regex being complete: a mapping form the rewrite misses is
+    // re-parsed, still found public, and refused.
+    $public = ['services' => ['web' => ['ports' => [['published' => '8080', 'target' => 80]]]]];
+
+    // Both parses see a public port: the rewrite changed nothing it could fix.
+    $ops = composeOpsSequence([$public, $public]);
+
+    $verdict = (new ComposeValidator($ops))->validate(
+        "services:\n  web:\n    ports:\n      - target: 80\n        published: 8080\n",
+        ROOT,
+    );
+
+    expect($verdict['ok'])->toBeFalse()
+        ->and($verdict['errors'][0])->toBe(__('errors/application.compose_port_public', ['service' => '', 'port' => '']));
+});
+
+it('refuses a bind mount outside the application directory', function () {
+    $ops = composeOps(['services' => ['web' => [
+        'image' => 'nginx:alpine',
+        'volumes' => [['type' => 'bind', 'source' => '/', 'target' => '/host']],
+    ]]]);
+
+    expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])->toBeFalse();
+});
+
+it('is not fooled by a sibling directory with the same prefix', function () {
+    // `/home/shop/shop/public_html-evil` starts with the root as a string but is a different
+    // directory: compare with the separator.
+    $ops = composeOps(['services' => ['web' => [
+        'volumes' => [['type' => 'bind', 'source' => ROOT.'-evil', 'target' => '/x']],
+    ]]]);
+
+    expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])->toBeFalse();
+});
+
+it('is not fooled by a path that climbs out', function () {
+    // Compose resolves `../../../etc` itself; this asserts the check also holds if a
+    // non-normalised source ever reaches it.
+    $ops = composeOps(['services' => ['web' => [
+        'volumes' => [['type' => 'bind', 'source' => ROOT.'/../../../etc', 'target' => '/x']],
+    ]]]);
+
+    expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])->toBeFalse();
+});
+
+it('leaves named volumes alone', function () {
+    // A named volume is Docker's to place and cannot point at the host
+    // filesystem. Refusing it would block the normal way to persist data.
+    $ops = composeOps(['services' => ['db' => [
+        'image' => 'postgres:16',
+        'volumes' => [['type' => 'volume', 'source' => 'pgdata', 'target' => '/var/lib/postgresql/data']],
+    ]]]);
+
+    expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])->toBeTrue();
+});
+
+it('refuses every documented way out of the container', function () {
+    // Each of these is a way onto the host, not a style preference.
+    $cases = [
+        'privileged' => true,
+        'cap_add' => ['SYS_ADMIN'],
+        'devices' => [['source' => '/dev/sda', 'target' => '/dev/sda']],
+        'pid' => 'host',
+        'ipc' => 'host',
+        'userns_mode' => 'host',
+        'security_opt' => ['apparmor:unconfined'],
+        'network_mode' => 'host',
+        'cgroup_parent' => '/',
+        // A build context is a host path the daemon reads as ROOT. The bind-mount check walks
+        // `volumes` and does not cover it: `context: /root` puts the server's keys into an image.
+        'build' => ['context' => '/root'],
+    ];
+
+    foreach ($cases as $key => $value) {
+        $ops = composeOps(['services' => ['web' => ['image' => 'nginx', $key => $value]]]);
+
+        expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])
+            ->toBeFalse("{$key} was allowed");
+    }
+});
+
+it('refuses a file Docker itself cannot read', function () {
+    $ops = composeOps([], answered: false);
+
+    $verdict = (new ComposeValidator($ops))->validate('not: [valid', ROOT);
+
+    // Docker said nothing we can quote, so the sentence stands without a colon
+    // and an empty tail.
+    expect($verdict['ok'])->toBeFalse()
+        ->and($verdict['errors'][0])->toBe(__('errors/application.compose_unparsable_generic'));
+});
+
+it('shows Docker\'s own parse error instead of pointing at a log the user cannot open (RC-29)', function () {
+    $error = unparsableError("yaml: line 3: did not find expected key\n");
+
+    expect($error)->toBe(__('errors/application.compose_unparsable', ['error' => 'yaml: line 3: did not find expected key']))
+        ->and($error)->toContain('did not find expected key')
+        ->and($error)->not->toContain('operations log');
+});
+
+it('quotes the error, not the warnings Docker prints ahead of it', function () {
+    $error = unparsableError(
+        "time=\"2026-11-05T10:00:00Z\" level=warning msg=\"the attribute `version` is obsolete\"\n"
+        ."WARN[0000] /home/shop/compose.yml: `version` is obsolete\n"
+        ."services.web.ports must be a list\n"
+    );
+
+    expect($error)->toContain('services.web.ports must be a list')
+        ->and($error)->not->toContain('obsolete');
+});
+
+it('keeps every line of a multi-line complaint, on one line', function () {
+    $error = unparsableError("yaml: unmarshal errors:\n  line 4: mapping key \"image\" already defined at line 3\n");
+
+    expect($error)->toContain('yaml: unmarshal errors: line 4: mapping key "image" already defined at line 3')
+        ->and($error)->not->toContain("\n");
+});
+
+it('falls back to the plain sentence when Docker only printed warnings', function () {
+    expect(unparsableError("WARN[0000] `version` is obsolete\n"))
+        ->toBe(__('errors/application.compose_unparsable_generic'));
+});
+
+it('does not blame the file for a refused sudo grant', function () {
+    // sudo's complaint is on stderr, and it is the panel's setup, not the user's
+    // YAML. Quoting it would send them hunting through a file that is fine.
+    $error = unparsableError("sudo: a password is required\n", denied: true);
+
+    expect($error)->toBe(__('errors/application.compose_unparsable_generic'))
+        ->and($error)->not->toContain('password');
+});
+
+it('redacts a secret Docker echoes back in its complaint', function (string $stderr, string $secret, string $kept) {
+    $error = unparsableError($stderr);
+
+    expect($error)->not->toContain($secret)
+        ->and($error)->toContain('[REDACTED]')
+        ->and($error)->toContain($kept);
+})->with([
+    'interpolation value' => [
+        'invalid interpolation format for services.web.environment.DB_PASSWORD: "s3cr3tVal$ue". You may need to escape any $ with another $.',
+        's3cr3tVal',
+        'services.web.environment.DB_PASSWORD',
+    ],
+    'yaml scalar' => [
+        "yaml: unmarshal errors:\n  line 7: cannot unmarshal !!str `hunter2hunter2` into int",
+        'hunter2hunter2',
+        'cannot unmarshal !!str',
+    ],
+    'invalid type' => [
+        'services.web.environment.API_TOKEN contains {"k": "t0kenValue"}, which is an invalid type, it should be a string, number, or a null',
+        't0kenValue',
+        'which is an invalid type',
+    ],
+    'url credentials' => [
+        'failed to resolve https://deploy:pa55w0rdXYZ@git.example.com/stack.yml: unauthorized',
+        'pa55w0rdXYZ',
+        'git.example.com',
+    ],
+    'key=value' => [
+        'error resolving DB_PASSWORD=abc123def for services.db',
+        'abc123def',
+        'services.db',
+    ],
+]);
+
+it('caps Docker\'s complaint at 300 characters', function () {
+    $error = unparsableError('yaml: '.str_repeat('é', 2000));
+
+    $quoted = trim(substr($error, strlen('Docker could not read this compose file:')));
+
+    expect(mb_strlen($quoted))->toBeLessThanOrEqual(300)
+        ->and($quoted)->toEndWith('…')
+        ->and($quoted)->toStartWith('yaml: ééé');
+});
+
+it('shows the same Docker error in every locale', function () {
+    foreach (['en', 'es', 'fr', 'de', 'hi', 'ja', 'pt', 'ru'] as $locale) {
+        app()->setLocale($locale);
+
+        $this->assertStringContainsString(
+            'yaml: line 3: did not find expected key',
+            unparsableError('yaml: line 3: did not find expected key'),
+            "error not shown in {$locale}",
+        );
+
+        expect(__('errors/application.compose_unparsable', ['error' => 'E'], $locale))
+            ->not->toBe('errors/application.compose_unparsable');
+    }
+
+    app()->setLocale('en');
+});
+
+it('refuses a file with no services, which would run nothing', function () {
+    $ops = composeOps(['services' => []]);
+
+    expect((new ComposeValidator($ops))->validate('...', ROOT)['ok'])->toBeFalse();
+});
+
+it('validates from the directory the deploy will run in', function () {
+    // Load-bearing: compose resolves a relative bind source against the CWD of the process
+    // reading the file, so validating from another directory checks a different path than the
+    // deploy will.
+    $seen = null;
+
+    $process = Mockery::mock(ProcessResult::class);
+    $process->shouldReceive('output')->andReturn(json_encode(['services' => ['w' => ['image' => 'n']]]));
+    $process->shouldReceive('errorOutput')->andReturn('');
+
+    $ops = Mockery::mock(ServerOps::class);
+    $ops->shouldReceive('run')->andReturnUsing(
+        function ($command, $context = [], $timeout = 60, $input = null, $cwd = null) use (&$seen, $process) {
+            $seen = $cwd;
+
+            return new ServerOpsResult(ok: true, reference: 'r', result: $process, answered: true);
+        }
+    );
+
+    (new ComposeValidator($ops))->validate('...', ROOT);
+
+    expect($seen)->toBe(ROOT);
+});
+
+it('reports one problem once, however many services repeat it', function () {
+    // Five identical lines reads as five problems.
+    $ops = composeOps(['services' => [
+        'a' => ['privileged' => true],
+        'b' => ['privileged' => true],
+    ]]);
+
+    $verdict = (new ComposeValidator($ops))->validate('...', ROOT);
+
+    // Two services, two distinct messages (each names its service), but no
+    // duplicates of either.
+    expect($verdict['errors'])->toHaveCount(count(array_unique($verdict['errors'])));
+});
+
+it('translates every refusal in every locale', function () {
+    foreach (['en', 'es', 'fr', 'de', 'hi', 'ja', 'pt', 'ru'] as $locale) {
+        foreach (['compose_unparsable', 'compose_unparsable_generic', 'compose_no_services', 'compose_bind_outside', 'compose_port_public'] as $key) {
+            expect(__("errors/application.{$key}", [], $locale))
+                ->not->toBe("errors/application.{$key}", "{$key} missing in {$locale}");
+        }
+
+        foreach (['privileged', 'cap_add', 'devices', 'namespace', 'security_opt', 'network_mode', 'cgroup_parent'] as $key) {
+            expect(__("errors/application.compose_forbidden.{$key}", [], $locale))
+                ->not->toBe("errors/application.compose_forbidden.{$key}", "{$key} missing in {$locale}");
+        }
+    }
+});
+
+it('finds the published port when there is only one', function () {
+    // The panel cannot allocate this. With a pasted file the user has already
+    // chosen, and proxying to the port the panel wished for points nginx at
+    // nothing.
+    $resolved = ['services' => ['app' => [
+        'ports' => [['host_ip' => '127.0.0.1', 'published' => '3001', 'target' => 3001]],
+    ]]];
+
+    expect((new ComposeValidator(composeOps([])))->publishedPort($resolved))->toBe(3001);
+});
+
+it('uses the container port to disambiguate several published ports', function () {
+    // An application and its metrics endpoint is a legitimate file. The field
+    // the user already has names the port INSIDE the container, which is the
+    // number they know.
+    $resolved = ['services' => ['app' => [
+        'ports' => [
+            ['host_ip' => '127.0.0.1', 'published' => '9100', 'target' => 9100],
+            ['host_ip' => '127.0.0.1', 'published' => '3001', 'target' => 3001],
+        ],
+    ]]];
+
+    $validator = new ComposeValidator(composeOps([]));
+
+    expect($validator->publishedPort($resolved, 3001))->toBe(3001)
+        ->and($validator->publishedPort($resolved, 9100))->toBe(9100)
+        // And gives up rather than guessing, so the caller can ask.
+        ->and($validator->publishedPort($resolved))->toBeNull();
+});
+
+it('reports no port when the file publishes none', function () {
+    // A worker or a queue is a legitimate container with nothing to proxy to.
+    // Distinguished from ambiguity so the caller can say the right thing.
+    $resolved = ['services' => ['worker' => ['image' => 'busybox']]];
+
+    expect((new ComposeValidator(composeOps([])))->publishedPort($resolved))->toBeNull();
+});
+
+it('refuses a build even when the context looks local', function () {
+    // The key is refused outright, not path-checked: the panel runs published images, and
+    // `dockerfile_inline` can `COPY` from anywhere the context reaches.
+    foreach ([['context' => '.'], ['context' => './app'], ['dockerfile_inline' => "FROM scratch\nCOPY /etc/shadow /"]] as $build) {
+        $ops = composeOps(['services' => ['web' => ['image' => 'nginx', 'build' => $build]]]);
+
+        $verdict = (new ComposeValidator($ops))->validate('...', ROOT);
+
+        expect($verdict['ok'])->toBeFalse('a build was allowed: '.json_encode($build))
+            ->and(implode(' ', $verdict['errors']))->toContain('builds an image');
+    }
+});

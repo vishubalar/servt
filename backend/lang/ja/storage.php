@@ -1,0 +1,173 @@
+<?php
+
+/*
+ * Copy for the Storage destinations integration — S3-compatible remote
+ * targets that backups are uploaded to. The keys in this file render the
+ * connect form, the row labels and the outcome of the test-connection probe.
+ */
+
+return [
+    'drivers' => [
+        's3' => 'S3 互換',
+        'ftp' => 'FTP',
+        'sftp' => 'SFTP',
+        'google_drive' => 'Google ドライブ',
+        'google_drive_oauth' => 'Google ドライブ（ご自身のアカウント）',
+        'local' => 'このサーバー（ローカルフォルダー）',
+    ],
+
+    'fields' => [
+        'name' => '表示名',
+        'endpoint' => 'エンドポイント URL',
+        'region' => 'リージョン',
+        'bucket' => 'バケット',
+        'prefix' => 'キープレフィックス (任意)',
+        'access_key' => 'アクセスキー',
+        'secret_key' => 'シークレットキー',
+        'host' => 'ホスト',
+        'port' => 'ポート',
+        'username' => 'ユーザー名',
+        'password' => 'パスワード',
+        'root' => 'リモートディレクトリ',
+        'ssl' => 'TLS を使用 (FTPS)',
+        'passive' => 'パッシブモード',
+        'private_key' => '秘密鍵',
+        'passphrase' => '鍵のパスフレーズ',
+        'host_fingerprint' => 'ホスト鍵のフィンガープリント',
+        'service_account_json' => 'サービスアカウントキー (JSON)',
+        'folder_id' => '共有ドライブのフォルダー ID',
+        'drive_name' => '共有ドライブ',
+        'client_email' => 'サービスアカウントのアドレス',
+    ],
+
+    'placeholders' => [
+        'endpoint' => 'https://s3.amazonaws.com',
+        'region' => 'us-east-1',
+        'prefix' => 'backups/production/',
+        'host' => 'backup.example.com',
+        'root' => 'backups/',
+    ],
+
+    'help' => [
+        'name' => '連携一覧で保存先を見分けるための短いラベルです。',
+        'endpoint' => 'AWS の場合は既定のままにします。Cloudflare R2、Backblaze B2、Wasabi、DigitalOcean Spaces など S3 互換のサービスの場合は設定してください。',
+        'region' => 'バケットが存在するリージョン (AWS の場合のみ必要)。',
+        'prefix' => 'バケット内の任意のパスプレフィックス (先頭のスラッシュなし)。',
+        'access_key' => '書き込み専用 — API が返すことはありません。',
+        'host' => 'バックアップを保存するサーバーのホスト名または IP アドレス。',
+        'port' => '空欄の場合は既定値を使用します。',
+        'root' => '書き込み先のサーバー上のディレクトリ。空欄の場合はログイン先をそのまま使用します。',
+        'ssl' => '強く推奨します。無効にすると、パスワードとバックアップ全体が平文で送信されます。',
+        'passive' => 'サーバーが別途要求しない限り、有効のままにしてください。',
+        'private_key' => '秘密鍵全体を貼り付けてください。パスワードの代わりに使用します。',
+        'passphrase' => '秘密鍵自体が暗号化されている場合のみ必要です。',
+        'host_fingerprint' => '初回接続時に記録し、以降は照合します。確実を期すにはサーバー上の鍵と比較してください。',
+        'plain_ftp_warning' => 'TLS が無効です。パスワードとすべてのバックアップが暗号化されずに送信されます。',
+        'service_account_json' => 'サービスアカウントの JSON キーファイル全体を貼り付けてください。',
+        'folder_id' => 'フォルダー URL の /folders/ 以降の部分です。リンク全体ではありません。',
+        'drive_shared_only' => 'Google Workspace の共有ドライブのみ利用できます。サービスアカウントには自身の保存容量がないため、個人のドライブへのアップロードは空のアカウントでも拒否されます。',
+        'drive_share_with' => 'テストの前に、共有ドライブのフォルダーをサービスアカウントのアドレスと共有してください。',
+    ],
+
+    'status' => [
+        'connected' => '接続済み',
+        'never_tested' => '未テスト',
+        'failed' => '前回のテストに失敗',
+    ],
+
+    'test' => [
+        'success' => '接続に成功しました。',
+        'failure' => '保存先に接続できませんでした。',
+        'invalid_credentials' => '保存先が認証情報を拒否しました。',
+        'unreachable' => '保存先のエンドポイントに到達できませんでした。',
+        'bucket_not_found' => 'その名前のバケットは存在しません。バケット名を確認してください（大文字と小文字は区別されます）。',
+        'wrong_region' => 'バケットは別のリージョンにあります。バケットを作成したリージョンを指定してください。',
+        'tls_failed' => 'エンドポイントとの安全な (TLS) 接続を確立できませんでした。サーバーの証明書が存在しないか、信頼されていないか、壊れています。エンドポイントの URL とサーバーの証明書を確認してください。',
+        'ftp_no_tls' => 'この FTP サーバーは暗号化（FTPS）に対応していないため、暗号化ログインが拒否されました。サーバーで TLS を有効にするか、暗号化なしの接続で問題なければ「TLS を使用 (FTPS)」をオフにしてください。',
+        'mismatch' => '保存先が書き込んだバイトと異なるバイトを返しました。',
+        'forbidden_host' => 'このエンドポイントアドレスは許可されていません。',
+        'invalid_endpoint' => 'バケットの有効な https:// エンドポイント URL を入力してください。',
+        'invalid_host' => '有効なホスト名または IP アドレスを入力してください。',
+        'host_key_mismatch' => 'サーバーが記録済みとは異なるホスト鍵を提示しました。接続を中止しました。',
+        'tls_certificate_changed' => 'FTPS サーバーが記録済みとは異なる証明書を提示したため、何も送信しませんでした。サーバーの証明書が更新された場合は、この送信先で「新しい証明書を信頼する」を選んでください。',
+        'tls_certificate_unreadable' => 'FTPS サーバーの証明書を読み取れなかったため、記録済みの証明書と照合できませんでした。何も送信していません。',
+        'invalid_private_key' => '秘密鍵を読み取れませんでした。全体が貼り付けられているか確認してください。',
+        'root_missing' => '保存先のフォルダーがサーバー上に存在しません。フォルダーを作成するか、パスを修正してください。',
+        'drive_personal' => 'そのフォルダーは個人のドライブにあります。サービスアカウントには保存容量がないためバックアップは拒否されます — 共有ドライブのフォルダーを使用してください。',
+        'drive_not_shared' => 'フォルダーは存在しますが、このサービスアカウントにはアクセス権がありません。',
+        'drive_folder_missing' => 'その ID のフォルダーは見つかりませんでした。',
+        'drive_not_a_folder' => 'その ID はフォルダーではなくファイルを指しています。',
+        'drive_bad_key' => 'サービスアカウントキーを読み取れませんでした。JSON ファイル全体を貼り付けてください。',
+        'drive_quota' => '保存容量の不足により Google がアップロードを拒否しました。個人のドライブで起きる現象です。',
+        'drive_incomplete' => 'テストの前にサービスアカウントキーとフォルダー ID を入力してください。',
+        'local_path_invalid' => 'フォルダーのパスが正しくありません。',
+        'local_path_not_allowed' => 'このフォルダーはバックアップに使用できません。',
+        'local_path_link' => 'フォルダー、またはそのパス上のフォルダーがリンクです。',
+        'local_missing' => 'バックアップフォルダーが存在しません。追加ディスク上にある場合は、マウントされているか確認してください。',
+        'local_foreign' => 'バックアップフォルダーがパネルの所有ではなくなっています。',
+        'local_not_writable' => 'バックアップフォルダーに書き込めませんでした。',
+        'local_no_space' => 'このバックアップに必要なディスクの空き容量がありません。',
+        'local_success' => 'フォルダーは使用できます。:total 中 :free が空いています。',
+    ],
+
+    'delete' => [
+        'in_use' => ':name を削除できません — :applications がまだこの保存先を使用しています。先にそれらのバックアップ対象を削除するか、参照先を変更してください。',
+        'in_use_by_databases' => ':name を削除できません — データベース :databases のバックアップスケジュールがまだ使用しています。先にそのスケジュールを削除するか、別のストレージに移してください。',
+        'holds_backups' => ':name を削除できません — まだ :count 件のバックアップが保存されています。先にそれらのバックアップを削除して、保存先からアーカイブも削除してください。',
+        'and_more' => '他 :count 件',
+    ],
+
+    'validation' => [
+        'sftp_auth_required' => 'パスワードか秘密鍵のいずれかを指定してください。',
+        'sftp_key_is_public' => 'これは公開鍵です。秘密鍵（.pub のないファイル）を貼り付けてください。',
+        'sftp_key_needs_passphrase' => 'この鍵はパスフレーズで保護されています。パスフレーズも入力してください。',
+        'sftp_key_wrong_passphrase' => 'このパスフレーズではこの鍵を解除できません。',
+        'sftp_key_invalid' => 'パネルが読み取れる秘密鍵ではありません。BEGIN 行と END 行を含めて鍵全体を貼り付けてください。',
+    ],
+
+    'upload' => [
+        'stalled' => 'アップロードがデータ送信を停止したため中断されました。接続は開いたままでしたがまったく転送されておらず、通常はストレージプロバイダ側が切断したことを意味します。バックアップは次回の実行時に再試行します。',
+    ],
+
+    'oauth' => [
+        'not_connected' => 'まだ接続されていません。「接続」を押して Google アカウントへのアクセスを承認してください。',
+        'revoked' => 'Google がこのアクセスを取り消しました。多くは OAuth アプリが「Testing」のままだった場合（約 1 週間で失効します）か、myaccount.google.com でアクセスを削除した場合です。もう一度接続してください。',
+        'user_quota' => 'Google ドライブの空き容量がありません。整理するか、別の保存先をお使いください。',
+        'folder_missing' => 'パネルはバックアップ フォルダーにアクセスできません。削除されたか、現在接続されているものとは別の Google アカウントまたは OAuth クライアントに属している可能性があります。パネルは自身が作成したフォルダーしか見えません。もう一度接続すると新しく作成します。',
+        'denied' => 'Google の画面でアクセスが拒否されました。変更はありません。',
+        'code_expired' => 'その承認はすでに使用されたか、有効期限が切れています。「接続」を押して最初からやり直してください。',
+        'bad_client' => 'そのクライアント ID は認識されません。末尾の .apps.googleusercontent.com を含めて全体がコピーされているか確認してください。',
+        'wrong_client_type' => 'そのクライアントは種類が違います。Google Cloud Console で「Web application」型の OAuth クライアントを作成し、その ID とシークレットを貼り付けてください。',
+        'redirect_mismatch' => 'Google がリダイレクト アドレスを拒否しました。「接続」ボタンの下に表示されているアドレスを、OAuth クライアントの「Authorized redirect URIs」に表示どおり正確にコピーしてください。',
+        'panel_url_missing' => 'このパネルは自身のウェブ アドレスを把握していないため、どこへ戻すかを Google に伝えられません。パネル設定で FRONTEND_URL を指定してください。',
+        'state_invalid' => 'そのログインはこのパネルからのものではありません。「接続」を押してもう一度承認してください。',
+        'state_expired' => 'そのログイン リンクはすでに使用されたか、時間が経ちすぎています。「接続」を押して最初からやり直してください。',
+        'destination_missing' => '承認中にこの保存先が削除されました。何も保存されていません。',
+        'start_failed' => 'Google ログインを開始できませんでした。しばらくしてからお試しください。',
+        'poll_failed' => 'Google ログインを完了できませんでした。しばらくしてからお試しください。',
+        'token_failed' => 'Google ログインを完了できませんでした。しばらくしてからお試しください。',
+        'no_refresh_token' => 'Google はアクセスを承認しましたが、継続利用のためのトークンが返されませんでした。このアカウントが既にこのアプリを許可している場合に起こります。myaccount.google.com の「サードパーティ アクセス」から削除して、もう一度接続してください。',
+        'api_disabled' => 'Google Cloud プロジェクトで Google Drive API が有効になっていません。「API とサービス → ライブラリ」を開き、「Google Drive API」を検索して「有効にする」を押してください。ログインは有効化しなくても動くため、この時点で初めて判明します。',
+        'insufficient_scope' => '接続は承認されましたが、ファイルの作成が許可されていません。OAuth 同意画面に Google Drive のスコープ drive.file が含まれているか確認し、もう一度接続してください。',
+        'folder_failed' => '接続しましたが、Drive にバックアップ フォルダーを作成できませんでした。理由はパネルのログの「storage」にあります。解決してからもう一度接続してください。',
+        'wrong_provider' => 'この保存先は Google ログインを使用しません。',
+    ],
+
+    // "This server" destinations (#14): the folder checks and the warning.
+    'local' => [
+        'path_invalid' => '/var/backups/panel のように、フォルダーのフルパスを入力してください。',
+        'path_not_allowed' => 'バックアップは :roots の下のフォルダーにのみ保存できます。',
+        'path_link' => 'フォルダー、またはそのパス上のフォルダーがリンクです。実際のフォルダーを選んでください。',
+        'path_taken' => 'このフォルダーはすでに別の保存先で使われています。',
+        'parent_missing' => 'フォルダー :parent が存在しません。追加ディスクの場合は、マウントされているか確認してください。',
+        'folder_foreign' => 'このフォルダーは別のアカウントのもので、空ではありません。空のフォルダーか新しいフォルダーを選んでください。',
+        'not_folder' => 'そのパスはフォルダーではなくファイルです。',
+        'unreadable' => 'フォルダーを確認できませんでした。もう一度お試しください。失敗が続く場合はサーバーのログを確認してください。',
+        'prepare_failed' => 'フォルダーを作成または非公開にできませんでした。ディスクの空き容量を確認してください。',
+        'folder_created' => 'フォルダーを作成しました: :path',
+        'folder_existing' => 'フォルダーが見つかり、使用できます: :path',
+        'warning' => 'このサーバー上のバックアップは、サーバーやそのディスクが故障すると失われます。サーバー外の保存先と併用してください。',
+    ],
+    // Answered instead of a second destination for the same credential (2026-10-28).
+    'already_added' => 'このストレージは「:name」としてすでに追加されています。',
+];

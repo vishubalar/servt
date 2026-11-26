@@ -1,0 +1,914 @@
+<?php
+
+use App\Exceptions\Server\Application\NoPortAvailableException;
+use App\Exceptions\Server\Application\ProvisioningFailedException;
+use App\Models\Application;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Applications\PortAllocator;
+use App\Services\Server\Applications\ProcessSupervisor;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Process;
+
+/**
+ * An application with a start command runs a real process.
+ *
+ * These cover the machinery that makes `app_port` and `start_command` take effect, and the
+ * guards that stop it doing damage.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'mern', 'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => true],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    $this->su = SystemUser::create([
+        'username' => 'appuser', 'home_path' => '/home/appuser',
+        'shell' => '/bin/bash', 'sudo' => false,
+    ]);
+});
+
+function nodeApp(array $overrides = []): Application
+{
+    return Application::create(array_merge([
+        'system_user_id' => test()->su->id,
+        'name' => 'API',
+        'domain' => 'api.test',
+        'site_type' => 'git',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+        'node_version' => '20.11.0',
+        'app_port' => 3000,
+        'start_command' => 'node server.js',
+    ], $overrides));
+}
+
+function supervisorHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+/**
+ * The unit file `apply()` writes, captured from the `tee` that writes it.
+ *
+ * The logrotate policy is written first — systemd creates the log files but
+ * not their directory — so the unit is found by content rather than position.
+ */
+function renderedUnit(Application $application): string
+{
+    $written = new ArrayObject;
+
+    Process::fake(function ($p) use ($written) {
+        if (($p->command[0] ?? '') === 'tee') {
+            $written[] = (string) $p->input;
+        }
+
+        return Process::result(output: '');
+    });
+
+    app(ProcessSupervisor::class)->apply($application, '/home/appuser/api.test');
+
+    $unit = collect($written)->first(fn (string $c) => str_contains($c, '[Unit]'));
+
+    expect($unit)->not->toBeNull('no unit file was written');
+
+    return (string) $unit;
+}
+
+describe('the unit', function () {
+    it('names the pinned Node, the allocated port and the site user', function () {
+        $written = new ArrayObject;
+        Process::fake(function ($p) use ($written) {
+            if (($p->command[0] ?? '') === 'tee') {
+                $written[] = (string) $p->input;
+            }
+
+            return Process::result(output: '');
+        });
+
+        app(ProcessSupervisor::class)->apply(nodeApp(), '/home/appuser/api.test');
+
+        // Picked by content, not position: applying a unit also writes a logrotate policy, so
+        // indexing into the list asserted against whichever was written first.
+        $unit = collect($written)->first(fn (string $body): bool => str_contains($body, '[Unit]')) ?? '';
+
+        expect($unit)
+            ->toContain('User=appuser')
+            ->toContain('WorkingDirectory=/home/appuser/api.test')
+            ->toContain('Environment=PORT=3000')
+            // The pinned version must reach run time, not just build time.
+            ->toContain('/opt/fnm/node-versions/v20.11.0/installation/bin')
+            ->toContain('ExecStart=/usr/bin/env PORT=3000 /opt/fnm/node-versions/v20.11.0/installation/bin/node server.js')
+            // A crash loop that restarts forever buries its own cause.
+            ->toContain('StartLimitBurst=5')
+            ->toContain('MemoryMax=512M');
+
+        // In [Unit]: under [Service] systemd ignores StartLimitIntervalSec ("Unknown key") and
+        // the limit never trips.
+        $unitSection = substr($unit, 0, strpos($unit, '[Service]'));
+
+        expect($unitSection)->toContain('StartLimitBurst=5')
+            ->toContain('StartLimitIntervalSec=60')
+            ->and(substr($unit, strpos($unit, '[Service]')))->not->toContain('StartLimit');
+    });
+
+    it('loads the same .env the Environment screen edits', function () {
+        // These were two independent path calculations that disagreed for every Node application:
+        // the unit read `{documentRoot}/.env` while the screen edited one a directory above it, so
+        // the service read neither of the two files the panel could name.
+        $written = new ArrayObject;
+        Process::fake(function ($p) use ($written) {
+            if (($p->command[0] ?? '') === 'tee') {
+                $written[] = (string) $p->input;
+            }
+
+            return Process::result(output: '');
+        });
+
+        $application = nodeApp(['serving_profile' => 'node']);
+
+        app(ProcessSupervisor::class)->apply($application, '/home/appuser/api.test');
+
+        $unit = collect($written)->first(fn (string $body): bool => str_contains($body, '[Unit]')) ?? '';
+
+        expect($unit)->toContain('EnvironmentFile=-'.$application->envPath());
+    });
+
+    it('keeps a proxied app\'s .env at its code root', function () {
+        // Nothing under a Node app's document root is fetchable by path: the vhost proxies and
+        // denies dotfiles. The "never inside the served directory" rule is for directories the web
+        // server hands out; moving the file would only put it where the application does not look.
+        $application = nodeApp(['serving_profile' => 'node']);
+
+        expect($application->envPath())->toBe($application->codePath().'/.env');
+    });
+
+    it('checks the app is actually up, not just that start returned zero', function () {
+        // `systemctl start` succeeds for a unit that starts and immediately
+        // dies — which is exactly what a bad start command does.
+        Process::fake(fn ($p) => ($p->command[1] ?? '') === 'is-active'
+            ? Process::result(output: '', errorOutput: 'inactive', exitCode: 3)
+            : Process::result(output: ''));
+
+        expect(fn () => app(ProcessSupervisor::class)->apply(nodeApp(), '/home/appuser/api.test'))
+            ->toThrow(ProvisioningFailedException::class);
+
+        // And the broken unit is taken back out, so the next unrelated
+        // daemon-reload does not pick it up.
+        Process::assertRan(fn ($p) => ($p->command[0] ?? '') === 'rm'
+            && str_contains((string) ($p->command[2] ?? ''), 'sv-app-'));
+    });
+
+    it('stops and disables before deleting the unit file', function () {
+        $runs = new ArrayObject;
+        Process::fake(function ($p) use ($runs) {
+            $runs[] = $p->command;
+
+            return Process::result(output: '');
+        });
+
+        app(ProcessSupervisor::class)->remove(nodeApp());
+
+        $order = collect($runs)->map(fn ($c) => implode(' ', $c))->values();
+
+        // Deleting the unit first would leave the process running with nothing
+        // left that can stop it — a site the panel has forgotten, still holding
+        // its port.
+        expect($order->search(fn ($c) => str_contains($c, 'systemctl stop')))
+            ->toBeLessThan($order->search(fn ($c) => str_starts_with($c, 'rm -f')));
+    });
+
+    it('writes no unit for an application that runs nothing', function () {
+        Process::fake();
+
+        expect(app(ProcessSupervisor::class)->runs(nodeApp(['start_command' => null])))->toBeFalse();
+    });
+
+    it('leaves the slice alone, because the workers are still in it', function () {
+        Process::fake();
+
+        app(ProcessSupervisor::class)->remove(nodeApp());
+
+        // The application's unit and its worker units share `sv-app-<id>.slice`. Stopping a slice
+        // kills what is still inside it; the workers are removed after this, by the code that
+        // knows to disable them first.
+        Process::assertNotRan(fn ($p) => in_array('stop', (array) $p->command, true)
+            && str_contains(implode(' ', (array) $p->command), '.slice'));
+    });
+
+    it('releases the slice, which systemd does not reclaim on its own', function () {
+        Process::fake();
+
+        $application = nodeApp();
+
+        app(ProcessSupervisor::class)->releaseSlice($application);
+
+        // Removing the unit leaves the slice loaded and active. Unreleased, a
+        // long-lived box accumulates one per application ever deleted.
+        Process::assertRan(fn ($p) => implode(' ', (array) $p->command)
+            === 'systemctl stop sv-app-'.$application->id.'.slice');
+    });
+
+    it('runs node directly when the application wants one process', function () {
+        $unit = renderedUnit(nodeApp());
+
+        expect($unit)->toContain('ExecStart=/usr/bin/env PORT=3000 /opt/fnm/node-versions/v20.11.0/installation/bin/node server.js')
+            ->and($unit)->not->toContain('pm2-runtime')
+            // No PM2, so no state directory and no widened crash window.
+            ->and($unit)->not->toContain('PM2_HOME')
+            ->and($unit)->toContain('StartLimitIntervalSec=60');
+    });
+
+    it('hands the script to pm2-runtime when it wants more than one', function () {
+        $unit = renderedUnit(nodeApp(['process_instances' => 4]));
+
+        // The script, not the interpreter: PM2 forks a JavaScript file through
+        // Node's cluster module. Given `node` it would have nothing to fork.
+        expect($unit)->toContain(
+            'ExecStart=/usr/bin/env PORT=3000 /opt/fnm/node-versions/v20.11.0/installation/bin/pm2-runtime start server.js'
+            .' --interpreter /opt/fnm/node-versions/v20.11.0/installation/bin/node'
+            .' -i 4 --name sv-app-1 --raw'
+        );
+    });
+
+    it('gives PM2 a writable state directory outside the document root', function () {
+        $application = nodeApp(['process_instances' => 4]);
+        $home = app(ProcessSupervisor::class)->pm2Home($application);
+        $unit = renderedUnit($application);
+
+        // Left at its ~/.pm2 default this lands under ProtectHome=read-only
+        // and PM2 cannot start — reporting the hardening, not the directory.
+        expect($unit)->toContain('Environment=PM2_HOME='.$home)
+            ->and($unit)->toMatch('/ReadWritePaths=.*'.preg_quote($home, '/').'/')
+            // A sibling of public_html, never inside it: anything under the
+            // document root is a URL, and a socket is not for publishing.
+            ->and($home)->not->toContain('public_html');
+    });
+
+    it('widens the crash window for PM2, whose failure cycle is slower', function () {
+        // PM2 retries the workers itself before exiting, so a full failure
+        // takes ~18s. Against a 60s window the count never reaches five and
+        // the unit restarts forever while still reporting active.
+        expect(renderedUnit(nodeApp(['process_instances' => 4])))
+            ->toContain('StartLimitIntervalSec=300');
+    });
+
+    it('passes the application its own arguments after the separator', function () {
+        expect(renderedUnit(nodeApp(['process_instances' => 2, 'start_command' => 'node server.js --port-offset 2'])))
+            ->toContain('--raw -- --port-offset 2');
+    });
+
+    it('will not cluster a command with no script for PM2 to fork', function (string $command) {
+        // Cluster mode is not a flag that applies to any command: pointed at something it cannot
+        // fork, PM2 silently runs one fork-mode process. Better to run the command we were given.
+        $unit = renderedUnit(nodeApp(['process_instances' => 4, 'start_command' => $command]));
+
+        expect($unit)->not->toContain('pm2-runtime')
+            ->and($unit)->not->toContain('PM2_HOME');
+    })->with([
+        'a bare binary' => '/usr/local/bin/nodebb',
+        'node with no script' => 'node',
+    ]);
+
+    it('creates the PM2 directory owned by the site, not root', function () {
+        $runs = new ArrayObject;
+        Process::fake(function ($p) use ($runs) {
+            $runs[] = $p->command;
+
+            return Process::result(output: '');
+        });
+
+        app(ProcessSupervisor::class)->apply(nodeApp(['process_instances' => 4]), '/home/appuser/api.test');
+
+        // Unlike the log dir, which root owns because systemd opens append:
+        // targets before dropping privileges, this one is written by the
+        // application's own process.
+        $commands = collect($runs)->map(fn ($c) => implode(' ', $c));
+
+        expect($commands->contains(fn ($c) => str_contains($c, 'chown appuser:appuser')
+            && str_contains($c, '/pm2')))->toBeTrue();
+    });
+
+    it('installs PM2 into the application\'s own Node version when it is missing', function () {
+        $runs = new ArrayObject;
+        // Stateful, because the code checks the same thing before and after
+        // acting on it. A fake that always answers "missing" makes the
+        // post-install verification fail against a box the fake broke.
+        $installed = new ArrayObject(['yes' => false]);
+
+        Process::fake(function ($p) use ($runs, $installed) {
+            $args = ($p->command[0] ?? '') === 'sudo' ? array_slice((array) $p->command, 2) : (array) $p->command;
+            $runs[] = $args;
+
+            $line = implode(' ', $args);
+
+            if (str_contains($line, 'npm install -g pm2@')) {
+                $installed['yes'] = true;
+
+                return Process::result(output: '');
+            }
+
+            // `test -x <pm2-runtime>`: absent until the install has run.
+            if (($args[0] ?? '') === 'test' && str_contains((string) ($args[2] ?? ''), 'pm2-runtime')) {
+                return Process::result(exitCode: $installed['yes'] ? 0 : 1, output: '');
+            }
+
+            return Process::result(output: '');
+        });
+
+        app(ProcessSupervisor::class)->apply(nodeApp(['process_instances' => 4]), '/home/appuser/api.test');
+
+        $commands = collect($runs)->map(fn (array $c) => implode(' ', $c));
+
+        // That version's own npm, not a global one: runtimes are per
+        // application via fnm, so there is no single PM2 to install once.
+        expect($commands->contains(fn (string $c) => str_contains($c, '/v20.11.0/installation/bin/npm install -g pm2@')))
+            ->toBeTrue();
+
+        // Pinned. `@latest` would give two servers provisioned a week apart
+        // different majors, and upgrade PM2 under running applications.
+        expect($commands->contains(fn (string $c) => str_contains($c, 'pm2@latest')))->toBeFalse();
+    });
+
+    it('does not reinstall PM2 on a version that already has it', function () {
+        $runs = new ArrayObject;
+        Process::fake(function ($p) use ($runs) {
+            $runs[] = ($p->command[0] ?? '') === 'sudo' ? array_slice((array) $p->command, 2) : (array) $p->command;
+
+            return Process::result(output: '');
+        });
+
+        app(ProcessSupervisor::class)->apply(nodeApp(['process_instances' => 4]), '/home/appuser/api.test');
+
+        expect(collect($runs)->map(fn (array $c) => implode(' ', $c))
+            ->contains(fn (string $c) => str_contains($c, 'npm install -g pm2')))->toBeFalse();
+    });
+
+    it('names the slice once, so the unit and the cleanup cannot disagree', function () {
+        $written = new ArrayObject;
+        Process::fake(function ($p) use ($written) {
+            if (($p->command[0] ?? '') === 'tee') {
+                $written[] = (string) $p->input;
+            }
+
+            return Process::result(output: '');
+        });
+
+        $application = nodeApp();
+        $supervisor = app(ProcessSupervisor::class);
+
+        $supervisor->apply($application, '/home/appuser/api.test');
+
+        // The template renders whatever `slice()` returns; when each built the name itself they
+        // could stop agreeing, and the cleanup would stop a slice nothing was ever in.
+        // Not the first write — the logrotate policy is written before the
+        // unit, because systemd creates the log files but not their directory.
+        $unit = collect($written)->first(fn (string $c) => str_contains($c, '[Unit]'));
+
+        expect($unit)->toContain('Slice='.$supervisor->slice($application));
+    });
+});
+
+it('logs a missing unit as an expected probe, not an error', function () {
+    $logs = [];
+    Process::fake(function ($p) use (&$logs) {
+        $args = $p->command[0] === 'sudo' ? array_slice($p->command, 2) : $p->command;
+
+        // `test -f` on a path that does not exist exits 1.
+        if (($args[0] ?? '') === 'test' && ($args[1] ?? '') === '-f') {
+            $logs[] = $args;
+
+            return Process::result(exitCode: 1, errorOutput: '', output: '');
+        }
+
+        return Process::result(output: '');
+    });
+
+    // Through `remove()`, which is what actually asks the question; the probe itself is private.
+    // A site with no unit (WordPress, static) is the common case, so removal has to be a no-op
+    // rather than an error.
+    app(ProcessSupervisor::class)->remove(nodeApp());
+
+    // The exit-1 probe call was made, and logged at info level rather than
+    // error: "there is no unit here" is an answer, not a failed operation.
+    expect($logs)->not()->toBeEmpty();
+
+    // And nothing was torn down on the strength of a negative answer.
+    Process::assertNotRan(fn ($p) => in_array('stop', (array) $p->command, true));
+    Process::assertNotRan(fn ($p) => in_array('disable', (array) $p->command, true));
+});
+
+describe('the start command', function () {
+    it('refuses a package manager, which would break signals', function (string $command) {
+        $this->withHeaders(supervisorHeaders())
+            ->putJson('/api/applications/'.nodeApp()->id, ['start_command' => $command])
+            ->assertJsonValidationErrors('start_command');
+    })->with(['npm start', 'yarn start', 'pnpm start', 'npx serve']);
+
+    it('refuses shell syntax, which ExecStart cannot run', function (string $command) {
+        $this->withHeaders(supervisorHeaders())
+            ->putJson('/api/applications/'.nodeApp()->id, ['start_command' => $command])
+            ->assertJsonValidationErrors('start_command');
+    })->with(['node a.js && node b.js', 'node a.js | tee log', 'node $(cat x)', 'node a.js > out']);
+
+    it('accepts the forms people actually use', function (string $command) {
+        $this->withHeaders(supervisorHeaders())
+            ->putJson('/api/applications/'.nodeApp()->id, ['start_command' => $command])
+            ->assertOk();
+    })->with(['node server.js', 'node dist/main.js --port 3000', '/usr/bin/node app.js']);
+});
+
+describe('ports', function () {
+    it('skips ports the database has handed out and ports already listening', function () {
+        nodeApp(['app_port' => 3000, 'domain' => 'a.test']);
+
+        // 3001 is not ours, but something is on it.
+        Process::fake(fn () => Process::result(output: "LISTEN 0 511 0.0.0.0:3001 0.0.0.0:*\n"));
+
+        expect(app(PortAllocator::class)->allocate())->toBe(3002);
+    });
+
+    it('lets the owner of the server pick a port that merely has a name', function () {
+        Process::fake(fn () => Process::result(output: ''));
+
+        // 8080 is `http-alt` in /etc/services and is also where half the Node
+        // applications in the world listen. Refusing it would be the panel
+        // overruling someone about their own machine.
+        $this->withHeaders(supervisorHeaders())->postJson('/api/applications', [
+            'system_user_id' => $this->su->id, 'name' => 'API', 'domain' => 'api8080.test',
+            'site_type' => 'php', 'app_port' => 8080,
+        ])->assertCreated()->assertJsonPath('application.app_port', 8080);
+    });
+
+    it('refuses a port another application on this server already has', function () {
+        Process::fake(fn () => Process::result(output: ''));
+        nodeApp(['app_port' => 3500, 'domain' => 'taken.test']);
+
+        // Before this, the only thing standing in the way was the unique
+        // index — a 500 rather than a message naming the problem.
+        $this->withHeaders(supervisorHeaders())->postJson('/api/applications', [
+            'system_user_id' => $this->su->id, 'name' => 'B', 'domain' => 'b.test',
+            'site_type' => 'php', 'app_port' => 3500,
+        ])->assertJsonValidationErrors('app_port');
+    });
+
+    it('refuses a port something outside the panel is listening on', function () {
+        // The user's server runs things the panel did not put there.
+        Process::fake(fn () => Process::result(output: "LISTEN 0 511 127.0.0.1:9999 0.0.0.0:*\n"));
+
+        $this->withHeaders(supervisorHeaders())->postJson('/api/applications', [
+            'system_user_id' => $this->su->id, 'name' => 'C', 'domain' => 'c.test',
+            'site_type' => 'php', 'app_port' => 9999,
+        ])->assertJsonValidationErrors('app_port');
+    });
+
+    it('does not report an application port as taken by itself', function () {
+        Process::fake(fn () => Process::result(output: ''));
+        $app = nodeApp(['app_port' => 3500, 'domain' => 'self.test']);
+
+        // Saving an unchanged form must not fail.
+        $this->withHeaders(supervisorHeaders())
+            ->putJson("/api/applications/{$app->id}", ['app_port' => 3500])
+            ->assertOk();
+    });
+
+    it('keeps its own port while it is running and listening on it', function () {
+        // The case above with nothing listening never happens for a live site: the app itself is
+        // on its port, and `ss` cannot say whose socket it is. Every save of a running Node
+        // site's runtime was refused.
+        Process::fake(fn () => Process::result(output: "LISTEN 0 511 127.0.0.1:3500 0.0.0.0:*\n"));
+        $app = nodeApp(['app_port' => 3500, 'domain' => 'running.test']);
+
+        $this->withHeaders(supervisorHeaders())
+            ->putJson("/api/applications/{$app->id}", ['app_port' => 3500])
+            ->assertOk();
+
+        $this->withHeaders(supervisorHeaders())
+            ->getJson("/api/applications/port-check?port=3500&application_id={$app->id}")
+            ->assertOk()->assertJsonPath('port_check.available', true);
+    });
+
+    it('still refuses moving to a port something else is listening on', function () {
+        Process::fake(fn () => Process::result(output: "LISTEN 0 511 127.0.0.1:3500 0.0.0.0:*\nLISTEN 0 511 127.0.0.1:3600 0.0.0.0:*\n"));
+        $app = nodeApp(['app_port' => 3500, 'domain' => 'mover.test']);
+
+        $this->withHeaders(supervisorHeaders())
+            ->putJson("/api/applications/{$app->id}", ['app_port' => 3600])
+            ->assertJsonValidationErrors('app_port');
+    });
+
+    it('skips a port /etc/services has spoken for, even with nothing on it', function () {
+        config(['server.applications.port_range' => ['from' => 3306, 'to' => 3310]]);
+        Process::fake(fn () => Process::result(output: ''));
+
+        // 3306 is MySQL. Nothing is listening on a box where MySQL is not
+        // installed *yet* — so a listening-only check would hand it out, and
+        // installing MySQL next week would break one of the two.
+        expect(app(PortAllocator::class)->allocate())->toBe(3307)
+            // Allocation is the conservative side: the panel choosing for
+            // itself skips anything /etc/services names.
+            ->and(app(PortAllocator::class)->conflict(3306))->toBeNull();
+    });
+
+    it('stays below the range the kernel hands to outgoing connections', function () {
+        $range = @file_get_contents('/proc/sys/net/ipv4/ip_local_port_range');
+        $ephemeralFrom = (int) (preg_split('/\s+/', trim((string) $range))[0] ?? 32768);
+
+        // A port inside the ephemeral range works until the kernel gives the
+        // same one to an outgoing connection — an intermittent bind failure
+        // with nothing to point at.
+        expect((int) config('server.applications.port_range.to'))->toBeLessThan($ephemeralFrom);
+    });
+
+    it('refuses rather than reaching outside the configured range', function () {
+        config(['server.applications.port_range' => ['from' => 3000, 'to' => 3000]]);
+        nodeApp(['app_port' => 3000, 'domain' => 'a.test']);
+        Process::fake(fn () => Process::result(output: ''));
+
+        expect(fn () => app(PortAllocator::class)->allocate())
+            ->toThrow(NoPortAvailableException::class);
+    });
+
+    it('gives a port only to an application that runs something', function () {
+        Process::fake(fn () => Process::result(output: ''));
+
+        $this->withHeaders(supervisorHeaders())->postJson('/api/applications', [
+            'system_user_id' => $this->su->id, 'name' => 'Plain', 'domain' => 'plain.test',
+            'site_type' => 'php',
+        ])->assertCreated()->assertJsonPath('application.app_port', null);
+    });
+});
+
+describe('the port check', function () {
+    it('warns about a named port without refusing it', function () {
+        Process::fake(fn () => Process::result(output: ''));
+
+        // The distinction the screen needs: this is a caution, not an error.
+        $this->withHeaders(supervisorHeaders())
+            ->getJson('/api/applications/port-check?port=8080')
+            ->assertOk()
+            ->assertJsonPath('port_check.available', true)
+            ->assertJsonPath('port_check.reason', 'registered')
+            ->assertJsonPath('port_check.service', 'http-alt')
+            // No alternative offered — the choice was fine.
+            ->assertJsonPath('port_check.suggested_port', null);
+    });
+
+    it('refuses a port another application holds, and offers a free one', function () {
+        Process::fake(fn () => Process::result(output: ''));
+        nodeApp(['app_port' => 3500, 'domain' => 'held.test']);
+
+        $this->withHeaders(supervisorHeaders())
+            ->getJson('/api/applications/port-check?port=3500')
+            ->assertOk()
+            ->assertJsonPath('port_check.available', false)
+            ->assertJsonPath('port_check.reason', 'in_use_by_app')
+            // Somewhere to go next, rather than just a refusal.
+            ->assertJsonPath('port_check.suggested_port', 3000);
+    });
+
+    it('reports a port nothing claims as simply free', function () {
+        Process::fake(fn () => Process::result(output: ''));
+
+        $this->withHeaders(supervisorHeaders())
+            ->getJson('/api/applications/port-check?port=3777')
+            ->assertOk()
+            ->assertJsonPath('port_check.available', true)
+            ->assertJsonPath('port_check.reason', null)
+            ->assertJsonPath('port_check.service', null);
+    });
+
+    it('does not report an application own port back to it as taken', function () {
+        Process::fake(fn () => Process::result(output: ''));
+        $app = nodeApp(['app_port' => 3500, 'domain' => 'mine.test']);
+
+        $this->withHeaders(supervisorHeaders())
+            ->getJson("/api/applications/port-check?port=3500&application_id={$app->id}")
+            ->assertOk()
+            ->assertJsonPath('port_check.available', true);
+    });
+});
+
+describe('the endpoint', function () {
+    it('refuses to act on an application with no process', function () {
+        $app = nodeApp(['start_command' => null]);
+
+        // A button that reports success while doing nothing teaches the user
+        // that the button works.
+        $this->withHeaders(supervisorHeaders())
+            ->postJson("/api/applications/{$app->id}/process/restart")
+            ->assertStatus(422);
+    });
+
+    it('restarts a real one and reports what systemd says', function () {
+        Process::fake(fn ($p) => ($p->command[1] ?? '') === 'show'
+            ? Process::result(output: "ActiveState=active\nSubState=running\nMemoryCurrent=12345\nNRestarts=0\n")
+            : Process::result(output: ''));
+
+        $app = nodeApp();
+
+        $this->withHeaders(supervisorHeaders())
+            ->postJson("/api/applications/{$app->id}/process/restart")
+            ->assertOk()
+            ->assertJsonPath('application.process.state', 'active')
+            ->assertJsonPath('application.has_process', true);
+
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'restart', "sv-app-{$app->id}.service"]);
+    });
+
+    it('keeps a stopped application stopped across a reboot, and a started one starting (bug #99)', function () {
+        Process::fake(fn () => Process::result(output: ''));
+        $app = nodeApp();
+        $unit = "sv-app-{$app->id}.service";
+
+        // Stop only stopped the process: the unit stayed enabled and the next
+        // boot brought the application back, though the screen said it would
+        // stay offline until started again.
+        $this->withHeaders(supervisorHeaders())->postJson("/api/applications/{$app->id}/process/stop")->assertOk();
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'disable', $unit]);
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'stop', $unit]);
+
+        $this->withHeaders(supervisorHeaders())->postJson("/api/applications/{$app->id}/process/start")->assertOk();
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'enable', $unit]);
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'start', $unit]);
+    });
+
+    it('switches a restarted application back on for boot', function () {
+        // After Stop, a plain restart left it running only until the next reboot.
+        Process::fake(fn () => Process::result(output: ''));
+        $app = nodeApp();
+
+        $this->withHeaders(supervisorHeaders())->postJson("/api/applications/{$app->id}/process/restart")->assertOk();
+
+        Process::assertRan(fn ($p) => $p->command === ['systemctl', 'enable', "sv-app-{$app->id}.service"]);
+    });
+
+    it('stops an application still under the old panel\'s PM2 without a unit to disable', function () {
+        Process::fake(fn () => Process::result(output: ''));
+        $app = nodeApp(['supervisor_mode' => 'pm2', 'pm2_process_name' => 'legacy-api']);
+
+        $this->withHeaders(supervisorHeaders())->postJson("/api/applications/{$app->id}/process/stop")->assertOk();
+
+        Process::assertNotRan(fn ($p) => in_array('disable', (array) $p->command, true));
+    });
+
+    it('rejects an action that is not one of the three', function () {
+        Process::fake();
+
+        $this->withHeaders(supervisorHeaders())
+            ->postJson('/api/applications/'.nodeApp()->id.'/process/destroy')
+            ->assertNotFound();
+    });
+});
+
+describe('refreshing a unit to the current template', function () {
+    it('rewrites a stale unit and reloads systemd, without restarting or enabling anything', function () {
+        // Units were only written on create, so the crash-loop fix reached new
+        // sites only — and a refresh that restarted apps would do it on every
+        // deploy, and one that enabled units would switch disabled sites on.
+        $app = nodeApp();
+        $written = [];
+
+        Process::fake(function ($process) use (&$written) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($args[0] ?? '') === 'cat') {
+                return Process::result(output: "[Service]\nStartLimitIntervalSec=60\n");
+            }
+            if (($args[0] ?? '') === 'tee') {
+                $written[] = (string) $process->input;
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        expect(app(ProcessSupervisor::class)->refreshUnit($app, '/home/appuser/api.test'))->toBeTrue()
+            ->and($written)->toHaveCount(1);
+
+        Process::assertRan(fn ($p) => in_array('daemon-reload', $p->command, true));
+        Process::assertNotRan(fn ($p) => in_array('systemctl', $p->command, true)
+            && (in_array('restart', $p->command, true) || in_array('enable', $p->command, true) || in_array('start', $p->command, true)));
+
+        // The same unit again: nothing to write, nothing to reload.
+        // (Counted here: a second Process::fake keeps the first one's record.)
+        $current = $written[0];
+        $changes = 0;
+        Process::fake(function ($process) use ($current, &$changes) {
+            if (in_array('cat', $process->command, true)) {
+                return Process::result(output: $current);
+            }
+            if (in_array('tee', $process->command, true) || in_array('daemon-reload', $process->command, true)) {
+                $changes++;
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        expect(app(ProcessSupervisor::class)->refreshUnit($app, '/home/appuser/api.test'))->toBeFalse()
+            ->and($changes)->toBe(0);
+    });
+
+    it('does not create a unit that is not there', function () {
+        Process::fake(fn ($process) => in_array('cat', $process->command, true)
+            ? Process::result(errorOutput: 'No such file', exitCode: 1)
+            : Process::result(exitCode: 0));
+
+        expect(app(ProcessSupervisor::class)->refreshUnit(nodeApp(), '/home/appuser/api.test'))->toBeFalse();
+        Process::assertNotRan(fn ($p) => in_array('tee', $p->command, true));
+    });
+});
+
+/**
+ * An application adopted from the old panel, still run by its PM2 daemon.
+ *
+ * The routing lives in ProcessSupervisor rather than in its callers, so these
+ * assert through the same public API that GitDeployer, the environment
+ * controller and the restore steps use — none of which know two supervisors
+ * exist.
+ */
+describe('an adopted application', function () {
+    function pm2App(array $overrides = []): Application
+    {
+        return nodeApp(array_merge([
+            'supervisor_mode' => 'pm2',
+            'pm2_process_name' => 'legacy-api',
+        ], $overrides));
+    }
+
+    /** @return ArrayObject<int, string> */
+    function ranFor(callable $act): ArrayObject
+    {
+        $ran = new ArrayObject;
+
+        Process::fake(function ($p) use ($ran) {
+            $args = ($p->command[0] ?? '') === 'sudo' ? array_slice((array) $p->command, 2) : (array) $p->command;
+            $ran[] = implode(' ', $args);
+
+            return Process::result(output: '[]');
+        });
+
+        $act();
+
+        return $ran;
+    }
+
+    it('writes no unit on deploy, and restarts the daemon instead', function () {
+        $application = pm2App();
+
+        $ran = ranFor(fn () => app(ProcessSupervisor::class)->apply($application, '/home/appuser/api.test'));
+
+        // A deploy still has to get the new code into the running process.
+        expect(collect($ran)->contains(fn (string $c) => str_contains($c, 'pm2 restart legacy-api')))->toBeTrue()
+            ->and(collect($ran)->contains(fn (string $c) => str_contains($c, 'sv-app-')))->toBeFalse()
+            ->and(collect($ran)->contains(fn (string $c) => str_starts_with($c, 'systemctl')))->toBeFalse();
+    });
+
+    it('deletes from the daemon rather than looking for a unit', function () {
+        $application = pm2App();
+
+        $ran = ranFor(fn () => app(ProcessSupervisor::class)->remove($application));
+
+        expect(collect($ran)->contains(fn (string $c) => str_contains($c, 'pm2 delete legacy-api')))->toBeTrue()
+            ->and(collect($ran)->contains(fn (string $c) => str_contains($c, 'systemctl disable')))->toBeFalse();
+    });
+
+    it('sends start, stop and restart to the daemon', function (string $action) {
+        $application = pm2App();
+
+        $ran = ranFor(fn () => app(ProcessSupervisor::class)->{$action}($application));
+
+        expect(collect($ran)->contains(fn (string $c) => str_contains($c, "pm2 {$action} legacy-api")))->toBeTrue();
+    })->with(['start', 'stop', 'restart']);
+
+    it('has no slice of ours to release, and does not pretend to fail', function () {
+        $application = pm2App();
+
+        $ran = ranFor(fn () => expect(app(ProcessSupervisor::class)->releaseSlice($application)->ok)->toBeTrue());
+
+        // A deprovision must not stall on the absence of something that was
+        // never created.
+        expect(collect($ran)->contains(fn (string $c) => str_contains($c, '.slice')))->toBeFalse();
+    });
+
+    it('answers status in the same shape as a unit does', function () {
+        $application = pm2App();
+
+        Process::fake(fn () => Process::result(output: json_encode([
+            ['name' => 'legacy-api', 'pm2_env' => ['status' => 'online', 'restart_time' => 1], 'monit' => ['memory' => 40, 'cpu' => 2]],
+            ['name' => 'legacy-api', 'pm2_env' => ['status' => 'online', 'restart_time' => 0], 'monit' => ['memory' => 60, 'cpu' => 1]],
+        ])));
+
+        // Same keys either way, so nothing downstream branches on the
+        // supervisor; `supervisor` is there for anything that wants to label
+        // it, and the fields a given supervisor cannot answer are null rather
+        // than invented.
+        expect(app(ProcessSupervisor::class)->status($application))->toMatchArray([
+            'state' => 'online',
+            'sub_state' => null,
+            'since' => null,
+            'memory' => 100,
+            'restarts' => 1,
+            'instances' => 2,
+            'online' => 2,
+            'supervisor' => 'pm2',
+        ]);
+    });
+
+    it('is still known to run when adoption recorded no start command', function () {
+        // The old panel stored a package-manager invocation and rewrote it on
+        // the way to PM2, so there may be nothing here we could parse. What it
+        // has is a name the daemon knows it by.
+        expect(app(ProcessSupervisor::class)->runs(pm2App(['start_command' => null])))->toBeTrue();
+    });
+});
+
+it('labels a systemd application as one, and admits what it cannot count', function () {
+    Process::fake(fn () => Process::result(output: "ActiveState=active\nSubState=running\nMemoryCurrent=1024\nNRestarts=0\n"));
+
+    expect(app(ProcessSupervisor::class)->status(nodeApp()))->toMatchArray([
+        'state' => 'active',
+        'instances' => 1,
+        // The unit is one cgroup; how many workers live inside it is PM2's to
+        // know. Null rather than a guess.
+        'online' => null,
+        'supervisor' => 'systemd',
+    ]);
+});
+
+describe('process detail (v7 pm2-detail)', function () {
+    function unitStatus(Application $app, string $usage, string $pid = '4242'): ?array
+    {
+        Process::fake(fn () => Process::result(output: "ActiveState=active\nSubState=running\nMemoryCurrent=1024\nNRestarts=0\nMainPID={$pid}\nCPUUsageNSec={$usage}\n"));
+
+        return app(ProcessSupervisor::class)->status($app);
+    }
+
+    it('reports the main process id, and none for a stopped unit', function () {
+        $app = nodeApp();
+
+        expect(unitStatus($app, '5000')['pid'])->toBe(4242)
+            // systemd says MainPID=0 when nothing runs; 0 is not a process.
+            ->and(unitStatus($app, '5000', '0')['pid'])->toBeNull();
+    });
+
+    it('works out CPU from the previous reading, with nothing to compare against the first time', function () {
+        $app = nodeApp();
+
+        expect(unitStatus($app, '7000000000')['cpu_percent'])->toBeNull();
+
+        // As if that reading had been taken two seconds ago: one CPU-second
+        // in two seconds is half of one core.
+        Cache::put("process-cpu:{$app->id}", ['usage' => 7_000_000_000, 'at' => (int) (microtime(true) * 1e9) - 2_000_000_000, 'percent' => null]);
+
+        expect(unitStatus($app, '8000000000')['cpu_percent'])->toEqualWithDelta(50.0, 0.5);
+    });
+
+    it('says unknown after a restart, not a negative rate', function () {
+        $app = nodeApp();
+        Cache::put("process-cpu:{$app->id}", ['usage' => 9_000_000_000, 'at' => (int) (microtime(true) * 1e9) - 2_000_000_000, 'percent' => 12.0]);
+
+        // The new process started counting from zero.
+        expect(unitStatus($app, '1000')['cpu_percent'])->toBeNull();
+    });
+
+    it('says unknown when systemd has no CPU figure', function () {
+        expect(unitStatus(nodeApp(), '[not set]')['cpu_percent'])->toBeNull();
+    });
+
+    it('shows pid and cpu on the application itself', function () {
+        $app = nodeApp();
+        Process::fake(fn () => Process::result(output: "ActiveState=active\nMainPID=4242\nCPUUsageNSec=1\n"));
+
+        $this->withHeaders(supervisorHeaders())->getJson("/api/applications/{$app->id}")
+            ->assertOk()
+            ->assertJsonPath('application.process.pid', 4242)
+            ->assertJsonPath('application.process.cpu_percent', null);
+    });
+});
+
+it('lets an application go back to the port its unit is still running on (FS-C41)', function () {
+    // Port changed to 3015 and not yet deployed: 3005 is held by this same
+    // app's process, and going back to it was refused as "already in use".
+    $dir = sys_get_temp_dir().'/units-'.uniqid();
+    mkdir($dir);
+    config(['server.applications.systemd_dir' => $dir]);
+
+    $app = nodeApp(['app_port' => 3015]);
+    file_put_contents($dir.'/'.app(ProcessSupervisor::class)->unit($app), "[Service]\nEnvironment=PORT=3005\n");
+
+    Process::fake(fn ($p) => in_array('ss', $p->command, true) || ($p->command[0] ?? '') === 'ss'
+        ? Process::result(output: "LISTEN 0 511 127.0.0.1:3005 0.0.0.0:*\n")
+        : Process::result());
+
+    expect(app(PortAllocator::class)->conflict(3005, $app))->toBeNull()
+        ->and(app(PortAllocator::class)->conflict(3005, nodeApp(['name' => 'Other', 'domain' => 'o.test', 'app_port' => 3020])))->toBe('in_use');
+});

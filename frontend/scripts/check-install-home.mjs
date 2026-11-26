@@ -1,0 +1,56 @@
+// Every label in the install-home map resolves in every locale (template-literal keys check-i18n can't see).
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { INSTALL_HOMES } from "../lib/services/install-home.js";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const locales = fs
+  .readdirSync(path.join(root, "messages"))
+  .filter((f) => f.endsWith(".json"))
+  .map((f) => f.replace(/\.json$/, ""));
+
+const problems = [];
+
+for (const locale of locales) {
+  const messages = JSON.parse(
+    fs.readFileSync(path.join(root, "messages", `${locale}.json`), "utf8"),
+  );
+  const services = messages.services ?? {};
+
+  for (const home of INSTALL_HOMES) {
+    if (typeof services.attention?.[home.label] !== "string") {
+      problems.push(`${locale}: services.attention.${home.label} missing`);
+    }
+    if (typeof services.state?.[home.retryLabel] !== "string") {
+      problems.push(`${locale}: services.state.${home.retryLabel} missing`);
+    }
+  }
+}
+
+const groups = fs
+  .readdirSync(path.join(root, "app"), { withFileTypes: true })
+  .filter((entry) => entry.isDirectory() && entry.name.startsWith("("))
+  .map((entry) => entry.name);
+
+for (const home of INSTALL_HOMES) {
+  const segment = home.href.replace(/^\//, "");
+  const found = ["", ...groups].some((group) =>
+    ["page.jsx", "page.js"].some((file) =>
+      fs.existsSync(path.join(root, "app", group, segment, file)),
+    ),
+  );
+  if (!found) {
+    problems.push(`route ${home.href} has no page under app/`);
+  }
+}
+
+if (problems.length) {
+  console.error("install-home check FAILED:");
+  for (const p of problems) console.error("  " + p);
+  process.exit(1);
+}
+
+console.log(
+  `install-home ok — ${INSTALL_HOMES.length} homes, ${locales.length} locales, every label resolves and every route exists`,
+);

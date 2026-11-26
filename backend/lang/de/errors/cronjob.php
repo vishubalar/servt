@@ -1,0 +1,33 @@
+<?php
+
+return [
+    'sync_failed' => 'Der Cronjob konnte auf dem Server nicht angewendet werden.',
+    // One sentence per privileged step. They all used to share
+    // `sync_failed`, so a full disk and a missing group read the same.
+    'step' => [
+        'log_dir' => 'Das Protokollverzeichnis für Cronjobs konnte nicht erstellt werden. Prüfen Sie freien Speicherplatz und ob /var/log beschreibbar ist.',
+        'log_touch' => 'Die Protokolldatei des Cronjobs konnte in /var/log/cronjobs nicht erstellt werden. Prüfen Sie, ob genügend Speicherplatz frei ist und der Ordner beschreibbar ist.',
+        'log_chown' => 'Die Protokolldatei konnte dem ausführenden Konto nicht übergeben werden. Prüfen Sie, ob dieses Konto noch existiert.',
+        'log_chmod' => 'Die Berechtigungen der Protokolldatei konnten nicht gesetzt werden.',
+        'rotation' => 'Die Rotationsrichtlinie konnte nicht installiert werden, daher wurde der Job nicht eingeplant — seine Ausgabe würde unbegrenzt wachsen.',
+        'write' => 'Die Cron-Datei konnte nicht geschrieben werden. Prüfen Sie den freien Speicherplatz.',
+        'chmod' => 'Die Berechtigungen der Cron-Datei konnten nicht gesetzt werden. Cron ignoriert eine Datei, der es nicht traut, daher wurde der Job nicht eingeplant.',
+        'remove' => 'Die Cron-Datei konnte nicht entfernt werden, der Job ist auf dem Server weiterhin eingeplant.',
+        'remove_stale' => 'Die alte Cron-Datei konnte nach der Umbenennung nicht entfernt werden. Es wurde nichts geändert, der Job ist also nicht doppelt eingeplant.',
+        'detach_source' => 'Die ursprüngliche Cron-Datei, aus der dieser Job importiert wurde, konnte nicht entfernt werden. Es wurde nichts geändert, der Befehl läuft also nicht doppelt.',
+        'run_now' => 'Der Job konnte nicht gestartet werden. Suchen Sie die unten stehende Referenz im Systemprotokoll des Servers.',
+        'read_history' => 'Das Protokoll des Jobs konnte nicht gelesen werden, daher können seine Ausführungen nicht angezeigt werden.',
+    ],
+    'invalid_expression' => 'Der Zeitplan ist kein gültiger Cron-Ausdruck.',
+    'invalid_user' => 'Der ausgewählte Benutzer existiert nicht auf dem Server.',
+    'user_not_allowed' => 'Nur der Panel-Administrator kann einen Cronjob unter einem Konto ausführen, das kein Systembenutzer des Panels ist.',
+    'unresolved_placeholder' => 'Der Befehl enthält noch den Platzhalter {path} oder {php} — ersetzen Sie ihn durch das Anwendungsverzeichnis und dessen PHP-Programm.',
+    'no_newline' => 'Dieser Wert darf keine Zeilenumbrüche enthalten.',
+    'reserved_name' => 'Dieser Name ist reserviert und kann nicht verwendet werden.',
+    'shell_comment' => 'Der Befehl enthält einen Shell-Kommentar (ein # am Anfang eines Wortes). Cron würde die Zeile dort abschneiden und der Job liefe nicht richtig. Entfernen Sie den Kommentar oder setzen Sie das # in Anführungszeichen.',
+    'run_paused' => 'Dieser Cronjob ist pausiert. Aktivieren Sie ihn, bevor Sie ihn ausführen.',
+    'run_already_running' => 'Dieser Cronjob läuft bereits über „Jetzt ausführen“. Warten Sie, bis diese Ausführung beendet ist.',
+    'switch_not_this_site' => 'Dieser Cronjob gehört nicht zu dieser Seite.',
+    'switch_unknown_php' => 'Cronjob :name nennt kein PHP, das das Panel umstellen kann. Bearbeiten Sie stattdessen seinen Befehl.',
+    'switch_too_long' => 'Cronjob :name wäre mit dem neuen PHP-Pfad länger als 1000 Zeichen. Bearbeiten Sie stattdessen seinen Befehl.',
+];

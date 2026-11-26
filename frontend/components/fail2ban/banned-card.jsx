@@ -1,0 +1,390 @@
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { useRefresh } from "@/hooks/use-refresh";
+import { useFormatter, useNow, useTranslations } from "next-intl";
+import { cn } from "@/lib/utils";
+import { toast } from "sonner";
+import Link from "@/components/ui/app-link";
+import { ShieldOff, Ban, ScrollText, SearchX } from "lucide-react";
+import { unbanIp, unbanAll } from "@/lib/api/fail2ban";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { LocalSearchInput } from "@/components/data-table/local-search-input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { SELECT_WELL } from "@/components/data-table/toolbar-well";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { DataTable } from "@/components/ui/data-table";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { BanIpDialog } from "@/components/fail2ban/ban-ip-dialog";
+import { BannedCards } from "@/components/fail2ban/banned-cards";
+import { useNavTransition } from "@/components/data-table/nav-transition";
+import { RefreshButton } from "@/components/data-table/refresh-button";
+import { apiMessage } from "@/lib/api/error-message";
+import { banAgeSeconds } from "@/lib/fail2ban/ban-age";
+import { HoverHint } from "@/components/ui/hover-hint";
+
+const PAGE_SIZE = 10;
+const TOOLS_FROM = 8;
+
+// Cells at module level: inline cells remount every render.
+
+function IpCell({ row }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} className="block truncate rounded font-mono text-sm">{row.original.ip}</span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-80 break-all font-mono">{row.original.ip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function JailCell({ row }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge tabIndex={0} variant="outline" className="max-w-full font-normal">
+          <span className="truncate">{row.original.jail}</span>
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-80 break-all">{row.original.jail}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function BannedAtCell({ row }) {
+  return (
+    <span className="block break-words whitespace-normal text-xs text-muted-foreground">
+      <BanAge ban={row.original} />
+    </span>
+  );
+}
+
+export function BanAge({ ban }) {
+  const format = useFormatter();
+  const now = useNow();
+  const age = banAgeSeconds(ban);
+  if (age === null) return ban.banned_at || "—";
+  return <HoverHint content={ban.banned_at}><span>{format.relativeTime(now.getTime() - age * 1000, now)}</span></HoverHint>;
+}
+
+function ExpiryCell({ row, table }) {
+  return expiryContent(row.original, table.options.meta.t);
+}
+
+function expiryContent(ban, t) {
+  const { seconds_left: left, expires_at: expires, banned_at: since } = ban;
+
+  if (typeof left === "number") {
+    if (left <= 0) return <span className="text-muted-foreground">{t("banned.expiring")}</span>;
+    return <span className="block break-words whitespace-normal tabular-nums">{formatLeft(t, left)}</span>;
+  }
+
+  if (expires) {
+    return <span className="block break-words whitespace-normal text-xs tabular-nums">{expires}</span>;
+  }
+
+  if (!since) return <span className="text-muted-foreground">{t("banned.unknownLeft")}</span>;
+
+  return (
+    <Badge variant="muted" className="max-w-full break-words whitespace-normal font-normal">
+      {t("banned.permanent")}
+    </Badge>
+  );
+}
+
+function ActionsCell({ row, table }) {
+  const { canManage, onRequestUnban, unbanning, t } = table.options.meta;
+  return (
+    <div className="flex justify-end">
+      <ReasonTooltip reason={canManage ? null : DENIED}>
+        <Button
+          variant="destructive"
+          size="sm"
+          className="h-auto max-w-full gap-1 px-2 py-1.5 whitespace-normal"
+          disabled={!canManage || unbanning === row.original.ip}
+          onClick={() => onRequestUnban(row.original)}
+        >
+          <ShieldOff className="size-4" />
+          <span className="min-w-0 break-words">{t("banned.unban")}</span>
+        </Button>
+      </ReasonTooltip>
+    </div>
+  );
+}
+
+export function BannedCard({ banned, jails, canManage, logHref, yourIp = null, serverIp = null }) {
+  const t = useTranslations("fail2ban");
+  const nav = useNavTransition();
+  const router = useRouter();
+  const { refreshAndWait } = useRefresh();
+  const [localPending, startLocal] = useTransition();
+  const refresh = nav ? nav.refresh : () => startLocal(() => router.refresh());
+  const pending = nav ? nav.isPending : localPending;
+  const [unbanning, setUnbanning] = useState(null);
+  const [unbanConfirm, setUnbanConfirm] = useState(null);
+  const [confirmAll, setConfirmAll] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [query, setQuery] = useState("");
+  const [jailFilter, setJailFilter] = useState("all");
+  const [rawPage, setRawPage] = useState(0);
+
+  const needsTools = banned.length > TOOLS_FROM;
+  const jailOptions = [...new Set(banned.map((b) => b.jail))].sort();
+
+  const term = query.trim().toLowerCase();
+  const filtered = banned.filter(
+    (b) =>
+      (jailFilter === "all" || b.jail === jailFilter) &&
+      (!term || b.ip.toLowerCase().includes(term)),
+  );
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const page = Math.min(rawPage, pageCount - 1);
+  const visible = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const setPage = setRawPage;
+
+  async function onUnban(ban) {
+    setUnbanning(ban.ip);
+    try {
+      await unbanIp(ban.ip, ban.jail);
+      await refreshAndWait();
+      toast.success(t("banned.unbanned", { ip: ban.ip }));
+      setUnbanConfirm(null);
+    } catch (error) {
+      // 404 = no longer banned, the list is stale.
+      if (error.response?.status === 404) {
+        toast.info(t("banned.alreadyGone"));
+        setUnbanConfirm(null);
+        refresh();
+        return;
+      }
+      toast.error(apiMessage(error, t("banned.unbanFailed", { ip: ban.ip })));
+    } finally {
+      setUnbanning(null);
+    }
+  }
+
+  async function onUnbanAll() {
+    setClearing(true);
+    try {
+      const { data } = await unbanAll();
+      await refreshAndWait();
+      toast.success(t("banned.unbannedAll", { count: data?.unbanned?.ips?.length ?? 0 }));
+      setConfirmAll(false);
+    } catch (error) {
+      if (error.response?.status === 404) {
+        toast.info(t("banned.noneToClear"));
+        setConfirmAll(false);
+        refresh();
+        return;
+      }
+      toast.error(apiMessage(error, t("banned.unbanAllFailed")));
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  const columns = [
+    { accessorKey: "ip", header: t("banned.ip"), cell: IpCell, meta: { className: "w-[28%]" } },
+    { accessorKey: "jail", header: t("banned.jail"), cell: JailCell, meta: { className: "w-[16%]" } },
+    { accessorKey: "banned_at", header: t("banned.since"), cell: BannedAtCell, meta: { className: "w-[24%] whitespace-normal" } },
+    { id: "expiry", header: t("banned.timeLeft"), cell: ExpiryCell, meta: { className: "w-[20%] whitespace-normal" } },
+    {
+      id: "actions",
+      header: () => <span className="sr-only">{t("banned.actions")}</span>,
+      meta: { className: "w-[12%] px-2 text-right whitespace-normal" },
+      cell: ActionsCell,
+    },
+  ];
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-3 space-y-0 xl:flex-row xl:items-center xl:justify-between">
+        <CardTitle icon={Ban} className="min-w-0 font-semibold">{t("banned.title")}</CardTitle>
+        <div className="flex min-w-0 flex-wrap items-center gap-2 xl:justify-end">
+          <RefreshButton />
+          {logHref ? (
+            <Button variant="neutral" asChild>
+              <Link href={logHref}>
+                <ScrollText className="size-4" />
+                {t("banned.seeLog")}
+              </Link>
+            </Button>
+          ) : null}
+          {banned.length > 0 ? (
+            <ReasonTooltip reason={canManage ? null : DENIED}>
+              <Button
+                variant="neutral"
+                disabled={!canManage}
+                onClick={() => setConfirmAll(true)}
+              >
+                {t("banned.unbanAll")}
+              </Button>
+            </ReasonTooltip>
+          ) : null}
+          <BanIpDialog jails={jails} canManage={canManage} yourIp={yourIp} serverIp={serverIp} />
+        </div>
+      </CardHeader>
+
+      <CardContent className="space-y-3">
+        {needsTools ? (
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <LocalSearchInput
+              value={query}
+              onChange={setQuery}
+              placeholder={t("banned.search")}
+              className="sm:max-w-64"
+            />
+            {jailOptions.length > 1 ? (
+              <Select value={jailFilter} onValueChange={setJailFilter}>
+                <SelectTrigger className={cn(SELECT_WELL, "sm:w-52")}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("banned.allJails")}</SelectItem>
+                  {jailOptions.map((name) => (
+                    <SelectItem key={name} value={name}>
+                      {name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : null}
+          </div>
+        ) : null}
+
+        {banned.length === 0 ? (
+          <EmptyState
+            icon={Ban}
+            title={t("banned.emptyTitle")}
+            description={t("banned.emptyBody")}
+          />
+        ) : visible.length === 0 ? (
+          <EmptyState compact icon={SearchX} subject={Ban} title={t("banned.noMatches")} />
+        ) : (
+          <div className="@container">
+            <div className={cn("@min-[900px]/page:hidden", pending && "pointer-events-none opacity-60")}>
+              <BannedCards
+                data={visible}
+                canManage={canManage}
+                onRequestUnban={setUnbanConfirm}
+                unbanning={unbanning}
+                t={t}
+                renderExpiry={(ban) => expiryContent(ban, t)}
+              />
+            </div>
+
+            <div
+              className={cn(
+                "-mx-(--card-spacing) hidden max-h-[26rem] overflow-auto border-t @min-[900px]/page:block",
+                pageCount > 1 ? "border-b" : "-mb-(--card-spacing)",
+              )}
+            >
+              <DataTable
+                bare
+                fixedLayout
+                columns={columns}
+                data={visible}
+                emptyMessage={t("banned.noMatches")}
+                stickyHeader
+                meta={{ canManage, onRequestUnban: setUnbanConfirm, unbanning, t }}
+              />
+            </div>
+          </div>
+        )}
+
+        {pageCount > 1 ? (
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground tabular-nums">
+              {t("banned.showing", {
+                from: page * PAGE_SIZE + 1,
+                to: Math.min((page + 1) * PAGE_SIZE, filtered.length),
+                total: filtered.length,
+              })}
+            </p>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={page === 0}
+                onClick={() => setPage((p) => p - 1)}
+              >
+                {t("banned.prev")}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={page >= pageCount - 1}
+                onClick={() => setPage((p) => p + 1)}
+              >
+                {t("banned.next")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+      </CardContent>
+
+      <ConfirmDialog
+        open={confirmAll}
+        onOpenChange={(open) => !clearing && setConfirmAll(open)}
+        icon={ShieldOff}
+        tone="warning"
+        confirmVariant="destructive"
+        title={t("banned.unbanAllTitle", { count: banned.length })}
+        description={t("banned.unbanAllDescription")}
+        cancelLabel={t("banned.cancel")}
+        confirmLabel={t("banned.unbanAll")}
+        pending={clearing}
+        onConfirm={onUnbanAll}
+      >
+        <ul className="max-h-56 divide-y overflow-y-auto rounded-lg border">
+          {banned.map((ban) => (
+            <li
+              key={`${ban.jail}-${ban.ip}`}
+              className="flex items-center justify-between gap-3 px-3 py-2"
+            >
+              <span className="truncate font-mono text-sm">{ban.ip}</span>
+              <span className="shrink-0 text-xs text-muted-foreground">{ban.jail}</span>
+            </li>
+          ))}
+        </ul>
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={!!unbanConfirm}
+        onOpenChange={(open) => !unbanning && !open && setUnbanConfirm(null)}
+        icon={ShieldOff}
+        tone="warning"
+        confirmVariant="destructive"
+        title={t("banned.unbanIpTitle", { ip: unbanConfirm?.ip })}
+        description={t("banned.unbanIpDescription", { jail: unbanConfirm?.jail })}
+        cancelLabel={t("banned.cancel")}
+        confirmLabel={t("banned.unban")}
+        pending={!!unbanning}
+        onConfirm={() => unbanConfirm && onUnban(unbanConfirm)}
+      />
+    </Card>
+  );
+}
+
+function formatLeft(t, seconds) {
+  if (seconds < 60) return t("banned.secondsLeft", { count: seconds });
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return t("banned.minutesLeft", { count: minutes });
+  return t("banned.hoursLeft", { count: Math.round(minutes / 60) });
+}

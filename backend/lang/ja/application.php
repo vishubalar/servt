@@ -1,0 +1,369 @@
+<?php
+
+return [
+    // What a name attached to an application does. Shown as the badge
+    // beside each domain, so it has to read as a noun, not a sentence.
+    'domain_type' => [
+        'primary' => 'プライマリ',
+        'alias' => 'エイリアス',
+        'redirect' => 'リダイレクト',
+    ],
+
+    'types' => [
+        'docker' => ['title' => 'Docker コンテナ', 'tagline' => '任意のレジストリの任意のイメージを nginx 経由で公開します。'],
+        'wordpress' => ['title' => 'WordPress', 'tagline' => 'ブログ・ウェブサイト作成'],
+        'phpmyadmin' => ['title' => 'phpMyAdmin', 'tagline' => 'ブラウザーからデータベースを管理'],
+        'adminer' => ['title' => 'Adminer', 'tagline' => 'ブラウザで MySQL、MariaDB、PostgreSQL のデータベースを管理'],
+        'uptimekuma' => ['title' => 'Uptime Kuma', 'tagline' => '稼働監視とステータスページ'],
+        'n8n' => ['title' => 'n8n', 'tagline' => 'ワークフロー自動化 (フェアコードライセンス)'],
+        'nodered' => ['title' => 'Node-RED', 'tagline' => 'デバイス・API・サービスをつなぐ'],
+        'nodebb' => ['title' => 'NodeBB', 'tagline' => 'フォーラムソフトウェア — MongoDB または PostgreSQL が必要'],
+        'nextcloud' => ['title' => 'Nextcloud', 'tagline' => 'プライベートなファイル同期・共有'],
+        'joomla' => ['title' => 'Joomla', 'tagline' => '柔軟なコンテンツ管理システム'],
+        'moodle' => ['title' => 'Moodle', 'tagline' => 'オンライン学習・コース管理'],
+        'mautic' => ['title' => 'Mautic', 'tagline' => 'マーケティング自動化とキャンペーン'],
+        'craftcms' => ['title' => 'Craft CMS', 'tagline' => '開発者向けコンテンツ管理'],
+        'akaunting' => ['title' => 'Akaunting', 'tagline' => '会計・請求管理'],
+        'statamic' => ['title' => 'Statamic', 'tagline' => 'フラットファイル CMS — データベース不要'],
+        'prestashop' => ['title' => 'PrestaShop', 'tagline' => 'オンラインストア・EC'],
+        'git' => ['title' => 'Gitリポジトリから', 'tagline' => 'GitHub・GitLab・Bitbucket から自分のコードをデプロイ'],
+        'php' => ['title' => '空のPHPアプリケーション', 'tagline' => '空のアプリケーション — ファイルは自分でアップロード'],
+        'static' => ['title' => '静的アプリケーション', 'tagline' => 'HTML・CSS・JavaScript のみ'],
+    ],
+
+    'status' => [
+        'pending' => '未デプロイ',
+        'provisioning' => 'セットアップ中…',
+        'active' => '稼働中',
+        'failed' => 'セットアップ失敗',
+    ],
+
+    'unavailable' => [
+        'deprecated' => 'このワンクリックアプリは提供を終了しました。既存のサイトは引き続き動作しますが、新しいサイトは作成できません。',
+        'stack' => 'このサーバーはコンテナのみを実行するため、この種類のアプリケーションはホストしません。',
+        'stack_profile' => 'このサーバーは、この種類のアプリケーションをホストするように設定されていません。',
+        'profile' => 'このサーバーは :profile アプリケーションを配信しないため、このレンダリング方式はここでは使えません。このサーバーが対応している方式を選んでください。',
+        'database' => 'このアプリケーションには :engines が必要ですが、このサーバーにはありません。',
+        'database_version' => ':type には :engine :minimum 以降が必要ですが、このサーバーの :engine は :version です。アップグレードするか、より新しい :engine のサーバーを使用してください。',
+        'php' => 'このサーバーには PHP がインストールされていません。',
+        'php_version_install' => 'このサーバーには :type が動作する PHP バージョン（:range）がありません。先に PHP 画面から PHP :version をインストールしてください。',
+        'php_version_none' => 'このサーバーには :type が動作する PHP バージョン（:range）がなく、サーバーのパッケージリポジトリからもインストールできません。',
+        'node' => 'このサーバーには Node.js がインストールされていません。',
+        'web_server' => 'このアプリケーションは :web_server サーバーではまだ利用できません。',
+    ],
+
+    'git_source' => [
+        'account' => '連携済みアカウントから',
+        'public_url' => '公開リポジトリのURLを貼り付け',
+    ],
+
+    'fields' => [
+        'memory_limit' => 'メモリ上限',
+        'cpu_limit' => 'CPU 上限',
+        'compose' => 'Compose ファイル',
+        'image' => 'イメージ',
+        'registry_id' => 'レジストリ',
+        'container_port' => 'コンテナのポート',
+        'docker_network' => 'ネットワーク',
+        'docker_mode' => '実行方法',
+        'docker_network_new' => '新しいネットワーク',
+        'volume_new' => '新しいボリューム',
+        'volume_path' => 'ボリュームのパス',
+        'database_engine' => 'データベースエンジン',
+        'company_name' => '会社名',
+        'company_email' => '会社のメールアドレス',
+        'locale' => 'ロケール',
+        'site_name' => 'アプリケーション名',
+        'language' => '言語',
+        'admin_name' => '管理者名',
+        'admin_first_name' => '管理者の名',
+        'admin_last_name' => '管理者の姓',
+        'short_name' => '短縮名',
+        'shop_name' => 'ショップ名',
+        'country' => '国',
+        'timezone' => 'タイムゾーン',
+        'rendering_type' => 'レンダリング方式',
+        'name' => '名前',
+        'domain' => 'ドメイン',
+        'system_user_id' => 'システムユーザー',
+        'php_version' => 'PHPバージョン',
+        'node_version' => 'Node.jsバージョン',
+        'app_port' => 'アプリのポート',
+        'web_root' => 'ウェブルート',
+        'build_command' => 'ビルドコマンド',
+        'deploy_script' => 'デプロイスクリプト',
+        'start_command' => '起動コマンド',
+        'package_manager' => 'パッケージマネージャー',
+        'git_source' => 'ソース',
+        'git_account_id' => 'Gitアカウント',
+        'repository' => 'リポジトリ',
+        'repository_url' => 'リポジトリURL',
+        'branch' => 'ブランチ',
+        'site_title' => 'アプリケーションタイトル',
+        'admin_user' => '管理者ユーザー名',
+        'admin_username' => '管理者ユーザー名',
+        'admin_email' => '管理者メールアドレス',
+        'admin_password' => '管理者パスワード',
+        'site_language' => 'アプリケーションの言語',
+        'table_prefix' => 'テーブル接頭辞',
+        'mailer_name' => '送信者名',
+        'mailer_email' => '送信元アドレス',
+        'mailer_host' => 'SMTP ホスト',
+        'mailer_port' => 'SMTP ポート',
+        'mailer_username' => 'SMTP ユーザー名',
+        'mailer_password' => 'SMTP パスワード',
+    ],
+
+    /*
+    | Example values, shown as ghost text in an empty field.
+    |
+    | A placeholder is NOT a default: it is never submitted. Anything with a
+    | correct value the panel can pick lives in the field's `default` instead,
+    | which the form pre-fills and the request carries — a table prefix is a
+    | default, an email address is a placeholder. Getting that backwards ships
+    | a form that looks filled in and posts null.
+    |
+    | Keyed by field name, not by site type, so one entry serves every type
+    | declaring that field — the same arrangement as `fields` and `help`.
+    | Localized because these are read by a person: an example is only an
+    | example if it is in a language they read.
+    */
+    'placeholders' => [
+        'cpu_limit' => '上限なし',
+        'mailer_host' => 'smtp.example.com',
+        'mailer_port' => '587',
+        'site_title' => 'マイアプリケーション',
+        'site_name' => 'マイアプリケーション',
+        'shop_name' => 'マイショップ',
+        'company_name' => 'マイカンパニー',
+        'short_name' => 'mysite',
+        'mailer_name' => 'マイアプリケーション',
+        'admin_email' => 'you@example.com',
+        'company_email' => 'you@example.com',
+        'mailer_email' => 'no-reply@example.com',
+        'mailer_username' => 'no-reply@example.com',
+        'timezone' => 'Asia/Tokyo',
+        'repository_url' => 'https://github.com/you/repo.git',
+        'build_command' => 'npm ci && npm run build',
+        'start_command' => 'node server.js',
+    ],
+
+    'options' => [
+        'docker_mode' => [
+            'simple' => 'シンプル — イメージとポート',
+            'compose' => 'compose ファイル — 自分で書く',
+        ],
+    ],
+
+    'help' => [
+        'memory_limit_app' => '任意。このアプリ自身のコンテナが使えるメモリの上限です。例: 512m、2g。単位のない数値は Docker にはバイトとして扱われ、メガバイトではありません。空欄の場合は :default が適用されます。アプリが一緒に持ってくるデータベースには別の上限があります。',
+        'memory_limit_app_floor' => '任意。このアプリ自身のコンテナが使えるメモリの上限です。空欄の場合は :default が適用されます。これはこのアプリに必要だと実測された値で、これより小さくするとアプリが起動しないことがあり、その失敗はメモリに触れないまま 502 として現れます。アプリが一緒に持ってくるデータベースには別の上限があります。',
+        'cpu_limit_app' => '任意。このアプリ自身のコンテナが使える CPU コア数です — 1 は 1 コア、0.5 は半分。このサーバーは :cores 個で、これを超えて要求するコンテナは Docker が起動しません。空欄の場合 CPU の上限はありません。超えても何も終了されず、コンテナは待つだけなので、症状はエラーではなく遅さとして現れます。アプリが一緒に持ってくるデータベースはこの制限を受けません。',
+        'memory_limit' => '任意。このコンテナが使えるメモリの上限です。例: 512m、2g。単位のない数値は Docker にはバイトとして扱われ、メガバイトではありません。空欄の場合はサーバーの既定値 :default が適用されます。これは上限であって予約ではなく（確保されるものはありません）、超えるとコンテナは強制終了され再起動します。',
+        'cpu_limit' => '任意。このコンテナが使える CPU コア数です — 1 は 1 コア、0.5 は半分。このサーバーは :cores 個で、これを超えて要求するコンテナは Docker が起動しません。空欄の場合 CPU の上限はありません。こちらを超えても何も終了されず、コンテナは待つだけなので、症状はエラーではなく遅さとして現れます。',
+        'compose' => '任意。独自の compose ファイルを貼り付ければ、Compose が対応するものはすべて利用できます（複数サービス、名前付きボリューム、ヘルスチェックなど）。空のままにすると、上のフィールドからパネルが生成します。ポートは 127.0.0.1 に公開し、バインドマウントはこのアプリケーションのディレクトリ内に収める必要があります。それ以外は理由を添えて拒否されます。',
+        'image' => '実行するイメージ。タグを明示してください（例: `nginx:1.27-alpine`）。タグなしの名前は `latest` を取得するため、デプロイが再現不能になり、ロールバックも意味を失います。',
+        'registry_id' => '公開イメージなら空のままで構いません — それが通常です。非公開イメージを動かすには、「連携」→「Docker レジストリ」で認証情報を追加し、ここで選びます。貼り付けた compose ファイルにも適用されます。そこに書かれたイメージも非公開でありうるからです。',
+        'container_port' => 'コンテナ内でアプリケーションが待ち受けるポート。サーバー側のポートはパネルが割り当て、nginx をそこへ向けます。',
+        'docker_network' => 'Docker ネットワークに参加すると、このコンテナと同じネットワーク上のコンテナが名前で通信できます。空欄にすると Docker の既定のブリッジになり、名前では通信できません。ネットワークは Docker ページで作成します。',
+        'docker_mode' => 'シンプルではイメージとポートを指定し、パネルが compose ファイルを書きます。compose ファイルはそれ以外のすべてに対応します。自分で書きますが、ループバック公開・メモリ上限・ログ上限はパネルが引き続き適用します。',
+        'docker_network_new' => '上の選択を空にしてここに名前を入力すると、新しいネットワークを作成してこのアプリケーションを参加させます。同名のネットワークが既にある場合は拒否されます。その場合は上から選択してください。',
+        'volume_new' => 'この名前でボリュームを作成してアプリケーションにマウントし、コンテナを再構築してもデータが残るようにします。同名のボリュームが既にある場合は拒否されます。',
+        'volume_path' => 'コンテナ内でボリュームが現れる場所です。例: /var/lib/ghost/content。アプリケーション自身のディレクトリは指定しないでください。そこに置くとアプリケーションのファイルが隠れます。',
+        'table_prefix_random' => '空欄にするとランダムな接頭辞が生成され、データベースを共有した場合でもテーブルが混ざりません。',
+        'timezone' => 'アプリケーションのタイムゾーン。例: America/New_York、Asia/Tokyo。設定 → 一般 → タイムゾーンを参照してください。',
+        'table_prefix_optional' => '任意。空欄にすると、テーブルは接頭辞なしで作成されます。',
+        'start_command' => 'エントリファイル（例:「node server.js」）。「npm start」は不可 — パッケージマネージャーが実際のプロセスをフォークするため、終了シグナルが届きません。',
+        'app_port' => '空欄にすると、パネルが空きポートを選びます。',
+        'rendering_type' => 'PHP はサーバーの PHP でコードを実行します。サーバーサイドレンダリングはアプリをプロセスとして実行し、そこへプロキシします。クライアントサイドレンダリングと静的は、Web サーバーが直接配信するファイルにビルドされます — 高速で、常時動かしておくものはありません。',
+        'repository_url' => '公開リポジトリ — アカウント不要。https:// のアドレスを指定してください。',
+        'build_command' => 'コード取得後に実行されます。例: composer install --no-dev',
+        'deploy_script' => 'コードの取得後に、アプリケーションのユーザーとして、このアプリケーションのPHPバージョンで実行されます。空欄にするとビルドコマンドが使われます。',
+        'package_manager' => '依存関係のインストールとビルドに使うツールです。下のビルドコマンドを自動入力します — 後から自由に編集できます。',
+    ],
+
+    'steps' => [
+        'create_database' => 'データベースを作成中',
+        'download' => 'アプリケーションをダウンロード中',
+        'extract' => 'ファイルを展開中',
+        'configure' => '設定を書き込み中',
+        'install_cli' => 'セットアップツールをインストール中',
+        'install_app' => 'インストーラーを実行中',
+        'init' => 'リポジトリを設定中',
+        'fetch' => '最新のコードを取得中',
+        'checkout' => 'ブランチをチェックアウト中',
+        'seed_env' => '環境ファイルを準備しています',
+        'build' => 'ビルドコマンドを実行中',
+        'write_credential' => 'gitアクセスを準備中',
+        'ensure_account' => 'システムアカウントを作成しています',
+        'create_directory' => 'ディレクトリを作成中',
+        'set_ownership' => '所有者を設定中',
+        'placeholder' => '仮ページを作成中',
+        'write_config' => 'アプリケーション設定を書き込み中',
+        'test_config' => '設定を検証中',
+        'reload' => 'ウェブサーバーを再読み込み中',
+        'write_env' => '環境変数を書き込んでいます',
+        'start_app' => 'アプリケーションを起動しています',
+        'write_unit' => 'サービスを準備しています',
+        'restart_app' => 'アプリケーションを再起動しています',
+        'harden' => 'セキュリティ設定を適用しています',
+        'trust_domain' => 'ドメインを許可しています',
+        'set_password' => '管理者パスワードを設定しています',
+        'script' => 'デプロイスクリプトを実行しています',
+        'dependencies' => '依存関係を確認しています',
+        'verify' => 'アプリケーションの応答を確認しています',
+        'verify_serving' => 'アプリケーションの応答を確認しています',
+        'create_admin' => '管理者アカウントを作成しています',
+        'schedule_cron' => 'バックグラウンドジョブを登録しています',
+        'worker' => 'バックグラウンド処理が停止しました',
+    ],
+    /*
+    | Why provisioning failed, keyed by the `failed_reason` code on the
+    | application. Only set where the exit status genuinely identifies
+    | the cause; most failures carry the step and reference instead.
+    */
+    'site_type_change' => [
+        'git_cannot_change' => 'このアプリケーションはgitリポジトリからデプロイされているため、タイプを変更できません。デプロイ・ワーカー・環境ファイルの各画面はこのタイプがあるために存在しており、それらを取り除いてもバックグラウンドのワーカーは停止せず、デプロイWebhookもプッシュを受け付け続けます。管理する画面だけが失われることになります。',
+        'git_not_a_target' => 'アプリケーションをgitデプロイに変換することはできません。それにはパネルが管理するリポジトリ・ブランチ・デプロイスクリプトが必要で、サーバー上に既にあるファイルからは作成できません。代わりにgitアプリケーションを作成してください。',
+        'unchanged' => 'このアプリケーションは既にそのタイプに設定されています。',
+        'not_suggestable' => 'このアプリケーションをそのタイプに変更することはできません。ディスク上でパネルが認識できるアプリケーションのみ再ラベル付けできます。それ以外は、アプリケーションが使えない機能を主張することになります。',
+        'only_from_generic' => '別のアプリケーションタイプに再ラベル付けできるのは、カスタムPHPまたは静的アプリケーションのみです。このアプリケーションは既に特定のアプリケーションに設定されており、あるアプリケーションを別のものに変えることはラベルではできません。',
+        'no_evidence' => 'このアプリケーションには :type らしきものが見つかりません。先にアプリケーションをアップロードしてから、もう一度「検出」を実行してください。パネルは、アプリケーション自身のディレクトリ内にアプリケーションを確認できたときにのみタイプを変更します。',
+    ],
+
+    'failure_reason' => [
+
+        'git_repository_unreachable' => 'パネルはリポジトリを取得できませんでした。リポジトリが存在しないか、非公開でこのサイトの git アカウントでは読み取れません（公開 URL のサイトにはアカウントがありません）。リポジトリのアドレスとアカウントを確認してから、もう一度デプロイしてください。',
+
+        'git_branch_missing' => 'このサイトがデプロイするブランチはリポジトリに存在しません。デプロイ設定で存在するブランチを選んでから、もう一度デプロイしてください。',
+
+        'download_unreachable' => 'ダウンロードできませんでした。サーバーがダウンロード元のホストに届きませんでした。サーバーのインターネット接続と DNS を確認して、もう一度お試しください。',
+        'download_timeout' => 'ダウンロードが許容時間を超えたため中止されました。サーバーからホストへの接続が遅すぎるか、途中で切断されています。サーバーのインターネット接続を確認して、もう一度お試しください。',
+        'download_http_error' => 'ホストがファイルではなくエラーを返しました。メンテナンス中か、ファイルが移動された可能性があります。数分後にもう一度お試しください。それでも失敗する場合は、サーバーからダウンロード先のアドレスが開けるか確認してください。',
+        'download_tls' => 'ホストとの安全な接続を確立できなかったため、何もダウンロードされませんでした。サーバーの日付と時刻、および CA 証明書（ca-certificates）がインストールされているかを確認して、もう一度お試しください。',
+        'download_interrupted' => 'ダウンロードの途中で接続が切れたため、ファイルが不完全です。もう一度お試しください。繰り返し発生する場合は、サーバーのネットワーク接続を確認してください。',
+        'archive_invalid' => 'ダウンロードしたファイルを展開できませんでした。ファイルが不完全か、想定したアーカイブではありません（プロキシやファイアウォールがエラーページに差し替えることがあります）。もう一度お試しください。それでも失敗する場合は、サーバーのプロキシとファイアウォールの設定を確認してください。',
+
+        'release_not_found' => 'リリース一覧には届きましたが、このサーバーにインストールできるバージョンがありませんでした。PHP のバージョンを確認するか、後でもう一度お試しください。',
+
+        'verify_http' => 'デプロイ後、アプリケーションはページではなくサーバーエラー（HTTP 5xx）を返しました。ログを確認してください。正確なステータスはデプロイログにあります。',
+        'container_port_missing' => 'このサイトにはコンテナポートが設定されていないため、パネルはコンテナ内のどのポートへプロキシすればよいか判断できません。「コンテナのポート」にアプリケーションが待ち受けるポートを設定して保存してください。',
+        'attached_database_engine_mismatch' => 'このアプリケーションにはすでにデータベースが関連付けられていますが、このアプリケーションが使用できないエンジン上で動作しています。関連付けを解除するか、対応するエンジン上のデータベースを関連付けてから再試行してください。',
+        'serving_error' => 'アプリケーションは起動しましたが、すべてのリクエストにエラーを返します。アセットが完全にビルドされていない可能性が高いため、アプリケーションログを確認してください。',
+        'not_answering' => 'アプリケーションは起動しましたが、リクエストに一度も応答しませんでした。待ち受けていない理由をアプリケーションログで確認してください。',
+        'owner_not_created' => 'アプリケーションは起動しましたが、管理者を確認できませんでした。管理者が存在しない間は、アプリケーションを開いた人なら誰でも管理者を作成できるため、アプリケーションは引き渡されていません。もう一度お試しください。失敗が続く場合はアプリケーションのログを確認してください。',
+        'claim_refused' => 'アプリケーションは起動しましたが、パネルが作成しようとした管理者を拒否したため、アプリケーションに所有者がいません。原因はたいていメールアドレスです。Chatwoot は使い捨てドメインやサンプル用ドメインを拒否し、test.com もそのひとつです。実在するアドレスを使ってください。アプリケーションは理由をログに残さないため、ログを見ても何も見つかりません。アプリケーションを削除し、別のアドレスで作り直してください。',
+        'app_not_ready' => 'アプリケーションは起動しましたが、2 分以内に起動処理が完了しなかったため、管理者を作成できませんでした。アプリケーションのログを確認してから、もう一度お試しください。',
+        'out_of_memory' => 'このステップ中にサーバーのメモリが不足し、システムによって停止されました。メモリを解放するか、スワップを追加してから再試行してください。',
+        'no_build_tools' => 'このステップではネイティブモジュールのコンパイルが必要でしたが、このサーバーにはコンパイラがインストールされていません。セットアップ画面からビルドツールをインストールして、もう一度お試しください。別の Node バージョンを選ぶことも有効な場合がありますが、ビルド済みバイナリを用意しているかは各パッケージ次第のため、それだけでは確実な解決策ではありません。',
+        'composer_platform' => 'このアプリケーションに設定されたPHPバージョンでは、Composerがこのアプリケーションの依存関係をインストールできませんでした。アプリケーションのPHPバージョン、または必要な拡張機能が、プロジェクトの要件を満たしていません。プロジェクトが対応しているPHPバージョンに変更するか、不足している拡張機能をインストールしてから、再度デプロイしてください。',
+        'registry_auth' => 'レジストリに拒否されたため、Docker はこのイメージを取得できませんでした。イメージ名かタグが間違っているか、イメージが非公開です — Docker はどちらも同じように報告するため、まず参照を確認してください。イメージが非公開の場合、パネルはまだレジストリにサインインできないため、公開されているイメージしか実行できません。',
+        'registry_credentials_rejected' => 'このアプリケーションがイメージ取得に使う認証情報が、レジストリに拒否されました。トークンの期限切れか失効が最も可能性の高い原因です — Docker ページで入れ替えてから再デプロイしてください。イメージ参照自体は正しく、レジストリは応答した上でこのユーザー名とトークンを受け付けなかっただけです。',
+        'container_restarting' => 'コンテナが起動と停止を繰り返しているため、アプリケーションを配信できません。コンテナ自身のログを確認してください — 多くの場合、すぐに終了するコマンドや entrypoint、不足している環境変数、あるいはイメージが読めなかった設定ファイルが原因です。',
+        'script_git_auth' => 'デプロイスクリプトがリポジトリへのログインが必要な git コマンド（通常は git pull）を実行していますが、スクリプトには認証情報がないため、プライベートリポジトリでは失敗します。この行は不要です。スクリプトの実行前に、パネルが接続済みアカウントで最新のコードをすでに取得しています。デプロイスクリプトからその行を削除して、もう一度デプロイしてください。',
+        'script_php_missing' => 'デプロイスクリプトで、このサーバーにインストールされていない PHP バージョンの {PHPxx} 変数を使っています。PHP 画面でそのバージョンをインストールするか、アプリケーション自身のバージョンには {php} を使ってから、もう一度デプロイしてください。',
+        'composer_dependencies_missing' => 'このプロジェクトにはComposerの依存関係が必要ですが、何もインストールされていません。そのためアプリケーションにvendor/autoload.phpが存在せず、すべてのリクエストが失敗します。デプロイスクリプトにcomposer installを実行する手順を追加してから、再度デプロイしてください。',
+        'process_exited' => 'アプリケーションは起動されましたが、プロセスがすぐに停止したため実行されていません。理由はアプリケーションのログで確認できます。多くの場合、パッケージが不足している（デプロイで依存関係がインストールされていない）か、起動コマンドが存在しません。',
+        'container_exited' => 'コンテナが起動直後に停止したため、サイトを配信できません。理由はコンテナ自身のログに記録されています。',
+        'container_port_mismatch' => 'このサイトの転送先のコンテナポートで何も応答せず、イメージは別のポートで待ち受けています。コンテナポートをイメージが宣言しているポートに変更して、再度デプロイしてください。',
+        'container_not_answering' => 'コンテナは動作していますが、そのポートで何も応答しませんでした。ログと、コンテナポートがアプリケーションの待ち受けポートと一致しているかを確認してください。',
+        'container_unhealthy' => 'コンテナは動作していますが、イメージ自身のヘルスチェックが正常に動作していないと報告しています。理由はコンテナのログと、ここに表示されるヘルスチェックの出力で確認できます。',
+        'compose_port_taken' => 'この compose ファイルは、このサーバーの別のアプリケーションがすでに使用しているホストポートを公開しているため、ここでは起動できません。compose ファイルで別のホストポートを公開して、再デプロイしてください。',
+        'container_port_in_use' => 'このサーバーで何かが、コンテナが公開するホストポートのいずれかをすでに使用しているため、コンテナを起動できませんでした。compose ファイルで別のホストポートを公開して、もう一度デプロイしてください。',
+    ],
+
+    // DS-03: why a container site's last deploy failed, with its values.
+    'container_failure' => [
+        'container_restarting' => 'コンテナが再起動を繰り返しています。',
+        'container_exited' => 'コンテナが起動直後に停止しました。',
+        'container_port_mismatch' => 'コンテナポート :port で何も応答しません — イメージは :image_ports で待ち受けています。コンテナポートを :image_ports にして再度デプロイしてください。',
+        'container_not_answering' => 'コンテナポート :port で :seconds 秒以内に応答がありませんでした。',
+        // DS-09: a pasted compose file has no single container port to name.
+        'container_not_answering_no_port' => 'このサイトのポートで :seconds 秒以内に応答がありませんでした。',
+        // DS-14: the image's own HEALTHCHECK failed.
+        'container_unhealthy' => 'Docker はこのコンテナを unhealthy と報告しています。イメージ自身のヘルスチェックが失敗しています。',
+        'health_check' => 'ヘルスチェックの出力: :output',
+        'last_line' => 'ログの最終行: :line',
+    ],
+
+    // DS-03: creating a site from a Docker image.
+    'docker_create' => [
+        'port_required' => 'このイメージは待ち受けポートを宣言していません。コンテナポート(コンテナ内でアプリケーションが待ち受けるポート)を入力してください。',
+        'image_not_found' => 'このイメージが見つからないため、ポートを読み取れません。名前とタグを確認するか、コンテナポートを手動で入力してください。',
+        'image_unreadable' => 'レジストリに接続できず、このイメージのポートを読み取れませんでした。コンテナポートを手動で入力してください。',
+        'port_mismatch' => 'イメージは :port ではなく :image_ports で待ち受けています。アプリケーションが実際に :port で待ち受けない限り、サイトは応答しません。',
+        'env_key_invalid' => '英字・数字・アンダースコアのみ使用でき、数字で始めることはできません。',
+        'env_key_duplicate' => '変数 :key が2回設定されています。',
+        'env_required' => 'このイメージは :keys がないと起動しません。サイトを作成する前に、それぞれに値を入力してください。',
+    ],
+
+    'port_free' => 'ポート :port は空いています。',
+
+    'rendering' => [
+        'php' => 'PHP アプリケーション (Laravel、Symfony、素の PHP)',
+        'ssr' => 'サーバーサイドレンダリング（プロセスを実行）',
+        'csr' => 'クライアントサイドレンダリング（ファイルにビルド）',
+        'static' => '静的アプリケーション（ファイルにビルド）',
+    ],
+
+    'package_manager' => [
+        'npm' => 'npm',
+        'yarn' => 'Yarn',
+        'pnpm' => 'pnpm',
+        'bun' => 'Bun',
+    ],
+
+    'supervisor_installing' => 'ワーカーの実行基盤である supervisor をインストールしています。少し時間がかかります。完了したらワーカーを作成し直してください。',
+
+    'placeholder_page' => [
+        'lede' => 'このアプリケーションは稼働中です。このページをご自身のものに置き換えてください。それまでは、すべての訪問者にこの画面が表示されます。',
+        'php_running' => 'このアプリケーションで PHP が動作しています',
+        'step_files_title' => 'ファイルをアップロード',
+        'step_files_body' => 'パネルのファイルマネージャーを使うか、このアプリケーションのシステムユーザーで SFTP 接続してください。',
+        'step_deploy_title' => 'または git からデプロイ',
+        'step_deploy_body' => 'アプリケーションをリポジトリに接続すると、プッシュのたびにパネルが取得してビルドします。',
+        'foot' => 'コントロールパネルが作成したプレースホルダーページです。',
+    ],
+
+    'supervisor_mode' => [
+        'systemd' => 'systemd ユニット',
+        'pm2' => 'PM2（引き継ぎ）',
+    ],
+
+    'disabled_page' => [
+        'title' => 'アプリケーションを利用できません',
+        'heading' => 'このアプリケーションは一時的に利用できません',
+        'lede' => '所有者によってオフラインにされています。しばらくしてからもう一度お試しください。',
+        'foot' => 'コントロールパネルによる配信です。',
+    ],
+
+    // A deploy that failed after its checkout left the new code live.
+    // See Application::codeOnDisk().
+    'code_on_disk' => [
+        'incomplete' => '最後のデプロイは新しいコードを配置した後に失敗しました。そのため、アプリケーションは完全にはデプロイされていないコミット :commit で動作しています。問題を修正して再度デプロイしてください。',
+    ],
+
+    // A delivery for a site whose deploy-on-push is switched off. See
+    // ApplicationWebhookController::receive().
+    'webhook_delivery' => [
+        'disabled' => 'このアプリケーションではパネルでプッシュ時のデプロイがオフになっているため、何もデプロイされませんでした。パネルで再度オンにするか、この Webhook を削除してください。',
+    ],
+
+    // Why deploy-on-push still needs the webhook added by hand. See
+    // WebhookRegistrar.
+    'webhook_registration' => [
+        'no_account' => 'このアプリケーションは接続済みの Git アカウントではなく公開 URL からデプロイされるため、パネルが Webhook を追加できません。下の URL とシークレットを使ってリポジトリ設定で追加してください。',
+        'signing_token' => 'GitLab の署名トークンは GitLab 自身が作成するため、パネルはこの Webhook を追加できません。下の URL とご自身の署名トークンを使って、リポジトリの Webhooks 設定で追加してください。',
+        'not_public' => 'パネルのアドレスがインターネットから到達できないため、GitHub、GitLab、Bitbucket は配信できません。パネルに公開アドレスを設定するか、その後で Webhook を手動で追加してください。',
+        'provider_refused' => 'Git プロバイダーがパネルによる Webhook の追加を許可しませんでした。接続中のトークンにこのリポジトリの Webhook を管理する権限がない可能性があります。下の URL とシークレットで手動で追加するか、その権限でアカウントを再接続してください。',
+        'removal_refused' => 'プッシュ時のデプロイはオフになりましたが、Git プロバイダーがパネルによる Webhook の削除を許可しませんでした。接続中のトークンに Webhook を削除する権限がない可能性があります。リポジトリの設定で Webhook を削除するまで、プッシュは送信され続け、拒否されます。',
+    ],
+
+    // OLD-20: what became of the site's system user when asked to remove it.
+    'system_user_removal' => [
+        'removed' => 'システムユーザー :username も削除しました。',
+        'still_used' => 'システムユーザー :username は残しました。ほかのアプリケーションをまだ所有しています。',
+        'has_processes' => 'システムユーザー :username は残しました。まだサインイン中か、何かを実行中です。終了後にシステムユーザーから削除してください。',
+        'failed' => 'システムユーザー :username を削除できませんでした。システムユーザーから削除してください。',
+    ],
+];

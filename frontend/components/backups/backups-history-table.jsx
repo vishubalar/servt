@@ -1,0 +1,448 @@
+import { useState } from "react";
+import Link from "@/components/ui/app-link";
+import { useFormatter, useTranslations } from "next-intl";
+import { CopyButton } from "@/components/ui/copy-button";
+import { CircleAlert, History, RotateCw, Trash2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { formatBytes } from "@/lib/format/bytes";
+import { apiDuration } from "@/lib/format/api-date";
+import { backupFailureText } from "@/lib/backups/reason";
+import { BACKUP_IN_FLIGHT, backupHasArchive } from "@/lib/schemas/backup";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { BackupStatusBadge, SafetyBadge } from "@/components/backups/backup-status-badge";
+import { Badge } from "@/components/ui/badge";
+import { DownloadBackupButton } from "@/components/backups/download-backup-button";
+import { DeleteBackupsDialog } from "@/components/backups/delete-backups-dialog";
+import { Checkbox } from "@/components/ui/checkbox";
+import { ActionIcon } from "@/components/ui/action-icon";
+import { restoreBlocker } from "@/lib/backups/restore-blocker";
+import { backupTypeLabel } from "@/lib/backups/type-label";
+import { backupSubject } from "@/lib/backups/backup-subject";
+import { HoverHint } from "@/components/ui/hover-hint";
+
+function SiteCell({ row }) {
+  const t = useTranslations("backups.history");
+  const backup = row.original;
+  const subject = backupSubject(backup);
+  const name = subject.name ?? t("unknownApplication");
+
+  return (
+    <div className="min-w-0">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        {subject.href ? (
+          <Link href={subject.href} className="truncate font-medium underline-offset-4 hover:underline">
+            {name}
+          </Link>
+        ) : (
+          <span className="truncate font-medium">{name}</span>
+        )}
+        {backup.is_safety ? <SafetyBadge /> : null}
+        {subject.archived ? <ArchivedBadge /> : null}
+      </div>
+      <p className="truncate text-xs text-muted-foreground">{subjectLine(subject, t)}</p>
+    </div>
+  );
+}
+
+export function subjectLine(subject, t) {
+  if (subject.kind === "database") return subject.archived ? t("subject.databaseDeleted") : t("subject.database");
+  return subject.archived ? t("subject.applicationDeleted") : (subject.domain ?? "");
+}
+
+export function ArchivedBadge() {
+  const t = useTranslations("backups.history");
+  return (
+    <Badge variant="muted" className="font-normal">
+      {t("archived")}
+    </Badge>
+  );
+}
+
+function StatusCell({ row, table }) {
+  const t = useTranslations("backups.history");
+  const backup = row.original;
+  const reason =
+    backup.status === "failed"
+      ? backupFailureText(backup, t("unknownReason"))
+      : null;
+
+  const width = "w-32 max-w-32";
+
+  return (
+    <div className={cn(width, "min-w-0 space-y-1")}>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <BackupStatusBadge backup={backup} />
+        {backup.is_safety && !table.options.meta?.showSite ? <SafetyBadge /> : null}
+      </div>
+      {reason ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <p
+              tabIndex={0}
+              className="line-clamp-2 whitespace-normal break-words text-xs leading-4 text-muted-foreground"
+            >
+              {reason}
+            </p>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-80 whitespace-normal">
+            {reason}
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
+    </div>
+  );
+}
+
+function TypeCell({ row }) {
+  const t = useTranslations("backups.history");
+  return (
+    <span className="text-sm">{backupTypeLabel(row.original, t)}</span>
+  );
+}
+
+function uidFragment(uid) {
+  const text = String(uid);
+  return text.length > 8 ? `${text.slice(0, 8)}…` : text;
+}
+
+function DestinationCell({ row }) {
+  const t = useTranslations("backups.history");
+  const { storage_destination_name: name, uid } = row.original;
+  if (!name) return <span className="text-sm text-muted-foreground">—</span>;
+  return (
+    <span className="flex min-w-0 flex-col gap-0.5">
+      <HoverHint content={name}><span className="truncate text-sm">
+        {name}
+      </span></HoverHint>
+      {uid && backupHasArchive(row.original.status) ? (
+        <span className="flex min-w-0 items-center gap-0.5">
+          <HoverHint content={uid}><span className="truncate font-mono text-xs text-muted-foreground">
+            {uidFragment(uid)}
+          </span></HoverHint>
+          <CopyButton value={uid} label={t("copyUid")} className="size-6 shrink-0" />
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+function WhenCell({ row }) {
+  const t = useTranslations("backups.history");
+  const format = useFormatter();
+  const backup = row.original;
+  const duration = apiDuration(backup.started_at, backup.finished_at);
+
+  return (
+    <div className="min-w-0">
+      <p className="truncate text-sm tabular-nums">{backup.created_at_human ?? backup.created_at}</p>
+      <p className="truncate text-xs tabular-nums text-muted-foreground">
+        {duration}
+        <span className="hidden @max-[1000px]/history:inline">
+          {duration ? " · " : null}
+          {sizeText(backup, t, format)}
+        </span>
+      </p>
+    </div>
+  );
+}
+
+function SizeCell({ row }) {
+  const t = useTranslations("backups.history");
+  const format = useFormatter();
+  const { size_bytes: size } = row.original;
+
+  const progress = uploadProgress(row.original, t, format);
+
+  return (
+    <span className="text-sm tabular-nums text-muted-foreground">
+      {size ? formatBytes(size, format) : (progress ?? sizeNote(row.original, t))}
+    </span>
+  );
+}
+
+function sizeText(backup, t, format) {
+  return backup.size_bytes
+    ? formatBytes(backup.size_bytes, format)
+    : (uploadProgress(backup, t, format) ?? sizeNote(backup, t));
+}
+
+export function uploadProgress(backup, t, format) {
+  const done = backup.bytes_transferred;
+
+  if (!BACKUP_IN_FLIGHT.includes(backup.status) || !done) return null;
+
+  const total = backup.bytes_total;
+
+  if (!total) return t("uploadProgressBare", { done: formatBytes(done, format) });
+
+  return t("uploadProgress", {
+    done: formatBytes(done, format),
+    total: formatBytes(total, format),
+  });
+}
+
+export function sizeNote(backup, t) {
+  if (BACKUP_IN_FLIGHT.includes(backup.status)) return t("sizePending");
+  if (backup.status === "failed") return t("sizeNone");
+  return t("sizeUnknown");
+}
+
+// Retry creates a NEW row, same as Back up now.
+function ActionsCell({ row, table }) {
+  const t = useTranslations("backups.history");
+  const tr = useTranslations("backups.restore");
+  const {
+    canRestore,
+    canRun,
+    canClear,
+    onRestore,
+    onRetry,
+    onClear,
+    busyId,
+    restoreInFlight,
+    retryBlockedFor,
+    retryable,
+    canDownload = canRestore,
+    showRestore = true,
+  } = table.options.meta;
+  const backup = row.original;
+
+  const download = <DownloadBackupButton backup={backup} canDownload={canDownload} />;
+  const retryBlocked = retryBlockedFor?.(backup) ?? null;
+
+  if (["pending", "running"].includes(backup.status)) {
+    return (
+      <div className="flex items-center justify-end gap-2">
+        {download}
+        {canClear && backup.clearable ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="min-w-28"
+            disabled={busyId === backup.id}
+            onClick={() => onClear?.(backup)}
+          >
+            <ActionIcon icon={CircleAlert} pending={busyId === backup.id} className="size-4" />
+            {t("clear.action")}
+          </Button>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (backup.status === "failed") {
+    return (
+      <div className="flex items-center justify-end gap-2">
+        {download}
+        {canRun && (retryable?.(backup) ?? true) ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="min-w-28"
+            disabled={busyId === backup.id || Boolean(retryBlocked)}
+            disabledReason={retryBlocked}
+            onClick={() => onRetry(backup)}
+          >
+            <ActionIcon icon={RotateCw} pending={busyId === backup.id} className="size-4" />
+            {t("retry")}
+          </Button>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (!showRestore) return <div className="flex items-center justify-end gap-2">{download}</div>;
+
+  const blocker = canRestore
+    ? restoreBlocker(backup, tr, restoreInFlight, table.options.meta?.subject === "database")
+    : DENIED;
+
+  return (
+    <div className="flex items-center justify-end gap-2">
+      {download}
+      <ReasonTooltip reason={blocker}>
+        <Button
+          size="sm"
+          variant="destructive"
+          className="min-w-28"
+          disabled={Boolean(blocker)}
+          onClick={() => onRestore(backup)}
+        >
+          <History className="size-4" />
+          {t("restoreShort")}
+        </Button>
+      </ReasonTooltip>
+    </div>
+  );
+}
+
+function SelectHeaderCell({ table }) {
+  const t = useTranslations("backups.history");
+  const all = table.getIsAllRowsSelected();
+
+  return (
+    <Checkbox
+      checked={all || (table.getIsSomeRowsSelected() ? "indeterminate" : false)}
+      onCheckedChange={(value) => table.toggleAllRowsSelected(!!value)}
+      aria-label={t("delete.selectAll")}
+    />
+  );
+}
+
+function SelectCell({ row }) {
+  const t = useTranslations("backups.history");
+
+  return (
+    <Checkbox
+      checked={row.getIsSelected()}
+      onCheckedChange={(value) => row.toggleSelected(!!value)}
+      aria-label={t("delete.selectRow")}
+    />
+  );
+}
+
+export function BackupsHistoryTable({
+  backups,
+  canRestore,
+  restoreInFlight,
+  canRun,
+  onRestore,
+  onRetry,
+  onClear,
+  busyId,
+  retryBlockedFor = null,
+  retryable = null,
+  showSite = true,
+  siteHeader,
+  subject = "application",
+  canDownload,
+  showRestore = true,
+  emptyMessage,
+  emptyIcon,
+  bare = false,
+  canDelete = false,
+  canClear = false,
+  onDeleted,
+}) {
+  const t = useTranslations("backups.history");
+  const [selection, setSelection] = useState({});
+
+  // Keyed by id so a reorder can't change which rows get deleted.
+  const selected = backups.filter((backup) => selection[String(backup.id)]);
+  const [confirming, setConfirming] = useState(false);
+  const showDestination = backups.some(
+    (backup) => backup.storage_destination_name !== undefined,
+  );
+
+  const columns = [
+    canDelete
+      ? {
+          id: "select",
+          header: SelectHeaderCell,
+          meta: { className: "w-10" },
+          cell: SelectCell,
+        }
+      : null,
+    showSite
+      ? {
+          accessorKey: "application_name",
+          header: siteHeader ?? t("columns.site"),
+          meta: { className: showDestination ? "w-[24%]" : "w-[30%]" },
+          cell: SiteCell,
+        }
+      : null,
+    { accessorKey: "status", header: t("columns.status"), meta: { className: showSite ? "w-[17%]" : "w-[22%]" }, cell: StatusCell },
+    { id: "type", header: t("columns.type"), meta: { className: "w-[16%] whitespace-nowrap" }, cell: TypeCell },
+    showDestination
+      ? {
+          id: "destination",
+          header: t("columns.destination"),
+          meta: { className: cn("max-w-40", showSite && "hidden 2xl:table-cell") },
+          cell: DestinationCell,
+        }
+      : null,
+    { id: "when", header: t("columns.when"), meta: { className: "w-[13%] whitespace-nowrap" }, cell: WhenCell },
+    {
+      id: "size",
+      header: () => <span className="block text-right">{t("columns.size")}</span>,
+      meta: { className: "w-[10%] text-right whitespace-nowrap @max-[1000px]/history:hidden" },
+      cell: SizeCell,
+    },
+    {
+      id: "actions",
+      header: () => <span className="sr-only">{t("columns.actions")}</span>,
+      meta: { className: "w-48 text-right" },
+      cell: ActionsCell,
+    },
+  ].filter(Boolean);
+
+  return (
+    <>
+      {canDelete && selected.length > 0 ? (
+        <div
+          className={cn(
+            "flex flex-wrap items-center justify-between gap-3 bg-muted/40",
+            bare
+              ? "border-b px-5 py-3"
+              : "mb-3 rounded-lg border px-4 py-2.5",
+          )}
+        >
+          <span className="text-sm">{t("delete.selectedCount", { count: selected.length })}</span>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setSelection({})}>
+              {t("delete.clearSelection")}
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => setConfirming(true)}>
+              <Trash2 className="size-4" />
+              {t("delete.action")}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      <DataTable
+        columns={columns}
+        data={backups}
+        emptyMessage={emptyMessage ?? t("empty.title")}
+        emptyIcon={emptyIcon}
+        bare={bare}
+        meta={{
+          canRestore,
+          canRun,
+          canClear,
+          onRestore,
+          onRetry,
+          onClear,
+          busyId,
+          restoreInFlight,
+          retryBlockedFor,
+          retryable,
+          showSite,
+          subject,
+          canDownload: canDownload ?? canRestore,
+          showRestore,
+        }}
+        {...(canDelete
+          ? {
+              rowSelection: selection,
+              onRowSelectionChange: setSelection,
+              rowId: (backup) => String(backup.id),
+            }
+          : null)}
+      />
+
+      <DeleteBackupsDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        backups={selected}
+        onDeleted={(ids, failedIds = []) => {
+          setSelection(Object.fromEntries(failedIds.map((id) => [String(id), true])));
+          onDeleted?.(ids);
+        }}
+      />
+    </>
+  );
+}

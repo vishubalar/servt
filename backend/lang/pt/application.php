@@ -1,0 +1,369 @@
+<?php
+
+return [
+    // What a name attached to an application does. Shown as the badge
+    // beside each domain, so it has to read as a noun, not a sentence.
+    'domain_type' => [
+        'primary' => 'Principal',
+        'alias' => 'Alias',
+        'redirect' => 'Redirecionamento',
+    ],
+
+    'types' => [
+        'docker' => ['title' => 'Contentor Docker', 'tagline' => 'Qualquer imagem, de qualquer registo, servida através do nginx.'],
+        'wordpress' => ['title' => 'WordPress', 'tagline' => 'Criador de blogs e sites'],
+        'phpmyadmin' => ['title' => 'phpMyAdmin', 'tagline' => 'Faça a gestão das suas bases de dados no navegador'],
+        'adminer' => ['title' => 'Adminer', 'tagline' => 'Gerencie bancos de dados MySQL, MariaDB e PostgreSQL no navegador'],
+        'uptimekuma' => ['title' => 'Uptime Kuma', 'tagline' => 'Monitorização de disponibilidade e páginas de estado'],
+        'n8n' => ['title' => 'n8n', 'tagline' => 'Automação de fluxos de trabalho (licença fair-code)'],
+        'nodered' => ['title' => 'Node-RED', 'tagline' => 'Ligue dispositivos, APIs e serviços'],
+        'nodebb' => ['title' => 'NodeBB', 'tagline' => 'Software de fóruns — precisa de MongoDB ou PostgreSQL'],
+        'nextcloud' => ['title' => 'Nextcloud', 'tagline' => 'Sincronização e partilha de ficheiros privados'],
+        'joomla' => ['title' => 'Joomla', 'tagline' => 'Sistema flexível de gestão de conteúdos'],
+        'moodle' => ['title' => 'Moodle', 'tagline' => 'Cursos e aprendizagem online'],
+        'mautic' => ['title' => 'Mautic', 'tagline' => 'Automação de marketing e campanhas'],
+        'craftcms' => ['title' => 'Craft CMS', 'tagline' => 'Gestão de conteúdos para programadores'],
+        'akaunting' => ['title' => 'Akaunting', 'tagline' => 'Contabilidade e faturação'],
+        'statamic' => ['title' => 'Statamic', 'tagline' => 'CMS de ficheiros — sem base de dados'],
+        'prestashop' => ['title' => 'PrestaShop', 'tagline' => 'Loja online e comércio eletrónico'],
+        'git' => ['title' => 'De um repositório Git', 'tagline' => 'Implante seu próprio código do GitHub, GitLab ou Bitbucket'],
+        'php' => ['title' => 'Aplicação PHP vazia', 'tagline' => 'Uma aplicação vazia — envie seus próprios arquivos'],
+        'static' => ['title' => 'Aplicação estática', 'tagline' => 'HTML, CSS e JavaScript simples'],
+    ],
+
+    'status' => [
+        'pending' => 'Ainda não implantado',
+        'provisioning' => 'Configurando…',
+        'active' => 'Em execução',
+        'failed' => 'Falha na configuração',
+    ],
+
+    'unavailable' => [
+        'deprecated' => 'Esta aplicação de um clique foi descontinuada. Os sites existentes continuam a funcionar, mas não é possível criar novos.',
+        'stack' => 'Este servidor executa apenas contentores, pelo que não aloja este tipo de aplicação.',
+        'stack_profile' => 'Este servidor não está preparado para alojar este tipo de aplicação.',
+        'profile' => 'Este servidor não serve aplicações :profile, por isso este tipo de renderização não pode ser usado aqui. Escolha um que este servidor sirva.',
+        'database' => 'Esta aplicação precisa de :engines, que este servidor não tem.',
+        'database_version' => ':type precisa de :engine :minimum ou mais recente, e este servidor tem :engine :version. Atualize-o ou use um servidor com um :engine mais recente.',
+        'php' => 'Este servidor não tem PHP instalado.',
+        'php_version_install' => 'Este servidor não tem nenhuma versão do PHP em que :type funcione (:range). Instale primeiro o PHP :version na tela de PHP.',
+        'php_version_none' => 'Este servidor não tem nenhuma versão do PHP em que :type funcione (:range), e nenhuma dessas versões pode ser instalada a partir do repositório de pacotes do servidor.',
+        'node' => 'Este servidor não tem Node.js instalado.',
+        'web_server' => 'Esta aplicação ainda não está disponível em servidores :web_server.',
+    ],
+
+    'git_source' => [
+        'account' => 'De uma conta conectada',
+        'public_url' => 'Colar a URL de um repositório público',
+    ],
+
+    'fields' => [
+        'memory_limit' => 'Limite de memória',
+        'cpu_limit' => 'Limite de CPU',
+        'compose' => 'Ficheiro compose',
+        'image' => 'Imagem',
+        'registry_id' => 'Registo',
+        'container_port' => 'Porta do contentor',
+        'docker_network' => 'Rede',
+        'docker_mode' => 'Como executar',
+        'docker_network_new' => 'Nova rede',
+        'volume_new' => 'Novo volume',
+        'volume_path' => 'Caminho do volume',
+        'database_engine' => 'Mecanismo de banco de dados',
+        'company_name' => 'Nome da empresa',
+        'company_email' => 'E-mail da empresa',
+        'locale' => 'Localidade',
+        'site_name' => 'Nome da aplicação',
+        'language' => 'Idioma',
+        'admin_name' => 'Nome do administrador',
+        'admin_first_name' => 'Nome próprio do administrador',
+        'admin_last_name' => 'Apelido do administrador',
+        'short_name' => 'Nome curto',
+        'shop_name' => 'Nome da loja',
+        'country' => 'País',
+        'timezone' => 'Fuso horário',
+        'rendering_type' => 'Tipo de renderização',
+        'name' => 'Nome',
+        'domain' => 'Domínio',
+        'system_user_id' => 'Usuário do sistema',
+        'php_version' => 'Versão do PHP',
+        'node_version' => 'Versão do Node.js',
+        'app_port' => 'Porta do aplicativo',
+        'web_root' => 'Raiz web',
+        'build_command' => 'Comando de build',
+        'deploy_script' => 'Script de implantação',
+        'start_command' => 'Comando de início',
+        'package_manager' => 'Gestor de pacotes',
+        'git_source' => 'Origem',
+        'git_account_id' => 'Conta do Git',
+        'repository' => 'Repositório',
+        'repository_url' => 'URL do repositório',
+        'branch' => 'Branch',
+        'site_title' => 'Título da aplicação',
+        'admin_user' => 'Usuário administrador',
+        'admin_username' => 'Utilizador administrador',
+        'admin_email' => 'E-mail do administrador',
+        'admin_password' => 'Senha do administrador',
+        'site_language' => 'Idioma da aplicação',
+        'table_prefix' => 'Prefixo das tabelas',
+        'mailer_name' => 'Nome do remetente',
+        'mailer_email' => 'Endereço do remetente',
+        'mailer_host' => 'Servidor SMTP',
+        'mailer_port' => 'Porta SMTP',
+        'mailer_username' => 'Utilizador SMTP',
+        'mailer_password' => 'Palavra-passe SMTP',
+    ],
+
+    /*
+    | Example values, shown as ghost text in an empty field.
+    |
+    | A placeholder is NOT a default: it is never submitted. Anything with a
+    | correct value the panel can pick lives in the field's `default` instead,
+    | which the form pre-fills and the request carries — a table prefix is a
+    | default, an email address is a placeholder. Getting that backwards ships
+    | a form that looks filled in and posts null.
+    |
+    | Keyed by field name, not by site type, so one entry serves every type
+    | declaring that field — the same arrangement as `fields` and `help`.
+    | Localized because these are read by a person: an example is only an
+    | example if it is in a language they read.
+    */
+    'placeholders' => [
+        'cpu_limit' => 'Sem limite',
+        'mailer_host' => 'smtp.exemplo.pt',
+        'mailer_port' => '587',
+        'site_title' => 'A minha aplicação',
+        'site_name' => 'A minha aplicação',
+        'shop_name' => 'A minha loja',
+        'company_name' => 'A minha empresa',
+        'short_name' => 'omeusite',
+        'mailer_name' => 'A minha aplicação',
+        'admin_email' => 'voce@exemplo.pt',
+        'company_email' => 'voce@exemplo.pt',
+        'mailer_email' => 'no-reply@exemplo.pt',
+        'mailer_username' => 'no-reply@exemplo.pt',
+        'timezone' => 'Europe/Lisbon',
+        'repository_url' => 'https://github.com/voce/repo.git',
+        'build_command' => 'npm ci && npm run build',
+        'start_command' => 'node server.js',
+    ],
+
+    'options' => [
+        'docker_mode' => [
+            'simple' => 'Simples — uma imagem e uma porta',
+            'compose' => 'Ficheiro compose — escrito por você',
+        ],
+    ],
+
+    'help' => [
+        'memory_limit_app' => 'Opcional. A memória máxima que o contêiner desta aplicação pode usar, por exemplo 512m ou 2g. Um número sem unidade significa bytes para o Docker, não megabytes. Se ficar vazio, recebe :default. Qualquer banco de dados que a aplicação traga tem o seu próprio teto.',
+        'memory_limit_app_floor' => 'Opcional. A memória máxima que o contêiner desta aplicação pode usar. Se ficar vazio, recebe :default, o valor medido de que esta aplicação precisa: abaixo disso pode não iniciar, e falhará como um 502 sem nada que mencione memória. Qualquer banco de dados que a aplicação traga tem o seu próprio teto.',
+        'cpu_limit_app' => 'Opcional. Quantos núcleos de CPU o contêiner desta aplicação pode usar — 1 para um núcleo inteiro, 0.5 para metade. Este servidor tem :cores, e o Docker não inicia um contêiner que peça mais. Se ficar vazio, não há limite de CPU. Passar deste não encerra nada: o contêiner espera, então o sintoma é lentidão e não um erro. Qualquer banco de dados que a aplicação traga não é limitado por ele.',
+        'memory_limit' => 'Opcional. A memória máxima que este contêiner pode usar, por exemplo 512m ou 2g. Um número sem unidade significa bytes para o Docker, não megabytes. Se ficar vazio, recebe o padrão do servidor: :default. É um teto, não uma reserva — nada é separado — e passar dele faz o contêiner ser encerrado e reiniciado.',
+        'cpu_limit' => 'Opcional. Quantos núcleos de CPU este contêiner pode usar — 1 para um núcleo inteiro, 0.5 para metade. Este servidor tem :cores, e o Docker não inicia um contêiner que peça mais. Se ficar vazio, não há limite de CPU algum. Passar deste não encerra nada: o contêiner espera, então o sintoma é lentidão e não um erro.',
+        'compose' => 'Opcional. Cole o seu próprio ficheiro compose e tudo o que o Compose suporta é suportado: vários serviços, volumes nomeados, healthchecks. Deixe vazio e o painel escreve um a partir dos campos acima. As portas têm de ser publicadas em 127.0.0.1 e os bind mounts permanecer dentro do diretório desta aplicação; o resto é recusado com o motivo.',
+        'image' => 'A imagem a executar, com uma etiqueta explícita — `nginx:1.27-alpine`. Um nome sem etiqueta puxa `latest`, o que torna uma implementação não reproduzível e uma reversão sem significado.',
+        'registry_id' => 'Deixe vazio para uma imagem pública — é o caso normal. Para executar uma privada, adicione uma credencial em Integrações → Registos Docker e escolha-a aqui. Aplica-se também a um compose colado, pois qualquer imagem que ele indique pode ser privada.',
+        'container_port' => 'A porta em que a sua aplicação escuta dentro do contentor. O painel atribui a porta no próprio servidor e aponta o nginx para ela.',
+        'docker_network' => 'Junte-se a uma rede Docker para que este contentor e os outros nessa rede se consigam alcançar pelo nome. Deixe vazio para a bridge predefinida do Docker, onde isso não é possível. As redes criam-se na página do Docker.',
+        'docker_mode' => 'Simples pede uma imagem e uma porta, e o painel escreve o ficheiro compose. Ficheiro compose serve para todo o resto — escreve-o você, e o painel continua a impor publicação em loopback, um limite de memória e logs limitados.',
+        'docker_network_new' => 'Deixe o seletor acima vazio e escreva aqui um nome para criar uma rede nova e ligar esta aplicação a ela. É recusado se já existir uma rede com esse nome — nesse caso, escolha-a acima.',
+        'volume_new' => 'Cria um volume com este nome e monta-o na aplicação, para que os dados sobrevivam à reconstrução do contentor. É recusado se já existir um volume com esse nome.',
+        'volume_path' => 'Onde o volume aparece dentro do contentor, por exemplo /var/lib/ghost/content. Não a pasta própria da aplicação — um volume aí esconderia os seus ficheiros.',
+        'table_prefix_random' => 'Deixe vazio e será gerado um prefixo aleatório, mantendo as tabelas separadas caso a base de dados venha a ser partilhada.',
+        'timezone' => 'Fuso horário da aplicação, por ex. America/New_York ou Europe/Lisbon. Ver Definições → Geral → Fuso horário.',
+        'table_prefix_optional' => 'Opcional. Se o limpar, as tabelas são criadas sem qualquer prefixo.',
+        'start_command' => 'O ficheiro de entrada, por exemplo "node server.js". Não "npm start": um gestor de pacotes bifurca o processo real, por isso os sinais de encerramento nunca lhe chegam.',
+        'app_port' => 'Se deixar vazio, o painel escolhe uma porta livre.',
+        'rendering_type' => 'PHP executa o seu código com o PHP do servidor. A renderização no servidor executa a sua app como um processo e faz proxy para ela. A renderização no cliente e a estática são compiladas em ficheiros que o servidor web entrega diretamente — mais rápido e sem nada a manter em execução.',
+        'repository_url' => 'Um repositório público — sem necessidade de conta. Deve ser um endereço https://.',
+        'build_command' => 'Executado após baixar o código, ex.: composer install --no-dev',
+        'deploy_script' => 'É executado após obter o código, como o utilizador da aplicação e na versão de PHP desta aplicação. Deixe vazio para usar o comando de compilação.',
+        'package_manager' => 'O que instala e compila as suas dependências. Preenche o comando de build abaixo — edite livremente depois.',
+    ],
+
+    'steps' => [
+        'create_database' => 'Criando o banco de dados',
+        'download' => 'Baixando a aplicação',
+        'extract' => 'Descompactando os arquivos',
+        'configure' => 'Gravando a configuração',
+        'install_cli' => 'Instalando a ferramenta de instalação',
+        'install_app' => 'Executando o instalador',
+        'init' => 'A configurar o repositório',
+        'fetch' => 'Baixando o código mais recente',
+        'checkout' => 'Mudando para o branch',
+        'seed_env' => 'Preparando o arquivo de ambiente',
+        'build' => 'Executando o comando de build',
+        'write_credential' => 'Preparando o acesso ao git',
+        'ensure_account' => 'A criar a conta do sistema',
+        'create_directory' => 'Criando o diretório',
+        'set_ownership' => 'Definindo o proprietário',
+        'placeholder' => 'Adicionando uma página provisória',
+        'write_config' => 'Gravando a configuração da aplicação',
+        'test_config' => 'Testando a configuração',
+        'reload' => 'Recarregando o servidor web',
+        'write_env' => 'A escrever as variáveis de ambiente',
+        'start_app' => 'Iniciando a aplicação',
+        'write_unit' => 'Preparando o serviço',
+        'restart_app' => 'Reiniciando a aplicação',
+        'harden' => 'Aplicando as configurações de segurança',
+        'trust_domain' => 'Autorizando o domínio',
+        'set_password' => 'Definindo a senha do administrador',
+        'script' => 'A executar o script de implantação',
+        'dependencies' => 'A verificar as dependências',
+        'verify' => 'A verificar se a aplicação responde',
+        'verify_serving' => 'A verificar se a aplicação responde',
+        'create_admin' => 'Criando a conta de administrador',
+        'schedule_cron' => 'Agendando as tarefas em segundo plano',
+        'worker' => 'O processo em segundo plano parou',
+    ],
+    /*
+    | Why provisioning failed, keyed by the `failed_reason` code on the
+    | application. Only set where the exit status genuinely identifies
+    | the cause; most failures carry the step and reference instead.
+    */
+    'site_type_change' => [
+        'git_cannot_change' => 'Esta aplicação é implantada a partir de um repositório git, portanto o seu tipo não pode ser alterado. As telas de Implantações, Workers e arquivo de ambiente existem por causa desse tipo, e removê-las não pararia os workers em segundo plano nem impediria o webhook de implantação de aceitar pushes — apenas retiraria as telas que os gerenciam.',
+        'git_not_a_target' => 'Uma aplicação não pode ser transformada em uma implantação git. Isso exige um repositório, uma branch e um script de implantação sob controle do painel, e isso não pode ser criado a partir dos arquivos já presentes no servidor. Crie uma aplicação git em vez disso.',
+        'unchanged' => 'Esta aplicação já está definida com esse tipo.',
+        'not_suggestable' => 'Esta aplicação não pode ser alterada para esse tipo. Apenas o software que o painel consegue reconhecer no disco pode ser reetiquetado — qualquer outro reivindicaria recursos que a aplicação não teria como usar.',
+        'only_from_generic' => 'Apenas uma aplicação PHP personalizada ou estática pode ser reetiquetada como outro tipo. Esta aplicação já está definida com um tipo específico, e transformar um software noutro não é algo que uma etiqueta possa fazer.',
+        'no_evidence' => 'Nada nesta aplicação parece :type. Envie esse software primeiro e execute Detectar novamente — o painel só altera o tipo de uma aplicação quando consegue ver esse software no diretório da própria aplicação.',
+    ],
+
+    'failure_reason' => [
+
+        'git_repository_unreachable' => 'O painel não conseguiu obter o repositório. Ele não existe, ou é privado e a conta git deste site não o consegue ler (um site com URL pública não tem conta). Verifique o endereço do repositório e a conta, e faça o deploy de novo.',
+
+        'git_branch_missing' => 'O branch que este site publica não existe no repositório. Escolha um branch existente nas definições de deploy e faça o deploy de novo.',
+
+        'download_unreachable' => 'A transferência não aconteceu: o servidor não conseguiu chegar ao anfitrião de onde transfere. Verifique o acesso à Internet e o DNS do servidor e tente novamente.',
+        'download_timeout' => 'A transferência demorou mais do que o tempo permitido e foi interrompida. A ligação do servidor ao anfitrião é demasiado lenta ou está a ser cortada. Verifique o acesso à Internet do servidor e tente novamente.',
+        'download_http_error' => 'O anfitrião respondeu à transferência com um erro em vez do ficheiro: pode estar em manutenção ou o ficheiro pode ter sido movido. Tente novamente dentro de alguns minutos; se continuar a falhar, verifique, a partir do servidor, se o endereço de transferência abre.',
+        'download_tls' => 'Não foi possível estabelecer uma ligação segura ao anfitrião, pelo que nada foi transferido. Verifique a data e a hora do servidor e se os certificados de CA estão instalados (ca-certificates) e tente novamente.',
+        'download_interrupted' => 'A ligação foi cortada a meio da transferência e o ficheiro ficou incompleto. Tente novamente; se voltar a acontecer, verifique a ligação de rede do servidor.',
+        'archive_invalid' => 'Não foi possível descompactar o ficheiro transferido: está incompleto ou não é o arquivo esperado (um proxy ou uma firewall pode substituí-lo por uma página de erro). Tente novamente; se continuar a falhar, verifique as definições de proxy e de firewall do servidor.',
+
+        'release_not_found' => 'A lista de versões foi alcançada, mas não tem nenhuma versão que este servidor possa instalar. Verifique a versão do PHP ou tente mais tarde.',
+
+        'verify_http' => 'Após a implementação, a aplicação respondeu com um erro de servidor (HTTP 5xx) em vez de uma página. Verifique o registo — o registo da implementação tem o estado exato.',
+        'container_port_missing' => 'Este site não tem porta do contentor, por isso o painel não sabe para que porta dentro do contentor encaminhar. Defina em Porta do contentor a porta em que a aplicação escuta e guarde.',
+        'attached_database_engine_mismatch' => 'Esta aplicação já tem uma base de dados associada, mas funciona num motor que esta aplicação não consegue usar. Desassocie-a, ou associe uma num motor suportado, e tente novamente.',
+        'serving_error' => 'A aplicação iniciou mas responde a todos os pedidos com um erro. Os seus recursos provavelmente não foram totalmente construídos — consulte o registo da aplicação.',
+        'not_answering' => 'A aplicação iniciou mas nunca respondeu a um pedido. Consulte o registo da aplicação para saber porque não está à escuta.',
+        'owner_not_created' => 'A aplicação iniciou, mas o seu administrador não pôde ser confirmado. A aplicação não foi entregue, porque enquanto não existir um administrador qualquer pessoa que a abra pode criar um. Tente novamente; se continuar a falhar, verifique o registo da aplicação.',
+        'claim_refused' => 'A aplicação arrancou, mas recusou o administrador que o painel tentou criar, pelo que a aplicação não tem proprietário. A causa habitual é o endereço de e-mail: o Chatwoot rejeita domínios descartáveis e de exemplo, e test.com é um deles — use um endereço real. A aplicação não regista o motivo, por isso não há nada no seu registo. Elimine a aplicação e crie-a de novo com outro endereço.',
+        'app_not_ready' => 'A aplicação iniciou, mas não terminou de arrancar em 2 minutos, por isso o seu administrador não pôde ser criado. Verifique o registo da aplicação e tente novamente.',
+        'out_of_memory' => 'O servidor ficou sem memória durante esta etapa e o sistema interrompeu-a. Liberte memória, ou adicione swap, e tente novamente.',
+        'no_build_tools' => 'Esta etapa precisava de compilar um módulo nativo e este servidor não tem compilador instalado. Instale as ferramentas de compilação no ecrã de configuração e tente novamente. Escolher outra versão do Node também pode ajudar, pois algumas incluem binários já compilados — mas cada pacote decide quais, por isso não é uma solução fiável por si só.',
+        'composer_platform' => 'O Composer não conseguiu instalar as dependências desta aplicação com a versão de PHP definida para esta aplicação. A versão de PHP da aplicação, ou uma das extensões de que necessita, não cumpre o que o projeto exige. Altere a versão de PHP da aplicação para uma suportada, ou instale a extensão em falta, e implante novamente.',
+        'registry_auth' => 'O Docker não conseguiu obter esta imagem porque o registo a recusou. Ou o nome ou a etiqueta da imagem estão errados, ou a imagem é privada — o Docker comunica ambos os casos da mesma forma, por isso verifique primeiro a referência. Se a imagem for privada, note que o painel ainda não consegue iniciar sessão num registo, pelo que só pode executar imagens de acesso público.',
+        'registry_credentials_rejected' => 'O registo recusou a credencial com que esta aplicação obtém a imagem. O token muito provavelmente expirou ou foi revogado — renove-o na página Docker e implante novamente. A referência da imagem está correta: o registo respondeu, apenas não aceitou este nome de utilizador e este token.',
+        'container_restarting' => 'O contentor arranca e para repetidamente, por isso a aplicação não consegue servir. O registo dele é o lugar a consultar — normalmente um comando ou entrypoint que termina de imediato, uma variável de ambiente em falta, ou um ficheiro de configuração que a imagem não conseguiu ler.',
+        'script_git_auth' => 'O seu script de deploy executa um comando git (normalmente git pull) que precisa de iniciar sessão no repositório, e o script não tem credenciais, por isso falha num repositório privado. Não precisa dele: o painel já descarrega o código mais recente com a conta ligada antes de o seu script ser executado. Remova essa linha do script de deploy e faça o deploy novamente.',
+        'script_php_missing' => 'O seu script de deploy usa uma variável {PHPxx} de uma versão de PHP que não está instalada neste servidor. Instale essa versão na tela de PHP ou use {php} para a versão da própria aplicação e faça o deploy novamente.',
+        'composer_dependencies_missing' => 'Este projeto precisa de dependências do Composer e nenhuma foi instalada, pelo que a aplicação não tem vendor/autoload.php e todos os pedidos irão falhar. Acrescente ao script de implantação um passo que execute composer install e implante novamente.',
+        'process_exited' => 'A aplicação foi iniciada, mas o seu processo parou de imediato, por isso não está em execução. O registo da aplicação mostra porquê — na maioria das vezes falta um pacote (a implementação não instalou as dependências) ou o comando de arranque não existe.',
+        'container_exited' => 'O contêiner parou logo após iniciar, então o site não pode responder. O próprio log dele diz o porquê.',
+        'container_port_mismatch' => 'Nada responde na porta do contêiner para a qual este site encaminha, e a imagem escuta em outra. Altere a porta do contêiner para a que a imagem declara e implante novamente.',
+        'container_not_answering' => 'O contêiner está rodando, mas nada respondeu na porta dele. Verifique o log e se a porta do contêiner é aquela em que a aplicação escuta.',
+        'container_unhealthy' => 'O contêiner está em execução, mas a verificação de integridade da própria imagem diz que ele não está funcionando. O log dele e a saída da verificação mostrada aqui dizem o porquê.',
+        'compose_port_taken' => 'Este ficheiro compose publica uma porta do anfitrião que outra aplicação deste servidor já usa, por isso não pode arrancar aqui. Publique outra porta do anfitrião no ficheiro compose e implante novamente.',
+        'container_port_in_use' => 'O contentor não conseguiu arrancar porque algo neste servidor já usa uma das portas do anfitrião que ele publica. Publique outra porta do anfitrião no ficheiro compose e implemente novamente.',
+    ],
+
+    // DS-03: why a container site's last deploy failed, with its values.
+    'container_failure' => [
+        'container_restarting' => 'O contêiner reinicia sem parar.',
+        'container_exited' => 'O contêiner parou logo após iniciar.',
+        'container_port_mismatch' => 'Nada responde na porta do contêiner :port — a imagem escuta em :image_ports. Defina a porta do contêiner como :image_ports e implante novamente.',
+        'container_not_answering' => 'Nada respondeu na porta do contêiner :port em :seconds segundos.',
+        // DS-09: a pasted compose file has no single container port to name.
+        'container_not_answering_no_port' => 'Nada respondeu na porta deste site em :seconds segundos.',
+        // DS-14: the image's own HEALTHCHECK failed.
+        'container_unhealthy' => 'O Docker informa que este contêiner não está íntegro: a verificação de integridade da própria imagem falha.',
+        'health_check' => 'A verificação de integridade disse: :output',
+        'last_line' => 'Última linha do log: :line',
+    ],
+
+    // DS-03: creating a site from a Docker image.
+    'docker_create' => [
+        'port_required' => 'Esta imagem não informa em qual porta escuta. Informe a porta do contêiner — a porta em que a aplicação escuta dentro do contêiner.',
+        'image_not_found' => 'Esta imagem não foi encontrada, então a porta dela não pode ser lida. Verifique o nome e a tag, ou informe você mesmo a porta do contêiner.',
+        'image_unreadable' => 'Não foi possível acessar o registro para ler a porta desta imagem. Informe você mesmo a porta do contêiner.',
+        'port_mismatch' => 'A imagem escuta em :image_ports, não em :port. O site só responderá se a aplicação realmente escutar em :port.',
+        'env_key_invalid' => 'Use apenas letras, dígitos e sublinhados, sem começar com dígito.',
+        'env_key_duplicate' => 'A variável :key foi definida duas vezes.',
+        'env_required' => 'Esta imagem não inicia sem :keys. Informe um valor para cada uma antes de criar o site.',
+    ],
+
+    'port_free' => 'A porta :port está livre.',
+
+    'rendering' => [
+        'php' => 'Aplicação PHP (Laravel, Symfony, PHP simples)',
+        'ssr' => 'Renderização no servidor (executa um processo)',
+        'csr' => 'Renderização no cliente (compilado em ficheiros)',
+        'static' => 'Aplicação estática (compilada em ficheiros)',
+    ],
+
+    'package_manager' => [
+        'npm' => 'npm',
+        'yarn' => 'Yarn',
+        'pnpm' => 'pnpm',
+        'bun' => 'Bun',
+    ],
+
+    'supervisor_installing' => 'A instalar o supervisor, sob o qual os workers são executados. Demora um momento — crie o worker novamente quando terminar.',
+
+    'placeholder_page' => [
+        'lede' => 'Esta aplicação está pronta e a funcionar. Substitua esta página pela sua — até lá, todos os visitantes veem-na.',
+        'php_running' => 'O PHP está a funcionar nesta aplicação',
+        'step_files_title' => 'Carregue os seus ficheiros',
+        'step_files_body' => 'Use o Gestor de Ficheiros do painel, ou ligue-se por SFTP com o utilizador de sistema desta aplicação.',
+        'step_deploy_title' => 'Ou faça deploy a partir do git',
+        'step_deploy_body' => 'Ligue a aplicação a um repositório e o painel irá obtê-la e compilá-la a cada push.',
+        'foot' => 'Página provisória criada pelo painel de controlo.',
+    ],
+
+    'supervisor_mode' => [
+        'systemd' => 'Unidade systemd',
+        'pm2' => 'PM2 (adotado)',
+    ],
+
+    'disabled_page' => [
+        'title' => 'Aplicação indisponível',
+        'heading' => 'Esta aplicação está temporariamente indisponível',
+        'lede' => 'Foi colocado offline pelo seu proprietário. Tente novamente mais tarde.',
+        'foot' => 'Servido pelo painel de controlo.',
+    ],
+
+    // A deploy that failed after its checkout left the new code live.
+    // See Application::codeOnDisk().
+    'code_on_disk' => [
+        'incomplete' => 'A última implementação falhou depois de o novo código ser colocado, por isso a aplicação está a executar o commit :commit, que não está totalmente implementado. Corrija o problema e implemente novamente.',
+    ],
+
+    // A delivery for a site whose deploy-on-push is switched off. See
+    // ApplicationWebhookController::receive().
+    'webhook_delivery' => [
+        'disabled' => 'O deploy ao fazer push está desligado para esta aplicação no painel, por isso nada foi implementado. Volte a ligá-lo no painel ou apague este webhook.',
+    ],
+
+    // Why deploy-on-push still needs the webhook added by hand. See
+    // WebhookRegistrar.
+    'webhook_registration' => [
+        'no_account' => 'Esta aplicação é implementada a partir de um URL público, não de uma conta Git ligada, por isso o painel não pode adicionar o webhook por si. Adicione-o nas definições do repositório com o URL e o segredo abaixo.',
+        'signing_token' => 'O GitLab cria os tokens de assinatura ele próprio, por isso o painel não pode adicionar este webhook por si. Adicione-o nas definições de Webhooks do repositório com o URL abaixo e o seu token de assinatura.',
+        'not_public' => 'O endereço do painel não é acessível a partir da internet, por isso o GitHub, o GitLab ou o Bitbucket não conseguiriam entregar-lhe nada. Dê ao painel um endereço público ou adicione o webhook à mão depois.',
+        'provider_refused' => 'O fornecedor Git não deixou o painel adicionar o webhook. Provavelmente o token ligado não tem permissão para gerir webhooks neste repositório. Adicione-o à mão com o URL e o segredo abaixo, ou volte a ligar a conta com essa permissão.',
+        'removal_refused' => 'O deploy ao fazer push está desligado, mas o fornecedor Git não deixou o painel remover o webhook que adicionou. Provavelmente o token ligado não tem permissão para apagar webhooks. Os push continuarão a ser enviados e recusados até apagar o webhook nas definições do repositório.',
+    ],
+
+    // OLD-20: what became of the site's system user when asked to remove it.
+    'system_user_removal' => [
+        'removed' => 'O utilizador de sistema :username também foi removido.',
+        'still_used' => 'O utilizador de sistema :username foi mantido: ainda é dono de outras aplicações.',
+        'has_processes' => 'O utilizador de sistema :username foi mantido: ainda tem sessão iniciada ou algo em execução. Remova-o em Utilizadores de sistema quando terminar.',
+        'failed' => 'Não foi possível remover o utilizador de sistema :username. Remova-o em Utilizadores de sistema.',
+    ],
+];

@@ -1,0 +1,104 @@
+<?php
+
+return [
+
+    /*
+    | Why an install failed, keyed by the `reason` code stored on the
+    | install row. Built at read time in the *viewer's* locale — the
+    | raw apt or fnm output is never shown, only referenced.
+    */
+
+    'install_failed' => [
+        'timed_out' => 'L’installation a dépassé le délai — généralement un miroir de paquets qui n’a pas répondu. Réessayez ; si cela se reproduit, vérifiez que le serveur atteint ses sources de paquets.',
+        'package_not_found' => 'Aucun paquet pour :version n\'est disponible dans les sources de paquets de ce serveur.',
+        'apt_lock' => 'Une autre opération de paquets est déjà en cours. Réessayez dans un instant.',
+        // ServerOps already knew: the grant is older than the panel.
+        // Naming the repair beats "contact support" for a failure with
+        // a one-command fix.
+        'sudo_denied' => 'L\'autorisation sudo de ce serveur est plus ancienne que le panneau qui y tourne : l\'installation a été refusée avant de commencer. Rien n\'a été modifié et réessayer n\'y changera rien. Exécutez `sudo php artisan panel:sudoers` sur le serveur pour réécrire l\'autorisation à partir de la liste du panneau, puis réessayez.',
+        'network' => 'Le dépôt de paquets est injoignable. Vérifiez que le serveur a un accès réseau.',
+        'no_space' => 'Le serveur n\'a plus d\'espace disque.',
+        'worker' => 'L\'installation s\'est arrêtée de façon inattendue. Elle a peut-être expiré — réessayez.',
+        'unknown' => 'L\'installation a échoué. Communiquez la référence ci-dessous au support.',
+        'dpkg_broken' => 'La base de paquets de ce serveur doit être réparée avant toute autre installation.',
+        'port_in_use_by_mysql' => 'MySQL est déjà installé et occupe ce port. Supprimez-le, ou continuez de vous en servir.',
+        'port_in_use_by_mariadb' => 'MariaDB est déjà installé et occupe ce port. Supprimez-le, ou continuez de vous en servir.',
+        'root_unreachable' => 'C\'est installé mais le panneau n\'a pas pu s\'y connecter. L\'accès administrateur a été modifié par rapport à la valeur par défaut ; le panneau a besoin de ces informations pour continuer.',
+        'cluster_missing' => 'PostgreSQL est installé mais aucun cluster n\'existe sur ce serveur. Il a peut-être été supprimé, ou sa configuration ne s\'est pas terminée.',
+        'grant_failed' => 'C\'est installé mais le panneau n\'a pas pu y créer son propre compte.',
+        'repository_failed' => 'Le dépôt de paquets MongoDB n\'a pas pu être ajouté. Vérifiez que le serveur accède à repo.mongodb.org.',
+        'unreachable' => 'Il a été installé mais ne répond pas. Communiquez la référence ci-dessous au support.',
+        'auth_required' => 'MongoDB est déjà installé ici et exige une connexion dont le panneau ne dispose pas. Ajoutez ses identifiants dans les paramètres de connexion, puis réessayez.',
+        'auth_config_present' => 'MongoDB est installé et sa configuration définit déjà une section security. Le panneau ne l\'a pas modifiée — activez-y authorization vous-même, puis réessayez.',
+        'auth_failed' => 'Il a été installé mais l\'authentification n\'a pas pu être activée. Communiquez la référence ci-dessous au support.',
+    ],
+
+    'uninstall_failed' => [
+        'timed_out' => 'La suppression de PHP :version a dépassé le délai. Réessayez.',
+        'failed' => 'PHP :version n\'a pas pu être supprimé. Communiquez la référence ci-dessous au support.',
+        'worker' => 'La suppression de PHP :version s\'est arrêtée de façon inattendue. Elle a peut-être expiré — réessayez.',
+        'unknown' => 'PHP :version n\'a pas pu être supprimé. Communiquez la référence ci-dessous au support.',
+    ],
+
+    'extension_install_failed' => [
+        'timed_out' => 'L’installation de :extension a dépassé le délai — généralement un miroir de paquets qui n’a pas répondu. Réessayez.',
+        'package_not_found' => 'Aucun paquet pour :extension sur PHP :version. Il n\'existe peut-être pas pour cette version.',
+        'apt_lock' => 'Une autre opération de paquets est déjà en cours. Réessayez dans un instant.',
+        // ServerOps already knew: the grant is older than the panel.
+        // Naming the repair beats "contact support" for a failure with
+        // a one-command fix.
+        'sudo_denied' => 'L\'autorisation sudo de ce serveur est plus ancienne que le panneau qui y tourne : l\'installation a été refusée avant de commencer. Rien n\'a été modifié et réessayer n\'y changera rien. Exécutez `sudo php artisan panel:sudoers` sur le serveur pour réécrire l\'autorisation à partir de la liste du panneau, puis réessayez.',
+        'network' => 'Le dépôt de paquets est injoignable. Vérifiez que le serveur a un accès réseau.',
+        'no_space' => 'Le serveur n\'a plus d\'espace disque.',
+        'worker' => 'L\'installation de :extension s\'est arrêtée de façon inattendue. Elle a peut-être expiré — réessayez.',
+        'unknown' => 'L\'installation de :extension a échoué. Communiquez la référence ci-dessous au support.',
+        'reload_failed' => ':extension a été installée, mais PHP n\'a pas pu être rechargé : elle n\'est donc pas encore active. Communiquez la référence ci-dessous au support.',
+        'enable_failed' => ':extension a été installée mais n\'a pas pu être activée. Réessayez avec l\'interrupteur.',
+    ],
+
+    'fail2ban_install_failed' => [
+        'package_not_found' => 'Aucun paquet fail2ban n\'est disponible. Vérifiez que les sources de paquets du serveur sont configurées et accessibles.',
+        'apt_lock' => 'Une autre opération de paquets est déjà en cours. Réessayez dans un instant.',
+        'network' => 'Le dépôt de paquets est injoignable. Vérifiez l\'accès réseau du serveur.',
+        'no_space' => 'Le serveur n\'a plus d\'espace disque.',
+        'worker' => 'L\'installation s\'est arrêtée de façon inattendue. Elle a peut-être expiré — réessayez.',
+        'unknown' => 'L\'installation de fail2ban a échoué. Communiquez la référence ci-dessous au support.',
+    ],
+
+    /*
+    | Per-runtime overrides, consulted before the shared groups above.
+    |
+    | `install_failed` is shared by PHP, Node, database engines and
+    | fail2ban. It used to be worded for PHP alone, so a failed MongoDB
+    | install told the user to check the PHP repository. Only the reasons
+    | that genuinely differ per runtime belong here; everything else
+    | still falls through.
+    */
+
+    'php_install_failed' => [
+        'package_not_found' => 'Aucun paquet pour :version. Vérifiez que le dépôt PHP est configuré et accessible.',
+    ],
+
+    'node_install_failed' => [
+        'package_not_found' => 'Node :version est introuvable. Vérifiez le numéro de version ou choisissez-en un dans la liste.',
+    ],
+
+    'wp_cli_install_failed' => [
+        'network' => 'GitHub, d\'où WP-CLI est téléchargé, est injoignable. Vérifiez l\'accès réseau du serveur et réessayez.',
+        'incomplete' => 'WP-CLI a été téléchargé mais ne peut pas s\'exécuter sur ce serveur. Il a besoin de `php` dans le PATH du serveur.',
+    ],
+
+    'database_install_failed' => [
+        'apt_lock' => 'Une autre installation de paquets est en cours sur le serveur, et elle l\'était encore après l\'attente du panneau. Réessayez dans quelques minutes.',
+        'package_not_found' => 'Aucun paquet pour :version sur ce serveur. Vérifiez que son dépôt de paquets est configuré et accessible.',
+        // The repository was added and its index fetched successfully;
+        // the engine simply has no build for this Ubuntu release.
+        'os_unsupported' => ':version ne publie pas encore de paquets pour :os. Ce serveur n\'a aucun problème : le panneau prend en charge :os, mais :version n\'a pas encore publié de version pour ce système. Utilisez un autre moteur de base de données, ou réessayez lorsqu\'elle sera disponible.',
+    ],
+
+    // Used for :os when /etc/os-release cannot be read.
+    'this_server' => 'le système d\'exploitation de ce serveur',
+
+    // FS-C18/FS-C19: apt's own error line, quoted after a generic failure.
+    'package_manager_said' => 'Le gestionnaire de paquets a indiqué : « :line »',
+];

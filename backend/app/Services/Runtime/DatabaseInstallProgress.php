@@ -1,0 +1,87 @@
+<?php
+
+namespace App\Services\Runtime;
+
+use App\Enums\InstallStatus;
+use App\Models\RuntimeInstall;
+use InvalidArgumentException;
+
+/**
+ * Database-specific progress around the shared apt phase detector.
+ *
+ * Package phases come from apt's own output. The surrounding operations are
+ * explicit because systemd, repository setup and account provisioning do not
+ * emit a stable machine-readable stream of their own.
+ */
+class DatabaseInstallProgress
+{
+    /** @var array<int, string> */
+    public const STEPS = [
+        'queued',
+        // ServerOps::apt() reports it while another package manager holds the
+        // lock — on a fresh server, Ubuntu's first-boot updates. Missing here
+        // until 2026-11-02, so the first wait threw "Unknown database install
+        // step" and failed an install that only had to wait: found by
+        // installing MariaDB right after the installer said done.
+        'waiting_for_package_manager',
+        'checking_conflicts',
+        'preparing_repository',
+        'updating_package_index',
+        'preparing',
+        'downloading',
+        'unpacking',
+        'configuring',
+        'starting_service',
+        // PostgreSQL only, and it earns its own step because it is a different
+        // failure from the one below with a different fix. `verifying_cluster`
+        // is "the database process is up", answered by pg_isready because
+        // neither of PostgreSQL's systemd units can report a cluster that
+        // failed to start. `verifying_connection` is "the panel can
+        // authenticate". Collapsing them would tell someone whose cluster
+        // never started to go and check their credentials.
+        'verifying_cluster',
+        'verifying_connection',
+        'creating_panel_account',
+    ];
+
+    private InstallProgress $packages;
+
+    public function __construct(private RuntimeInstall $install)
+    {
+        $this->packages = new InstallProgress($install);
+    }
+
+    public function step(string $step): void
+    {
+        if (! in_array($step, self::STEPS, true)) {
+            throw new InvalidArgumentException("Unknown database install step [{$step}].");
+        }
+
+        $this->install->forceFill(['current_step' => $step])->save();
+    }
+
+    public function output(string $chunk): void
+    {
+        if ($this->packages->push($chunk)) {
+            $this->packages->persist();
+        }
+    }
+
+    /** Preserve apt's last words without overwriting a later explicit step. */
+    public function flushOutput(): void
+    {
+        $this->packages->persistOutput();
+    }
+
+    /** @return array<string, mixed> */
+    public static function describe(RuntimeInstall $install): array
+    {
+        $step = $install->current_step;
+
+        return [
+            ...$install->toProgress(),
+            'current_step_title' => $step === null ? null : __("database.install_steps.{$step}"),
+            'retryable' => $install->status === InstallStatus::Failed,
+        ];
+    }
+}

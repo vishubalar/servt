@@ -1,0 +1,748 @@
+<?php
+
+use App\Actions\Admin\PanelUpdate\QueuePanelUpdate;
+use App\Enums\PanelUpdateStatus;
+use App\Models\PanelUpdate;
+use App\Models\User;
+use App\Services\Panel\AvailableRelease;
+use App\Services\Panel\InstalledPanelInfo;
+use App\Services\Panel\UpdatePreflight;
+use App\Services\Panel\UpdateScript;
+use App\Support\Bytes;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Validation\ValidationException;
+
+beforeEach(function () {
+    Cache::flush();
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+});
+
+function panelAdminHeader(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+function fakeRelease(string $tag = 'v9.9.9'): void
+{
+    Http::fake(['api.github.com/*' => Http::response([
+        'tag_name' => $tag,
+        'published_at' => '2026-08-01T10:00:00Z',
+        'body' => 'Release notes here.',
+        'html_url' => 'https://github.com/example/repo/releases/tag/'.$tag,
+    ])]);
+}
+
+it('reports installed version, available version and preflight', function () {
+    fakeRelease();
+
+    $response = $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update');
+
+    $response->assertOk()
+        ->assertJsonStructure(['panel_update' => [
+            'installed' => ['version', 'commit_hash', 'commit_short', 'branch', 'source', 'is_git_checkout', 'has_local_changes'],
+            'available' => ['version', 'published_at', 'notes', 'url', 'checked'],
+            'update_available',
+            'preflight' => ['ready', 'checks'],
+        ]]);
+
+    // The tag is published as v9.9.9 but surfaced bare.
+    expect($response->json('panel_update.available.version'))->toBe('9.9.9')
+        ->and($response->json('panel_update.available.checked'))->toBeTrue();
+});
+
+it('denies a non-admin', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/panel-update')
+        ->assertForbidden();
+});
+
+it('denies an unauthenticated request', function () {
+    $this->getJson('/api/admin/panel-update')->assertUnauthorized();
+});
+
+it('reports no update when the release host cannot be reached', function () {
+    Http::fake(['api.github.com/*' => Http::response(null, 503)]);
+
+    $response = $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update');
+
+    // Failing soft is the point: an unreachable release host must not turn
+    // an informational widget into a 500.
+    $response->assertOk();
+    expect($response->json('panel_update.available.checked'))->toBeFalse()
+        ->and($response->json('panel_update.available.version'))->toBeNull()
+        ->and($response->json('panel_update.update_available'))->toBeFalse();
+});
+
+it('caches the availability check so the dashboard cannot hammer the release host', function () {
+    fakeRelease();
+
+    $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update')->assertOk();
+    $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update')->assertOk();
+
+    Http::assertSentCount(1);
+});
+
+it('bypasses the cache when asked to refresh', function () {
+    fakeRelease();
+
+    $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update')->assertOk();
+    $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update?refresh=1')->assertOk();
+
+    Http::assertSentCount(2);
+});
+
+describe('version comparison', function () {
+    it('only reports an update when the published version is genuinely newer', function () {
+        $releases = app(AvailableRelease::class);
+
+        expect($releases->isNewer('1.0.0', '1.0.1'))->toBeTrue()
+            ->and($releases->isNewer('1.0.0', '2.0.0'))->toBeTrue()
+            ->and($releases->isNewer('1.0.1', '1.0.0'))->toBeFalse()
+            ->and($releases->isNewer('1.0.0', '1.0.0'))->toBeFalse();
+    });
+
+    it('never guesses when either side is unknown', function () {
+        $releases = app(AvailableRelease::class);
+
+        // Prompting an update on a guess invites a mutating, downtime-
+        // incurring operation for no reason.
+        expect($releases->isNewer(null, '2.0.0'))->toBeFalse()
+            ->and($releases->isNewer('1.0.0', null))->toBeFalse()
+            ->and($releases->isNewer(null, null))->toBeFalse();
+    });
+});
+
+describe('installed panel info', function () {
+    it('reports a reachable release baseline for this branch checkout', function () {
+        $info = app(InstalledPanelInfo::class)->installed();
+
+        expect($info['version'])->not->toBeNull()
+            ->and($info['source'])->toBeIn(['tag-ahead', 'tag', 'file']);
+    });
+
+    it('resolves the commit from .git without shelling out', function () {
+        $info = app(InstalledPanelInfo::class)->installed();
+
+        expect($info['is_git_checkout'])->toBeTrue()
+            ->and($info['commit_hash'])->toMatch('/^[0-9a-f]{40}$/')
+            ->and($info['commit_short'])->toHaveLength(7);
+    });
+
+    it('reads a linked worktree, whose .git is a file naming the real git directory', function () {
+        $root = storage_path('framework/testing/panel-worktree-'.uniqid());
+        $hash = str_repeat('ab', 20);
+
+        // git's own layout: the worktree keeps its HEAD; the branch is packed
+        // in the main repository, which `commondir` points back to.
+        File::ensureDirectoryExists("{$root}/main/.git/worktrees/wt");
+        File::ensureDirectoryExists("{$root}/wt");
+        File::put("{$root}/wt/.git", "gitdir: {$root}/main/.git/worktrees/wt\n");
+        File::put("{$root}/main/.git/worktrees/wt/HEAD", "ref: refs/heads/feature\n");
+        File::put("{$root}/main/.git/worktrees/wt/commondir", "../..\n");
+        File::put("{$root}/main/.git/packed-refs", "# pack-refs with: peeled fully-peeled sorted\n{$hash} refs/heads/feature\n");
+
+        Process::fake();
+
+        $info = new class("{$root}/wt") extends InstalledPanelInfo
+        {
+            public function __construct(private string $root) {}
+
+            public function repositoryPath(): string
+            {
+                return $this->root;
+            }
+        };
+
+        try {
+            expect($info->installed())
+                ->toMatchArray(['is_git_checkout' => true, 'commit_hash' => $hash, 'branch' => 'feature']);
+        } finally {
+            File::deleteDirectory($root);
+        }
+    });
+});
+
+describe('preflight', function () {
+    it('fails the clean-tree check when the checkout has local changes', function () {
+        $response = $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update');
+
+        $checks = collect($response->json('panel_update.preflight.checks'))->keyBy('key');
+
+        // Whatever the real state of this checkout is, the check must be
+        // present and must be a boolean — never absent, never null.
+        expect($checks)->toHaveKey('clean_working_tree')
+            ->and($checks['clean_working_tree']['passed'])->toBeBool();
+    });
+
+    it('reports every check the update depends on', function () {
+        $response = $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update');
+
+        expect(collect($response->json('panel_update.preflight.checks'))->pluck('key')->all())
+            ->toBe(['git_checkout', 'clean_working_tree', 'free_disk', 'free_memory', 'writable_path']);
+    });
+
+    it('is ready only when every check passes', function () {
+        $response = $this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update');
+
+        $checks = collect($response->json('panel_update.preflight.checks'));
+
+        expect($response->json('panel_update.preflight.ready'))
+            ->toBe($checks->every(fn ($check) => $check['passed'] === true));
+    });
+});
+
+it('names the files that are blocking an update', function () {
+    // A blocker the admin cannot act on is barely better than none: the detail must name the
+    // dirty files.
+    $installed = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $installed->shouldReceive('localChanges')->andReturn([
+        'M backend/config/server.php',
+        'D frontend/tests/a.mjs',
+    ]);
+
+    $check = collect((new UpdatePreflight($installed))->run()['checks'])
+        ->firstWhere('key', 'clean_working_tree');
+
+    expect($check['passed'])->toBeFalse()
+        ->and($check['detail'])->toContain('2 uncommitted changes')
+        ->and($check['detail'])->toContain('backend/config/server.php')
+        ->and($check['detail'])->toContain('frontend/tests/a.mjs');
+});
+
+it('caps the blocking list rather than pasting a whole git status', function () {
+    // A stale checkout can have hundreds of entries. The point is to identify
+    // the problem, not to reproduce git status in a status card.
+    $installed = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $installed->shouldReceive('localChanges')->andReturn(
+        array_map(fn (int $i): string => "M file-{$i}.php", range(1, 40)),
+    );
+
+    $detail = collect((new UpdatePreflight($installed))->run()['checks'])
+        ->firstWhere('key', 'clean_working_tree')['detail'];
+
+    expect($detail)->toContain('40 uncommitted changes')
+        ->and($detail)->toContain('and 35 more')
+        ->and(substr_count($detail, 'file-'))->toBe(5);
+});
+
+it('counts swap toward the memory the frontend build can use', function () {
+    // install.sh adds a swapfile so a 1 GB box can finish `next build`. Judging on MemAvailable
+    // alone would refuse updates on exactly the servers the installer prepared.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+
+    // A 1 GB box with install.sh's swapfile: short on RAM, fine in total.
+    expect($preflight->memoryVerdict(700, 2400, 2560)['passed'])->toBeTrue();
+
+    // The same box without the swapfile is not fine, and must be told so
+    // before the update starts rather than by the OOM killer partway through.
+    expect($preflight->memoryVerdict(700, 0, 2560)['passed'])->toBeFalse();
+});
+
+it('reports memory and swap separately so the fix is obvious', function () {
+    // "2560MB required" alone does not tell an admin whether to close a
+    // process or add a swapfile, and those are different fixes.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+
+    expect($preflight->memoryVerdict(700, 300, 2560)['detail'])
+        ->toBe('700MB available + 300MB swap, 2560MB required');
+});
+
+it('gives the numbers and a sentence in the viewer\'s language, not English megabytes (OLD-19)', function () {
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+    app()->setLocale('de');
+
+    $verdict = $preflight->memoryVerdict(700, 300, 2560);
+
+    expect($verdict['values'])->toBe(['available_mb' => 700, 'swap_mb' => 300, 'required_mb' => 2560])
+        ->and($verdict['message'])->toBe(__('panel_update.preflight_detail.free_memory', [
+            'available' => Bytes::human(700 * 1048576),
+            'swap' => Bytes::human(300 * 1048576),
+            'required' => Bytes::human(2560 * 1048576),
+        ]))
+        ->and($verdict['message'])->toContain('benötigt');
+
+    app()->setLocale('en');
+});
+
+it('treats a kernel with no swap support as having no swap', function () {
+    // /proc/meminfo has no SwapFree line at all on such a kernel. "No swap"
+    // and "no swap left" constrain the build identically, so null must not
+    // become a pass by accident.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+    $verdict = $preflight->memoryVerdict(700, null, 2560);
+
+    expect($verdict['passed'])->toBeFalse()
+        ->and($verdict['detail'])->toContain('0MB swap');
+});
+
+it('requires enough memory for a build that was measured, not guessed', function () {
+    // 2000MB is OOM-killed during compilation and 2500MB during static generation; the reported
+    // figure must sit above both.
+    expect(config('panel_update.preflight.min_free_memory_mb'))
+        ->toBeGreaterThanOrEqual(2560);
+});
+
+it('reports memory without ever blocking the update on it', function () {
+    // Free memory is a moving sample, not a fact that stays true until fixed. Gating on it would
+    // disable the update button with nothing for the admin to fix, so show the reading but do
+    // not make it a verdict.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+
+    expect($preflight->memoryVerdict(100, 0, 2560))
+        ->toMatchArray(['passed' => false, 'advisory' => true]);
+});
+
+it('stays ready when the only thing short is memory', function () {
+    // The whole point of the advisory flag: a failing memory reading must not
+    // reach `ready`, or nothing has actually changed for the admin.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+
+    expect($preflight->ready([
+        ['key' => 'git_checkout', 'passed' => true, 'detail' => null],
+        ['key' => 'clean_working_tree', 'passed' => true, 'detail' => null],
+        ['key' => 'free_disk', 'passed' => true, 'detail' => null],
+        ['key' => 'free_memory', 'passed' => false, 'detail' => null, 'advisory' => true],
+        ['key' => 'writable_path', 'passed' => true, 'detail' => null],
+    ]))->toBeTrue();
+});
+
+it('still blocks on a check that is a fact rather than a reading', function () {
+    // The advisory escape hatch must not leak into the checks that do gate.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+
+    expect($preflight->ready([
+        ['key' => 'clean_working_tree', 'passed' => false, 'detail' => null],
+        ['key' => 'free_memory', 'passed' => false, 'detail' => null, 'advisory' => true],
+    ]))->toBeFalse();
+});
+
+it('treats a check with no advisory key as blocking', function () {
+    // A check added later must opt out of gating deliberately, not by
+    // forgetting a key -- the safe default is the one that refuses.
+    $preflight = new UpdatePreflight(Mockery::mock(InstalledPanelInfo::class)->makePartial());
+
+    expect($preflight->ready([['key' => 'something_new', 'passed' => false, 'detail' => null]]))
+        ->toBeFalse();
+});
+
+it('still fails closed when git cannot answer', function () {
+    // Unknown is not clean. If we cannot prove the tree is safe we do not get
+    // to run `git checkout --force` over whatever is in it.
+    $installed = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $installed->shouldReceive('localChanges')->andReturn(null);
+
+    $check = collect((new UpdatePreflight($installed))->run()['checks'])
+        ->firstWhere('key', 'clean_working_tree');
+
+    expect($check['passed'])->toBeFalse()
+        ->and($check['detail'])->toBe('unknown');
+});
+
+it('does not let a finished run nobody watched block the next update', function () {
+    // The row is only advanced by PanelUpdateRunner::reconcile(), called when somebody looks at
+    // the update page; the detached script cannot write to the database. An update that finished
+    // unobserved left a row saying "running" forever and every later press was refused.
+    $dir = storage_path('framework/testing/panel-update');
+    is_dir($dir) || mkdir($dir, 0755, true);
+    config()->set('panel_update.state_dir', $dir);
+
+    $stale = PanelUpdate::create([
+        'user_id' => $this->admin->id,
+        'status' => PanelUpdateStatus::Running,
+        'from_version' => '1.0.0',
+        'from_commit' => str_repeat('a', 40),
+        'to_version' => '1.0.1',
+        'started_at' => now()->subHour(),
+    ]);
+
+    // What the detached script actually wrote, which nobody has read back.
+    file_put_contents(
+        app(UpdateScript::class)->statePath($stale),
+        json_encode(['step' => 'health_check', 'status' => 'succeeded', 'reason' => '', 'at' => now()->toIso8601String()]),
+    );
+
+    try {
+        app(QueuePanelUpdate::class)->execute($this->admin, dryRun: true);
+    } catch (ValidationException $e) {
+        // Whatever else stops it here, it must no longer be the phantom run.
+        expect($e->getMessage())->not->toBe(__('panel_update.errors.in_progress'));
+    }
+
+    // ...and the phantom is settled rather than left to block the next press.
+    expect($stale->fresh()->status)->toBe(PanelUpdateStatus::Succeeded);
+});
+
+it('reports the tag it is checked out on, not a file somebody forgot', function () {
+    // A release tagged without bumping VERSION ships the old version; the health check asserts
+    // the installed version is the one answering, so that update rolls back. The file is
+    // maintained by hand, which is the bug.
+    $repo = sys_get_temp_dir().'/panel-version-'.bin2hex(random_bytes(4));
+    mkdir($repo.'/backend', 0755, true);
+    file_put_contents($repo.'/VERSION', "1.0.1\n");
+
+    $git = fn (array $args) => Process::path($repo)->run(array_merge(['git'], $args));
+    $git(['init', '-q']);
+    $git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'r']);
+    $git(['tag', 'v1.0.3']);
+
+    $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $info->shouldReceive('repositoryPath')->andReturn($repo);
+
+    $installed = $info->installed();
+
+    expect($installed['version'])->toBe('1.0.3')
+        ->and($installed['source'])->toBe('tag');
+
+    Process::run(['rm', '-rf', $repo]);
+});
+
+it('falls back to the file on a branch, which every fresh install is on', function () {
+    // install.sh clones --depth 1 onto a branch and fetches no tags, so there
+    // is nothing to describe. That is exactly why the file stays as fallback
+    // rather than being removed.
+    $repo = sys_get_temp_dir().'/panel-version-'.bin2hex(random_bytes(4));
+    mkdir($repo.'/backend', 0755, true);
+    file_put_contents($repo.'/VERSION', "1.0.1\n");
+
+    $git = fn (array $args) => Process::path($repo)->run(array_merge(['git'], $args));
+    $git(['init', '-q']);
+    $git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'r']);
+
+    $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $info->shouldReceive('repositoryPath')->andReturn($repo);
+
+    expect($info->installed()['source'])->toBe('file')
+        ->and($info->installed()['version'])->toBe('1.0.1');
+
+    Process::run(['rm', '-rf', $repo]);
+});
+
+it('ignores a tag that is not version-shaped', function () {
+    // `nightly` or `staging` on a commit is a normal thing to do, and putting
+    // a word where the update compares numbers would break the comparison.
+    $repo = sys_get_temp_dir().'/panel-version-'.bin2hex(random_bytes(4));
+    mkdir($repo.'/backend', 0755, true);
+    file_put_contents($repo.'/VERSION', "1.0.1\n");
+
+    $git = fn (array $args) => Process::path($repo)->run(array_merge(['git'], $args));
+    $git(['init', '-q']);
+    $git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'r']);
+    $git(['tag', 'nightly']);
+
+    $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $info->shouldReceive('repositoryPath')->andReturn($repo);
+
+    expect($info->installed()['source'])->toBe('file');
+
+    Process::run(['rm', '-rf', $repo]);
+});
+
+it('uses the nearest release as the baseline when HEAD is ahead of it', function () {
+    // A branch deployed from main can be newer than the latest release while VERSION is stale.
+    // Keep the distinction in `source`, but compare from the reachable release version.
+    $repo = sys_get_temp_dir().'/panel-version-'.bin2hex(random_bytes(4));
+    mkdir($repo.'/backend', 0755, true);
+    file_put_contents($repo.'/VERSION', "1.0.1\n");
+
+    $git = fn (array $args) => Process::path($repo)->run(array_merge(['git'], $args));
+    $git(['init', '-q']);
+    $git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'released']);
+    $git(['tag', 'v1.0.3']);
+    $git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'after']);
+
+    $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $info->shouldReceive('repositoryPath')->andReturn($repo);
+
+    expect($info->installed()['source'])->toBe('tag-ahead')
+        ->and($info->installed()['version'])->toBe('1.0.3');
+
+    Process::run(['rm', '-rf', $repo]);
+});
+
+it('does not let polling the update page use up the update button', function () {
+    // Laravel keys an inline throttle on the route URI and the user, not the method or the
+    // limit, and GET and POST here share `/panel-update`: the two throttles were one counter, so
+    // polling used up the button's attempts and the update answered 429.
+    Cache::flush();
+
+    // Well past the start limit of 3, nowhere near the check limit of 30.
+    foreach (range(1, 10) as $ignored) {
+        test()->withHeaders(['Authorization' => 'Bearer '.$this->token])
+            ->getJson('/api/admin/panel-update')
+            ->assertOk();
+    }
+
+    // The button must still be pressable: whatever it answers, it must not be 429.
+    $response = test()->withHeaders(['Authorization' => 'Bearer '.$this->token])
+        ->postJson('/api/admin/panel-update');
+
+    expect($response->status())->not->toBe(429);
+});
+
+it('keeps the update routes answering while the panel is down', function () {
+    // `artisan down` is step two of an update, yet the progress feed, the page's own reads and
+    // the button must keep answering during it.
+    // Driven through the real maintenance file: the middleware reads it, and a config assertion
+    // would pass a list that does not match the dispatched URI.
+    $down = storage_path('framework/down');
+    file_put_contents($down, json_encode(['except' => []]));
+
+    try {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Running,
+            'from_version' => '1.0.0',
+            'from_commit' => str_repeat('a', 40),
+            'to_version' => '1.0.1',
+            'started_at' => now(),
+        ]);
+
+        $headers = ['Authorization' => 'Bearer '.$this->token];
+
+        // The progress feed: what the page polls every few seconds.
+        expect(test()->withHeaders($headers)->getJson("/api/admin/panel-update/{$update->id}")->status())
+            ->not->toBe(503);
+
+        // The page's own read, and the button.
+        expect(test()->withHeaders($headers)->getJson('/api/admin/panel-update')->status())->not->toBe(503)
+            ->and(test()->withHeaders($headers)->postJson('/api/admin/panel-update')->status())->not->toBe(503);
+
+        // Health, because the release flow verifies *before* leaving
+        // maintenance — with health behind the gate it could never pass its
+        // own check and would roll back every time.
+        expect(test()->getJson('/api/health')->status())->not->toBe(503);
+
+        // Everything else still 503s. Maintenance mode has a job: no writes
+        // reach a half-updated panel.
+        expect(test()->withHeaders($headers)->getJson('/api/applications')->status())->toBe(503);
+    } finally {
+        @unlink($down);
+    }
+});
+
+/*
+ * Steps that must not cost the whole update.
+ *
+ * The in-place script runs `artisan` from the release it just checked out, so a step added in
+ * release N does not exist in older ones; under `set -e` its absence rolled back an otherwise
+ * good release.
+ */
+
+function inPlaceScript(): string
+{
+    return app(UpdateScript::class)->render(
+        new PanelUpdate(['id' => 1, 'from_commit' => str_repeat('a', 40)]),
+        '1.0.17',
+    );
+}
+
+it('does not fail the update when the firewall backfill is missing', function () {
+    $line = collect(explode("\n", inPlaceScript()))
+        ->first(fn (string $l): bool => str_contains($l, 'firewall:record-defaults'));
+
+    expect($line)->not->toBeNull()
+        // `|| echo` rather than a bare call: the script runs under `set -e`.
+        ->and($line)->toContain('||');
+});
+
+it('restricts existing PostgreSQL databases without letting it fail the update (bug #35)', function () {
+    $line = collect(explode("\n", inPlaceScript()))
+        ->first(fn (string $l): bool => str_contains($l, 'databases:restrict-postgres'));
+
+    expect($line)->not->toBeNull()
+        ->and($line)->toContain('|| echo "WARNING');
+});
+
+it('warns rather than going quiet when that backfill is skipped', function () {
+    // Silently swallowing it would leave the firewall screen reading an empty
+    // table with nothing anywhere saying why.
+    $line = collect(explode("\n", inPlaceScript()))
+        ->first(fn (string $l): bool => str_contains($l, 'firewall:record-defaults'));
+
+    expect($line)->toContain('WARNING')
+        // And it names the command, so the fix is copy-pasteable.
+        ->and($line)->toContain('artisan firewall:record-defaults');
+});
+
+it('still refuses a target contained in the live commit', function () {
+    // Kept asserted: the fix above makes a downgrade's symptom survivable, which must not hide
+    // the downgrade itself.
+    expect(inPlaceScript())->toContain('merge-base --is-ancestor')
+        ->and(inPlaceScript())->toContain('target_not_newer');
+});
+
+it('puts the old dependencies back when it rolls back after composer ran', function () {
+    // The checkout restores the old code, not vendor/: without a reinstall a
+    // failed migrate left the old release running on the new packages.
+    $script = inPlaceScript();
+    $rollback = str($script)->between('rollback() {', "\n}")->toString();
+
+    expect($rollback)->toContain('if [ "$DEPS_CHANGED" = 1 ]; then')
+        ->and(strpos($rollback, 'composer install'))->toBeGreaterThan(strpos($rollback, 'checkout --force'))
+        // Best-effort: a failed reinstall must not stop the rest of the rollback.
+        ->and($rollback)->toMatch('/composer install[^\n]*\|\| true/')
+        // Set only once composer is about to change vendor/, so an earlier
+        // failure does not pay for a reinstall it does not need.
+        ->and(strpos($script, 'DEPS_CHANGED=1'))->toBeGreaterThan(strpos($script, 'note composer_install'))
+        ->and(strpos($script, 'DEPS_CHANGED=0'))->toBeLessThan(strpos($script, 'trap rollback ERR'));
+});
+
+describe('the installed commit after git packs its refs', function () {
+    /**
+     * A fake checkout at a temp path: HEAD on `main`, the branch either as a
+     * loose ref file or only inside packed-refs.
+     */
+    function panelInfoFor(bool $packed): InstalledPanelInfo
+    {
+        $root = sys_get_temp_dir().'/panel-info-'.uniqid();
+        mkdir($root.'/.git/refs/heads', 0777, true);
+        file_put_contents($root.'/.git/HEAD', "ref: refs/heads/main\n");
+        $hash = str_repeat('ab12', 10);
+
+        if ($packed) {
+            // What `git pack-refs` leaves: a header, the branch, an annotated
+            // tag and the line peeling it — and no loose file.
+            file_put_contents($root.'/.git/packed-refs', "# pack-refs with: peeled fully-peeled sorted \n"
+                .str_repeat('cd34', 10)." refs/heads/feature\n"
+                ."{$hash} refs/heads/main\n"
+                .str_repeat('ef56', 10)." refs/tags/v1.0.0\n^".str_repeat('0987', 10)."\n");
+        } else {
+            file_put_contents($root.'/.git/refs/heads/main', $hash."\n");
+        }
+
+        test()->panelInfoRoot = $root;
+        Process::fake(fn () => Process::result(exitCode: 128));
+
+        $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+        $info->shouldReceive('repositoryPath')->andReturn($root);
+
+        return $info;
+    }
+
+    afterEach(fn () => isset($this->panelInfoRoot) && File::deleteDirectory($this->panelInfoRoot));
+
+    it('reads the commit from a loose ref', function () {
+        expect(panelInfoFor(packed: false)->installed()['commit_hash'])->toBe(str_repeat('ab12', 10));
+    });
+
+    it('reads the commit from packed-refs once git has packed the branch', function () {
+        // After `git gc`/`git pack-refs` the loose file is gone; this read
+        // nothing and the update screen lost the installed commit.
+        expect(panelInfoFor(packed: true)->installed()['commit_hash'])->toBe(str_repeat('ab12', 10));
+    });
+});
+
+/*
+ * A fresh install is a shallow clone of main with no tags, so its version is the VERSION
+ * file's word, which can trail the latest tag. The panel then offered an older release as an
+ * update, and the forward-only guard refused the run.
+ */
+describe('an install whose version is only the file\'s word (bug #6)', function () {
+    function installedFromFile(string $committedAt): array
+    {
+        return ['version' => '1.0.14', 'source' => 'file', 'committed_at' => $committedAt];
+    }
+
+    it('offers no update when the running code is newer than the release', function () {
+        $releases = app(AvailableRelease::class);
+
+        expect($releases->isUpdate(installedFromFile('2026-10-01T12:00:00+00:00'), ['version' => '1.0.17', 'published_at' => '2026-09-20T10:00:00Z']))->toBeFalse();
+    });
+
+    it('still offers one when the release came after the running code', function () {
+        $releases = app(AvailableRelease::class);
+
+        expect($releases->isUpdate(installedFromFile('2026-09-01T12:00:00+00:00'), ['version' => '1.0.17', 'published_at' => '2026-09-20T10:00:00Z']))->toBeTrue()
+            // A real tag is still compared by number, as before.
+            ->and($releases->isUpdate(['version' => '1.0.14', 'source' => 'tag', 'committed_at' => '2026-10-01T12:00:00+00:00'], ['version' => '1.0.17', 'published_at' => '2026-09-20T10:00:00Z']))->toBeTrue();
+    });
+
+    it('says so on the screen, and refuses the button rather than starting a run that fails', function () {
+        fakeRelease('v1.0.17'); // published 2026-08-01
+        $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+        $info->shouldReceive('installed')->andReturn([
+            'version' => '1.0.14', 'commit_hash' => str_repeat('a', 40), 'commit_short' => 'aaaaaaa', 'branch' => 'main',
+            'source' => 'file', 'committed_at' => '2026-10-01T12:00:00+00:00', 'is_git_checkout' => true, 'has_local_changes' => false,
+        ]);
+        app()->instance(InstalledPanelInfo::class, $info);
+
+        expect($this->withHeaders(panelAdminHeader())->getJson('/api/admin/panel-update')->json('panel_update.update_available'))->toBeFalse();
+
+        $this->withHeaders(panelAdminHeader())->postJson('/api/admin/panel-update')
+            ->assertUnprocessable()
+            ->assertJsonPath('errors.version.0', __('panel_update.errors.no_update'));
+    });
+
+    it('reads the commit date off a real checkout', function () {
+        $repo = sys_get_temp_dir().'/panel-version-'.bin2hex(random_bytes(4));
+        mkdir($repo.'/backend', 0755, true);
+        Process::path($repo)->run(['git', 'init', '-q']);
+        Process::path($repo)->env(['GIT_COMMITTER_DATE' => '2026-10-01T12:00:00+00:00'])
+            ->run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'r']);
+
+        $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+        $info->shouldReceive('repositoryPath')->andReturn($repo);
+
+        expect($info->installed()['committed_at'])->toBe('2026-10-01T12:00:00+00:00');
+
+        Process::run(['rm', '-rf', $repo]);
+    });
+});
+
+/*
+ * sites:resync locks the panel directory with setfacl through the sudo grant, so it must run
+ * after panel:sudoers; on an older grant the lock failed and the directory stayed readable.
+ */
+it('updates the panel\'s privileges before anything that uses them', function () {
+    $script = inPlaceScript();
+    $sudoers = strpos($script, 'note sync_privileges');
+
+    expect($sudoers)->not->toBeFalse();
+
+    foreach (['resync_site_configs', 'record_firewall_defaults', 'resync_fail2ban', 'restrict_postgres_databases', 'repair_node_runtime'] as $step) {
+        expect(strpos($script, "note {$step}"))->toBeGreaterThan($sudoers, "{$step} runs before sync_privileges");
+    }
+
+    // The progress list follows the script, so the bar does not jump back.
+    $steps = UpdateScript::STEPS;
+    expect(array_search('sync_privileges', $steps, true))->toBeLessThan(array_search('resync_site_configs', $steps, true));
+});
+
+it('knows the code here already is a release whose tag was never fetched (FS-C36)', function () {
+    // The release is tagged upstream on the very commit installed here; the
+    // server's own clone has no tags. By name it looks like an update.
+    $origin = sys_get_temp_dir().'/panel-origin-'.bin2hex(random_bytes(4));
+    $repo = sys_get_temp_dir().'/panel-clone-'.bin2hex(random_bytes(4));
+    mkdir($origin, 0755, true);
+
+    $git = fn (string $dir, array $args) => Process::path($dir)->run(array_merge(['git', '-c', 'user.email=t@t', '-c', 'user.name=t'], $args));
+    $git($origin, ['init', '-q']);
+    $git($origin, ['commit', '-q', '--allow-empty', '-m', 'r1']);
+    Process::run(['git', 'clone', '-q', '--no-tags', $origin, $repo]);
+    $git($origin, ['tag', '-a', 'v7.0.18', '-m', 'release']);
+    $git($origin, ['commit', '-q', '--allow-empty', '-m', 'r2']);
+    $git($origin, ['tag', 'v7.0.19']);
+
+    $info = Mockery::mock(InstalledPanelInfo::class)->makePartial();
+    $info->shouldReceive('repositoryPath')->andReturn($repo);
+
+    app()->instance(InstalledPanelInfo::class, $info);
+    $head = trim(Process::path($repo)->run(['git', 'rev-parse', 'HEAD'])->output());
+
+    expect($info->alreadyContains('7.0.18'))->toBeTrue()
+        // So the screen offers no update for it…
+        ->and(app(AvailableRelease::class)->isUpdate(['version' => '1.0.17', 'source' => 'tag', 'commit_hash' => $head], ['version' => '7.0.18']))->toBeFalse()
+        // …and still offers the real one.
+        ->and(app(AvailableRelease::class)->isUpdate(['version' => '1.0.17', 'source' => 'tag', 'commit_hash' => $head], ['version' => '7.0.19']))->toBeTrue()
+        // A real update: the commit is not in this clone at all.
+        ->and($info->alreadyContains('7.0.19'))->not->toBeTrue();
+
+    Process::run(['rm', '-rf', $origin, $repo]);
+});

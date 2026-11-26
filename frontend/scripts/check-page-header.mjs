@@ -1,0 +1,81 @@
+import fs from "node:fs";
+import path from "node:path";
+
+// Every screen must open with PageHeader (exceptions listed below).
+
+const ALLOWED = new Map([
+  [
+    "app/(app)/applications/[application]/page.jsx",
+    "leads with the site's name, status and domain, not a page title",
+  ],
+  [
+    "components/ui/detail-header.jsx",
+    "the masthead of a detail page (a database): name, badges and facts, as the application page",
+  ],
+  ["app/(setup)/setup/page.jsx", "onboarding card: an icon, then the heading"],
+  ["components/sections/not-found-content.jsx", "centred 404, not a page shell"],
+  [
+    "components/integrations/storage/google-drive-callback.jsx",
+    "centred OAuth result: the heading is the outcome, so each state owns it",
+  ],
+  [
+    "components/dashboard/dashboard-hero.jsx",
+    "the dashboard leads with the server banner; its heading is the health verdict",
+  ],
+  [
+    "components/admin/dashboard/admin-hero.jsx",
+    "the admin dashboard leads with the same banner; its heading is the panel's health verdict",
+  ],
+  ["components/ui/page-header.jsx", "the component itself"],
+]);
+
+const code = (source) =>
+  source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+function walk(dir, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules" || entry.name === ".next") continue;
+      walk(full, out);
+    } else if (entry.name.endsWith(".jsx")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+const offenders = [];
+const staleAllowances = [];
+
+for (const file of [...walk("app"), ...walk("components")]) {
+  const source = code(fs.readFileSync(file, "utf8"));
+  const hasHeading = /<h1[\s>]/.test(source);
+  const allowed = ALLOWED.has(file);
+
+  if (hasHeading && !allowed) offenders.push(file);
+  if (allowed && !hasHeading) staleAllowances.push(file);
+}
+
+if (offenders.length === 0 && staleAllowances.length === 0) {
+  const total = ALLOWED.size - 1;
+  console.log(`page headers ok — every screen uses PageHeader, ${total} named exceptions`);
+  process.exit(0);
+}
+
+if (offenders.length) {
+  console.error(`page header check failed — ${offenders.length} file(s) hand-roll an <h1>:`);
+  for (const file of offenders) console.error(`  ${file}`);
+  console.error(`
+Use <PageHeader title={...} subtitle={...} /> so every screen agrees about
+where its title, subtitle and spacing live. If this screen genuinely leads
+with something else, add it to ALLOWED in scripts/check-page-header.mjs with
+the reason.`);
+}
+
+if (staleAllowances.length) {
+  console.error(`\n${staleAllowances.length} allowance(s) no longer have an <h1> — remove them:`);
+  for (const file of staleAllowances) console.error(`  ${file}`);
+}
+
+process.exit(1);

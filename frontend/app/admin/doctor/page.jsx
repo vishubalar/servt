@@ -1,0 +1,112 @@
+import { getTranslations } from "next-intl/server";
+import { CircleCheck, ShieldAlert } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { getDoctor } from "@/lib/admin/get-doctor";
+import { CheckRow, PassedChecks } from "@/components/admin/doctor/check-row";
+import { RecheckButton } from "@/components/admin/doctor/recheck-button";
+import { CopyReportButton } from "@/components/admin/doctor/copy-report-button";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { PageHeader } from "@/components/ui/page-header";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata() {
+  const t = await getTranslations("doctor");
+  return { title: t("title") };
+}
+
+const RANK = { fail: 0, warn: 1, pass: 2 };
+
+export default async function AdminDoctorPage() {
+  const [t, result] = await Promise.all([getTranslations("doctor"), getDoctor()]);
+  const doctor = result.doctor;
+
+  const statusLabels = { pass: t("statusPass"), warn: t("statusWarn"), fail: t("statusFail") };
+
+  const sorted = doctor
+    ? [...doctor.checks].sort((a, b) => (RANK[a.status] ?? 1) - (RANK[b.status] ?? 1))
+    : [];
+  const attention = sorted.filter((c) => c.status !== "pass");
+  const passed = sorted.filter((c) => c.status === "pass");
+
+  const report = doctor
+    ? [
+        `${t("title")} — ${doctor.healthy ? t("healthy") : t("unhealthy", { count: doctor.failed })}`,
+        t("counts", { passed: doctor.passed, warnings: doctor.warnings, failed: doctor.failed }),
+        "",
+        ...sorted.map((c) =>
+          [
+            `[${statusLabels[c.status]}] ${c.title}`,
+            c.detail ? `  ${c.detail}` : null,
+            c.status !== "pass" && c.fix ? `  ${t("fixLabel")}: ${c.fix}` : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        ),
+      ].join("\n")
+    : "";
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("title")} />
+
+      {!doctor ? (
+        <LoadFailed
+          description={t("loadFailed")}
+          status={result.status}
+          failure={result.failure} message={result.message} debug={result.debug}
+        />
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-4 rounded-2xl border border-border/70 bg-card p-4 shadow-e1">
+            <span
+              className={cn(
+                "flex size-11 shrink-0 items-center justify-center rounded-xl",
+                doctor.healthy ? "bg-success/10" : "bg-destructive/10",
+              )}
+            >
+              {doctor.healthy ? (
+                <CircleCheck className="size-6 text-success" aria-hidden />
+              ) : (
+                <ShieldAlert className="size-6 text-destructive" aria-hidden />
+              )}
+            </span>
+            {/* min-w-48: with min-w-0 the summary got squeezed to one word per line on phones. */}
+            <div className="min-w-48 flex-1">
+              <p className="font-medium">
+                {!doctor.healthy
+                  ? t("unhealthy", { count: doctor.failed })
+                  : doctor.warnings > 0
+                    ? t("healthyWithWarnings", { count: doctor.warnings })
+                    : t("healthy")}
+              </p>
+              <p className="text-sm text-muted-foreground">
+                {t("counts", {
+                  passed: doctor.passed,
+                  warnings: doctor.warnings,
+                  failed: doctor.failed,
+                })}
+              </p>
+              {!doctor.healthy ? (
+                <p className="mt-1 text-sm text-muted-foreground">{t("blockingNote")}</p>
+              ) : null}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <CopyReportButton text={report} />
+              <RecheckButton />
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            {attention.map((check) => (
+              <CheckRow key={check.key} check={check} labels={statusLabels} />
+            ))}
+            {passed.length ? (
+              <PassedChecks checks={passed} title={t("passedGroup", { count: passed.length })} />
+            ) : null}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

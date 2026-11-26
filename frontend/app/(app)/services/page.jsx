@@ -1,0 +1,64 @@
+import { getTranslations, getFormatter } from "next-intl/server";
+import { Cog } from "lucide-react";
+import { getPermissions } from "@/lib/permissions/get-permissions";
+import { can } from "@/lib/permissions/can";
+import { getServices } from "@/lib/services/get-services";
+import { getPhp } from "@/lib/php/get-php";
+import { ServicesPanel } from "@/components/services/services-panel";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { NavTransitionProvider } from "@/components/data-table/nav-transition";
+import { PageHeader } from "@/components/ui/page-header";
+import { PermissionDenied } from "@/components/sections/permission-denied";
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata() {
+  const t = await getTranslations("services");
+  return { title: t("title") };
+}
+
+export default async function ServicesPage() {
+  const [permissions, t] = await Promise.all([
+    getPermissions(),
+    getTranslations("services"),
+  ]);
+
+  if (!can(permissions, "service", "view")) return <PermissionDenied title={t("title")} />;
+  const canManage = can(permissions, "service", "manage");
+
+  const canSeePhp = can(permissions, "php", "view");
+  const [{ services, failed, status, failure, message }, php] = await Promise.all([
+    getServices(),
+    canSeePhp ? getPhp() : Promise.resolve({ data: null }),
+  ]);
+  const phpVersions = php.data?.versions ?? [];
+
+  const format = await getFormatter();
+  const checkedAt = format.dateTime(new Date(), { timeStyle: "short" });
+
+  return (
+    <div className="space-y-6">
+      <PageHeader title={t("title")} />
+
+      {failed ? (
+        <LoadFailed description={t("loadFailed")} status={status} failure={failure} message={message} />
+      ) : services.length === 0 ? (
+        <EmptyState
+          icon={Cog}
+          title={t("empty.title")}
+          description={t("empty.body")}
+        />
+      ) : (
+        <NavTransitionProvider>
+          <ServicesPanel
+            initialServices={services}
+            initialCheckedAt={checkedAt}
+            phpVersions={phpVersions}
+            canManage={canManage}
+          />
+        </NavTransitionProvider>
+      )}
+    </div>
+  );
+}

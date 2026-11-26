@@ -1,0 +1,1178 @@
+<?php
+
+use App\Enums\DomainType;
+use App\Http\Resources\ApplicationResource;
+use App\Jobs\RunClone;
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\ApplicationPhpSettings;
+use App\Models\Database;
+use App\Models\DatabaseUser;
+use App\Models\GitAccount;
+use App\Models\ServerCapability;
+use App\Models\SiteClone;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Backups\Storage\LocalBackupFolder;
+use App\Services\Server\ServerOps;
+use App\Services\Server\SystemUsers\HomeDirectoryAccess;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Process;
+
+/**
+ * Site Clone: a fully independent duplicate, with no ongoing link to the source (unlike Staging).
+ * A database-needing type without a CloneStrategy refuses cleanly, webhook identity is never
+ * copied (unique constraint), and `provision()`'s installer/process-start steps are skipped so
+ * a fresh install never fights the rsync that follows.
+ *
+ * Cloning is asynchronous: the request returns 202 with a `SiteClone` and `RunClone` does the
+ * work off the queue. Tests assert the handover (202, pending record), then run the job.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    ServerCapability::create([
+        'stack' => 'lemp',
+        'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => true],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    $this->systemUser = SystemUser::create(['username' => 'siteowner', 'home_path' => '/home/siteowner']);
+});
+
+function cloneHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->admin->createToken('t')->plainTextToken];
+}
+
+/** Starts a clone through the API and returns the refreshed record once the job has run. */
+function runClone(Application $source, string $domain, ?string $name = null): SiteClone
+{
+    $payload = array_filter(['domain' => $domain, 'name' => $name]);
+
+    $response = test()->withHeaders(cloneHeaders())
+        ->postJson("/api/applications/{$source->id}/clone", $payload)
+        ->assertAccepted()
+        ->assertJsonPath('clone.domain', $domain)
+        ->assertJsonPath('clone.status', 'pending');
+
+    $clone = SiteClone::findOrFail($response->json('clone.id'));
+
+    // No second `handle()`: QUEUE_CONNECTION=sync means the POST above already ran the job, and a
+    // second run collides on `application_domains.domain`.
+    return $clone->fresh();
+}
+
+function fakeCloneServer(bool $testPasses = true): void
+{
+    Process::fake(function ($process) use ($testPasses) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($args[0] ?? '') === 'nginx' && ($args[1] ?? '') === '-t') {
+            return Process::result(exitCode: $testPasses ? 0 : 1, errorOutput: $testPasses ? '' : 'invalid');
+        }
+
+        if (in_array(($args[0] ?? ''), ['mysql', 'mariadb'], true)
+            && str_contains((string) $process->input, 'information_schema.schemata')) {
+            return Process::result(output: '1');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+it('clones a static site (no database needed) generically', function () {
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Docs',
+        'slug' => 'docs', 'domain' => 'docs.test', 'site_type' => 'static',
+        'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+    ]);
+
+    $record = runClone($source, 'docs-clone.test');
+
+    expect($record->status->value)->toBe('completed')
+        ->and($record->target_application_id)->not->toBeNull();
+
+    $clone = Application::find($record->target_application_id);
+
+    expect($clone)->not->toBeNull()
+        ->and($clone->cloned_from_application_id)->toBe($source->id)
+        ->and($clone->status->value)->toBe('active')
+        ->and($clone->webhook_enabled)->toBeFalse()
+        // Without a slug the clone would provision into the system user's home, shared by every clone.
+        ->and($clone->slug)->not->toBeNull()
+        ->and($clone->slug)->not->toBe($source->slug)
+        ->and(ActivityLog::where('type', 'application')->where('action', 'cloned')->exists())->toBeTrue();
+
+    Process::assertRan(fn ($p) => ($p->command[0] ?? '') === 'rsync');
+});
+
+it('clones a WordPress site including its database', function () {
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'My Extremely Long Online Shop Application Name',
+        'slug' => 'shop', 'domain' => 'shop.test', 'site_type' => 'wordpress',
+        'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/', 'php_version' => '8.4',
+    ]);
+
+    $database = Database::create(['name' => 'shop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+    DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_user', 'password' => 'secret', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    $record = runClone($source, 'shop-clone.test');
+
+    expect($record->status->value)->toBe('completed');
+
+    $clone = Application::find($record->target_application_id);
+
+    $cloneDatabase = Database::where('application_id', $clone->id)->with('users')->first();
+
+    expect($cloneDatabase)->not->toBeNull()
+        ->and($cloneDatabase->name)->toStartWith('clone_')
+        ->and(strlen($cloneDatabase->name))->toBeLessThanOrEqual(32)
+        ->and($cloneDatabase->name)->toMatch('/_[a-z0-9]{6}$/')
+        ->and($cloneDatabase->users->first()->username)->toBe($cloneDatabase->name);
+
+    Process::assertRan(fn ($p) => ($p->command[0] ?? '') === 'mysqldump');
+    Process::assertRan(fn ($p) => in_array('runuser', $p->command, true) && in_array('search-replace', $p->command, true));
+});
+
+it('rewrites every spelling of the source address, not just its URL (bug #92)', function () {
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Shop', 'slug' => 'shop', 'domain' => 'shop.test', 'site_type' => 'wordpress',
+        'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/', 'php_version' => '8.4',
+    ]);
+    $database = Database::create(['name' => 'shop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+    DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_user', 'password' => 'secret', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    // A subdomain of the source: a plain bare-domain pass would turn it into copy.copy.shop.test.
+    expect(runClone($source, 'copy.shop.test')->status->value)->toBe('completed');
+
+    $searched = fn (string $term, bool $regex = false) => Process::assertRan(function ($p) use ($term, $regex) {
+        $i = array_search('search-replace', $p->command, true);
+
+        return $i !== false && $p->command[$i + 1] === $term
+            && in_array('--regex', $p->command, true) === $regex;
+    });
+
+    // Links saved over http:// must not keep pointing at the original.
+    $searched('http://shop.test');
+    $searched('https://shop.test');
+    // The block editor's escaped form, and protocol-relative asset URLs.
+    $searched('http:\\/\\/shop.test');
+    $searched('//shop.test');
+    // The bare host only as a whole name.
+    $searched('(?<![A-Za-z0-9.-])shop\\.test(?![A-Za-z0-9-]|\\.[A-Za-z0-9])', regex: true);
+    Process::assertNotRan(function ($p) {
+        $i = array_search('search-replace', $p->command, true);
+
+        return $i !== false && $p->command[$i + 1] === 'shop.test';
+    });
+});
+
+it('refuses to clone a database-needing type with no clone recipe', function () {
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Forum',
+        'slug' => 'forum', 'domain' => 'forum.test', 'site_type' => 'nodebb',
+        'serving_profile' => 'node', 'status' => 'active', 'node_version' => '22', 'app_port' => 4000,
+    ]);
+
+    // `app_clone` is not among a database-backed type's features, so `CheckPermission` closes the
+    // route up front: 404, nothing created, nothing queued.
+    test()->withHeaders(cloneHeaders())
+        ->postJson("/api/applications/{$source->id}/clone", ['domain' => 'forum-clone.test'])
+        ->assertNotFound();
+
+    expect(SiteClone::count())->toBe(0)
+        ->and(Application::where('domain', 'forum-clone.test')->exists())->toBeFalse();
+});
+
+it('still refuses inside the job if a strategy-less clone is ever reached directly', function () {
+    fakeCloneServer();
+
+    // Defense in depth: the route is closed, but `CloneManager`'s own guard protects clones
+    // dispatched by anything other than that route.
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Forum Direct',
+        'slug' => 'forum-direct', 'domain' => 'forum-direct.test', 'site_type' => 'nodebb',
+        'serving_profile' => 'node', 'status' => 'active', 'node_version' => '22', 'app_port' => 4001,
+    ]);
+
+    $clone = SiteClone::create([
+        'source_application_id' => $source->id,
+        'name' => 'Forum Copy',
+        'domain' => 'forum-copy.test',
+        'status' => 'pending',
+    ]);
+
+    app()->call([new RunClone($clone->id, $source->id), 'handle']);
+
+    expect($clone->fresh()->status->value)->toBe('failed')
+        ->and($clone->fresh()->target_application_id)->toBeNull()
+        ->and(Application::where('domain', 'forum-copy.test')->exists())->toBeFalse();
+});
+
+it('allocates a fresh port for a node clone rather than reusing the source port', function () {
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Status',
+        'slug' => 'status', 'domain' => 'status.test', 'site_type' => 'uptimekuma',
+        'serving_profile' => 'node', 'status' => 'active', 'node_version' => '22',
+        'app_port' => 3001, 'start_command' => 'node server.js',
+    ]);
+
+    $record = runClone($source, 'status-clone.test');
+
+    $clone = Application::find($record->target_application_id);
+
+    expect($clone->app_port)->not->toBeNull()->and($clone->app_port)->not->toBe(3001);
+});
+
+it('refuses without manage permission', function () {
+    fakeCloneServer();
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Docs',
+        'slug' => 'docs', 'domain' => 'docs2.test', 'site_type' => 'static',
+        'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+    ]);
+
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_clone', view: true, manage: false);
+
+    $this->withHeaders(['Authorization' => 'Bearer '.$viewer->createToken('t')->plainTextToken])
+        ->postJson("/api/applications/{$source->id}/clone", ['domain' => 'docs2-clone.test'])
+        ->assertStatus(403);
+});
+
+/*
+ * The failure path. A clone creates its target Application row before provisioning and `domain`
+ * is unique, so a row left behind by a failure blocks any retry and lists a site never built.
+ */
+describe('when a clone fails partway', function () {
+    it('leaves no half-made site behind and lets the same clone be retried', function () {
+        fakeCloneServer(testPasses: false);
+
+        $source = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id,
+            'name' => 'Docs',
+            'slug' => 'docs', 'domain' => 'docs.test', 'site_type' => 'static',
+            'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+        ]);
+
+        $failed = runClone($source, 'docs-clone.test');
+
+        // The SiteClone record is the history and stays; the application does not.
+        expect($failed->status->value)->toBe('failed')
+            ->and($failed->target_application_id)->toBeNull()
+            ->and(Application::where('domain', 'docs-clone.test')->exists())->toBeFalse()
+            ->and(Application::where('cloned_from_application_id', $source->id)->exists())->toBeFalse();
+
+        // The same domain is free again, so the retry works.
+        fakeCloneServer();
+
+        $retried = runClone($source, 'docs-clone.test');
+
+        expect($retried->status->value)->toBe('completed')
+            ->and(Application::find($retried->target_application_id))->not->toBeNull();
+    });
+
+    it('still records why it failed', function () {
+        fakeCloneServer(testPasses: false);
+
+        $source = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id,
+            'name' => 'Docs',
+            'slug' => 'docs', 'domain' => 'docs.test', 'site_type' => 'static',
+            'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+        ]);
+
+        // Cleaning up must keep the failure reason; without it the panel can only say "failed".
+        $record = runClone($source, 'docs-clone.test');
+
+        expect($record->reason)->not->toBeEmpty();
+    });
+
+    it('does not report success when copied files cannot be owned by the site user', function () {
+        $filesCopied = false;
+
+        Process::fake(function ($process) use (&$filesCopied) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($args[0] ?? '') === 'nginx' && ($args[1] ?? '') === '-t') {
+                return Process::result(exitCode: 0);
+            }
+
+            if (($args[0] ?? '') === 'rsync') {
+                $filesCopied = true;
+
+                return Process::result(exitCode: 0);
+            }
+
+            if ($filesCopied && ($args[0] ?? '') === 'chown' && ($args[1] ?? '') === '-R') {
+                return Process::result(exitCode: 1, errorOutput: 'ownership denied');
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        $source = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id,
+            'name' => 'Docs',
+            'slug' => 'docs', 'domain' => 'docs.test', 'site_type' => 'static',
+            'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+        ]);
+
+        $record = runClone($source, 'docs-clone.test');
+
+        expect($record->status->value)->toBe('failed')
+            ->and($record->target_application_id)->toBeNull()
+            ->and(Application::where('domain', 'docs-clone.test')->exists())->toBeFalse();
+    });
+
+    it('does not keep a WordPress clone whose secret config cannot be secured', function (string $command) {
+        Process::fake(function ($process) use ($command) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($args[0] ?? '') === 'nginx' && ($args[1] ?? '') === '-t') {
+                return Process::result(exitCode: 0);
+            }
+
+            if (in_array(($args[0] ?? ''), ['mysql', 'mariadb'], true)
+                && str_contains((string) $process->input, 'information_schema.schemata')) {
+                return Process::result(output: '1');
+            }
+
+            // Site-user writes arrive wrapped in `runuser`.
+            if (($args[0] ?? '') === 'runuser') {
+                $args = array_slice($args, 4);
+            }
+
+            if (($args[0] ?? '') === $command && str_ends_with((string) end($args), '/wp-config.php')) {
+                return Process::result(exitCode: 1, errorOutput: 'permission denied');
+            }
+
+            return Process::result(exitCode: 0);
+        });
+
+        $source = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id,
+            'name' => 'Shop',
+            'slug' => 'shop', 'domain' => 'shop.test', 'site_type' => 'wordpress',
+            'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/', 'php_version' => '8.4',
+        ]);
+
+        $database = Database::create([
+            'name' => 'shop_db',
+            'engine' => 'mysql',
+            'application_id' => $source->id,
+        ]);
+        DatabaseUser::create([
+            'database_id' => $database->id,
+            'username' => 'shop_user',
+            'password' => 'secret',
+            'connection_preference' => 'localhost',
+            'host' => 'localhost',
+        ]);
+
+        $record = runClone($source, 'shop-clone.test');
+
+        expect($record->status->value)->toBe('failed')
+            ->and($record->target_application_id)->toBeNull()
+            ->and(Application::where('domain', 'shop-clone.test')->exists())->toBeFalse();
+    })->with(['tee', 'chmod']);
+});
+
+it('writes the clone\'s wp-config.php as the site user, never as root', function () {
+    // The target is a copy of another site, so a `wp-config.php` symlink arrives with it, and
+    // root's `tee`/`chown` would follow the link.
+    $ran = [];
+    Process::fake(function ($process) use (&$ran) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+        $ran[] = $args;
+
+        if (in_array(($args[0] ?? ''), ['mysql', 'mariadb'], true)
+            && str_contains((string) $process->input, 'information_schema.schemata')) {
+            return Process::result(output: '1');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Shop',
+        'slug' => 'shop', 'domain' => 'shop.test', 'site_type' => 'wordpress',
+        'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/', 'php_version' => '8.4',
+    ]);
+    $database = Database::create(['name' => 'shop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+    DatabaseUser::create([
+        'database_id' => $database->id, 'username' => 'shop_user', 'password' => 'secret',
+        'connection_preference' => 'localhost', 'host' => 'localhost',
+    ]);
+
+    expect(runClone($source, 'shop-clone.test')->status->value)->toBe('completed');
+
+    $writes = collect($ran)
+        ->filter(fn (array $c) => in_array('tee', $c, true) && str_ends_with((string) end($c), '/wp-config.php'))
+        ->values();
+
+    expect($writes)->not->toBeEmpty()
+        ->and($writes->every(fn (array $c) => array_slice($c, 0, 5) === ['runuser', '-u', 'siteowner', '--', 'tee']))->toBeTrue()
+        // No root chown afterwards: the user's write already made it theirs.
+        ->and(collect($ran)->map(fn (array $c) => implode(' ', $c))
+            ->contains(fn (string $c) => str_starts_with($c, 'chown ') && str_ends_with($c, '/wp-config.php')))->toBeFalse();
+});
+
+it('gives the clone a primary domain row, not just the mirror column', function () {
+    // The Domains screen reads `application_domains`; `applications.domain` only mirrors the
+    // primary row, and CloneManager does not go through CreateApplication, which writes it.
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Docs primary',
+        'slug' => 'docs-primary', 'domain' => 'docs-primary.test', 'site_type' => 'static',
+        'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+    ]);
+
+    $clone = Application::find(runClone($source, 'docs-primary-clone.test')->target_application_id);
+
+    $primary = $clone->domains()->where('type', 'primary')->first();
+
+    expect($primary)->not->toBeNull()
+        ->and($primary->domain)->toBe('docs-primary-clone.test')
+        // The clone's own domain; the mirror column and the row must name the same host.
+        ->and($clone->domain)->toBe($primary->domain);
+});
+
+it('keeps serving its own domain after an alias is added', function () {
+    // `serverNames()` falls back to `applications.domain` only while the relation is empty, so
+    // with no primary row one alias would make the next vhost drop the site's own domain.
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id,
+        'name' => 'Docs alias',
+        'slug' => 'docs-alias', 'domain' => 'docs-alias.test', 'site_type' => 'static',
+        'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+    ]);
+
+    $clone = Application::find(runClone($source, 'docs-alias-clone.test')->target_application_id);
+
+    $clone->domains()->create([
+        'domain' => 'extra.docs-alias.test',
+        'type' => DomainType::Alias,
+        'is_test' => false,
+    ]);
+
+    expect($clone->fresh()->load('domains')->serverNames())
+        ->toContain('docs-alias-clone.test')
+        ->toContain('extra.docs-alias.test');
+});
+
+/*
+ * PHP settings travel with the clone: copying only `php_version` would give the clone the same
+ * interpreter but different limits than its source.
+ */
+
+function phpSourceApp(array $settings = []): Application
+{
+    $source = Application::forceCreate([
+        'system_user_id' => test()->systemUser->id,
+        'name' => 'Shop', 'slug' => 'shop', 'domain' => 'shop.test',
+        'site_type' => 'php', 'serving_profile' => 'php', 'php_version' => '8.4',
+        'status' => 'active', 'web_root' => '/',
+    ]);
+
+    if ($settings !== []) {
+        ApplicationPhpSettings::create(['application_id' => $source->id, ...$settings]);
+    }
+
+    return $source->fresh(['phpSettings']);
+}
+
+it('carries the source PHP settings onto the clone', function () {
+    fakeCloneServer();
+
+    $source = phpSourceApp([
+        'memory_limit' => '1024M',
+        'upload_max_filesize' => '512M',
+        'post_max_size' => '512M',
+        'max_execution_time' => 120,
+        'php_timezone' => 'Asia/Kolkata',
+    ]);
+
+    $clone = Application::find(runClone($source, 'shop-clone.test')->target_application_id)
+        ->fresh(['phpSettings']);
+
+    expect($clone->phpSettings)->not->toBeNull()
+        ->and($clone->phpSettings->memory_limit)->toBe('1024M')
+        ->and($clone->phpSettings->upload_max_filesize)->toBe('512M')
+        ->and($clone->phpSettings->post_max_size)->toBe('512M')
+        ->and($clone->phpSettings->max_execution_time)->toBe(120)
+        ->and($clone->phpSettings->php_timezone)->toBe('Asia/Kolkata')
+        // Its own row, not the source's reassigned.
+        ->and($clone->phpSettings->id)->not->toBe($source->phpSettings->id)
+        ->and($source->fresh(['phpSettings'])->phpSettings)->not->toBeNull();
+});
+
+it('does not re-harden a clone whose source had relaxed the list', function () {
+    // Provisioning fills a null disable_functions, which is right for a new site but would break
+    // a clone whose source relaxed the list on purpose.
+    fakeCloneServer();
+
+    $source = phpSourceApp(['disable_functions' => 'exec']);
+
+    $clone = Application::find(runClone($source, 'shop-clone.test')->target_application_id)
+        ->fresh(['phpSettings']);
+
+    expect($clone->phpSettings->disable_functions)->toBe('exec')
+        ->and($clone->phpSettings->disable_functions)
+        ->not->toBe(ApplicationPhpSettings::STRICT_DISABLED_FUNCTIONS);
+});
+
+it('carries the provisioned-list record onto the clone so it is judged by the same list (RC-3)', function () {
+    fakeCloneServer();
+
+    $source = phpSourceApp(['disable_functions' => 'exec,system']);
+    $source->phpSettings->forceFill(['provisioned_disable_functions' => 'exec,system,passthru'])->save();
+
+    $clone = Application::find(runClone($source->fresh(), 'shop-clone.test')->target_application_id)
+        ->fresh(['phpSettings']);
+
+    expect($clone->phpSettings->disable_functions)->toBe('exec,system')
+        ->and($clone->phpSettings->provisioned_disable_functions)->toBe('exec,system,passthru');
+});
+
+it('keeps an explicitly empty list empty on the clone', function () {
+    // An empty string means "this site disables nothing"; an `empty()` check instead of a null
+    // check would re-harden it.
+    fakeCloneServer();
+
+    $source = phpSourceApp(['disable_functions' => '']);
+
+    $clone = Application::find(runClone($source, 'shop-clone.test')->target_application_id)
+        ->fresh(['phpSettings']);
+
+    expect($clone->phpSettings->disable_functions)->toBe('');
+});
+
+it('still hardens a clone whose source had no settings at all', function () {
+    // An older site may predate the settings row; with nothing inherited, the default applies.
+    fakeCloneServer();
+
+    $source = phpSourceApp();
+
+    $clone = Application::find(runClone($source, 'shop-clone.test')->target_application_id)
+        ->fresh(['phpSettings']);
+
+    expect($clone->phpSettings)->not->toBeNull()
+        ->and($clone->phpSettings->disable_functions)
+        ->toBe(ApplicationPhpSettings::STRICT_DISABLED_FUNCTIONS);
+});
+
+describe('cloning a git application', function () {
+    function gitSource(array $overrides = []): Application
+    {
+        $account = GitAccount::create([
+            'provider' => 'github',
+            'label' => 'Deploy key',
+            'identifier' => 'octocat',
+            'token' => 'ghp_secret',
+        ]);
+
+        return Application::forceCreate(array_merge([
+            'system_user_id' => test()->systemUser->id,
+            'name' => 'Shop API',
+            'slug' => 'shop-api',
+            'domain' => 'api.test',
+            'site_type' => 'git',
+            'serving_profile' => 'php',
+            'php_version' => '8.4',
+            'status' => 'active',
+            // The front controller is in public/, so the served directory is one level below the checkout.
+            'web_root' => '/public',
+            'git_account_id' => $account->id,
+            'repository' => 'octocat/shop-api',
+            'branch' => 'main',
+            'last_commit' => 'abc1234',
+            'last_deployed_at' => now()->subHour(),
+            'deploy_script' => 'composer install',
+        ], $overrides));
+    }
+
+    it('copies the checkout, not just the served directory', function () {
+        fakeCloneServer();
+
+        $source = gitSource();
+        $record = runClone($source, 'api-clone.test');
+
+        expect($record->status->value)->toBe('completed');
+
+        $clone = Application::find($record->target_application_id);
+
+        // Copy `public_html`, not `public_html/public`: the source, composer.json and the `.env`
+        // (at codePath()/.env) live above the served directory.
+        Process::assertRan(function ($p) use ($source, $clone) {
+            if (($p->command[0] ?? '') !== 'rsync') {
+                return false;
+            }
+
+            $command = implode(' ', $p->command);
+
+            return str_contains($command, rtrim($source->codePath(), '/').'/')
+                && str_contains($command, rtrim($clone->codePath(), '/').'/')
+                && ! str_contains($command, '/public/ ');
+        });
+    });
+
+    /** fakeCloneServer(), plus a source `.env` to read and the clone's write captured. */
+    function fakeEnvCloneServer(string $sourceEnv): ArrayObject
+    {
+        $seen = new ArrayObject(['written' => null, 'commands' => []]);
+
+        Process::fake(function ($process) use ($sourceEnv, $seen) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+            $args = ($args[0] ?? '') === 'runuser' ? array_slice($args, 4) : $args;
+            $seen['commands'] = [...$seen['commands'], $args];
+
+            if (($args[0] ?? '') === 'cat' && str_ends_with((string) end($args), '/shop-api/public_html/.env')) {
+                return Process::result(output: $sourceEnv);
+            }
+
+            if (($args[0] ?? '') === 'tee' && str_ends_with((string) end($args), '.env.panel-tmp')) {
+                $seen['written'] = [end($args), (string) $process->input];
+            }
+
+            if (in_array(($args[0] ?? ''), ['mysql', 'mariadb'], true)
+                && str_contains((string) $process->input, 'information_schema.schemata')) {
+                return Process::result(output: '1');
+            }
+
+            return Process::result();
+        });
+
+        return $seen;
+    }
+
+    it('gives the copy its own database and points its .env at it (CLN-01)', function () {
+        $seen = fakeEnvCloneServer(implode("\n", [
+            'APP_NAME="Shop API"',
+            'APP_URL=https://api.test',
+            'DB_DATABASE=shop_db',
+            'DB_USERNAME=shop_user',
+            "DB_PASSWORD='s3cret'",
+            'DATABASE_URL=mysql://shop_user:s3cret@127.0.0.1:3306/shop_db',
+            'MAIL_HOST=smtp.example.com',
+        ])."\n");
+
+        $source = gitSource();
+        $database = Database::create(['name' => 'shop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+        DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_user', 'password' => 's3cret', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+        $record = runClone($source, 'api-clone.test');
+
+        expect($record->status->value)->toBe('completed');
+
+        $clone = Application::find($record->target_application_id);
+        $copy = Database::where('application_id', $clone->id)->with('users')->first();
+        $user = $copy?->users->first();
+
+        // A database of its own, and the source's untouched and still the source's.
+        expect($copy)->not->toBeNull()
+            ->and($copy->name)->not->toBe('shop_db')
+            ->and($database->fresh()->application_id)->toBe($source->id);
+
+        [$path, $written] = $seen['written'];
+
+        expect($path)->toBe($clone->codePath().'/.env.panel-tmp')
+            ->and($written)->toBe(implode("\n", [
+                'APP_NAME="Shop API"',
+                'APP_URL=https://api-clone.test',
+                "DB_DATABASE={$copy->name}",
+                "DB_USERNAME={$user->username}",
+                "DB_PASSWORD='{$user->password}'",
+                'DATABASE_URL=mysql://'.rawurlencode($user->username).':'.rawurlencode($user->password)."@127.0.0.1:3306/{$copy->name}",
+                'MAIL_HOST=smtp.example.com',
+            ])."\n");
+
+        expect(collect($seen['commands'])->contains(fn ($c) => ($c[0] ?? '') === 'mysqldump' && in_array('shop_db', $c, true)))->toBeTrue();
+    });
+
+    it('drops the database it made when the clone fails after it', function () {
+        Process::fake(function ($process) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+            $args = ($args[0] ?? '') === 'runuser' ? array_slice($args, 4) : $args;
+
+            if (($args[0] ?? '') === 'tee' && str_ends_with((string) end($args), '.env.panel-tmp')) {
+                return Process::result(exitCode: 1, errorOutput: 'No space left on device');
+            }
+
+            if (in_array(($args[0] ?? ''), ['mysql', 'mariadb'], true)
+                && str_contains((string) $process->input, 'information_schema.schemata')) {
+                return Process::result(output: '1');
+            }
+
+            return Process::result();
+        });
+
+        $source = gitSource();
+        $database = Database::create(['name' => 'shop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+        DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_user', 'password' => 's3cret', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+        expect(runClone($source, 'api-clone.test')->status->value)->toBe('failed')
+            ->and(Database::pluck('name')->all())->toBe(['shop_db']);
+    });
+
+    it('still points a copy with no database at its own address', function () {
+        $seen = fakeEnvCloneServer("APP_URL=https://api.test\nAPP_KEY=base64:abc\n");
+
+        expect(runClone(gitSource(), 'api-clone.test')->status->value)->toBe('completed')
+            ->and($seen['written'][1])->toBe("APP_URL=https://api-clone.test\nAPP_KEY=base64:abc\n")
+            ->and(Database::count())->toBe(0);
+    });
+
+    it('keeps the checkout and its dependencies', function () {
+        fakeCloneServer();
+
+        $record = runClone(gitSource(), 'api-clone.test');
+        expect($record->status->value)->toBe('completed');
+
+        // Excluding these breaks the copy: no remote, branch or HEAD, and a Node site that
+        // cannot start until something rebuilds it.
+        Process::assertRan(function ($p) {
+            if (($p->command[0] ?? '') !== 'rsync') {
+                return false;
+            }
+
+            $command = implode(' ', $p->command);
+
+            return ! str_contains($command, '--exclude .git/')
+                && ! str_contains($command, '--exclude node_modules/');
+        });
+    });
+
+    it('carries the git account, so nothing has to be relinked', function () {
+        fakeCloneServer();
+
+        $source = gitSource();
+        $clone = Application::find(runClone($source, 'api-clone.test')->target_application_id);
+
+        expect($clone->git_account_id)->toBe($source->git_account_id);
+        // The flag the Deployment screen reads to decide whether to demand a relink.
+        expect($clone->git_account_missing ?? null)->toBeNull();
+
+        $payload = ApplicationResource::make($clone->fresh())->resolve();
+        expect($payload['git_account_missing'])->toBeFalse();
+    });
+
+    it('reports the commit it is actually running', function () {
+        fakeCloneServer();
+
+        $source = gitSource();
+        $clone = Application::find(runClone($source, 'api-clone.test')->target_application_id);
+
+        // The files on disk are the source's, so the clone must not report "never deployed".
+        expect($clone->last_commit)->toBe($source->last_commit);
+        expect($clone->last_deployed_at)->not->toBeNull();
+    });
+
+    it('arms deploy-on-push with credentials of its own', function () {
+        fakeCloneServer();
+
+        $source = gitSource([
+            'webhook_enabled' => true,
+            'webhook_identifier' => 'src-hook',
+            'webhook_secret' => 'src-secret',
+            'webhook_provider' => 'github',
+        ]);
+
+        $clone = Application::find(runClone($source, 'api-clone.test')->target_application_id);
+
+        expect($clone->webhook_enabled)->toBeTrue();
+
+        // Never the source's: the identifier is UNIQUE, and a shared secret would let one
+        // `git push` deploy both the original and the clone.
+        expect($clone->webhook_identifier)->not->toBeNull()
+            ->and($clone->webhook_identifier)->not->toBe($source->webhook_identifier);
+        expect($clone->webhook_secret)->not->toBe($source->webhook_secret);
+        expect($clone->webhook_provider)->toBe('github');
+    });
+
+    it('shows the copy its new webhook url, because only the user can register it', function () {
+        fakeCloneServer();
+
+        $source = gitSource([
+            'webhook_enabled' => true,
+            'webhook_identifier' => 'src-hook',
+            'webhook_secret' => 'src-secret',
+            'webhook_provider' => 'github',
+        ]);
+
+        $record = runClone($source, 'api-clone.test');
+
+        // A repository webhook posts to one URL and the panel cannot add the copy's URL to
+        // GitHub, so the screen hands it over the moment the clone finishes.
+        $payload = test()->withHeaders(cloneHeaders())
+            ->getJson("/api/clones/{$record->id}")
+            ->assertOk()
+            ->json('clone.target_webhook');
+
+        $clone = Application::find($record->target_application_id);
+
+        expect($payload)->not->toBeNull();
+        expect($payload['url'])->toContain($clone->webhook_identifier);
+        expect($payload['secret'])->toBe($clone->webhook_secret);
+        expect($payload['provider'])->toBe('github');
+    });
+
+    it('keeps the copy\'s webhook secret from a role that may not deploy', function () {
+        fakeCloneServer();
+
+        $record = runClone(gitSource([
+            'webhook_enabled' => true,
+            'webhook_identifier' => 'src-hook',
+            'webhook_secret' => 'src-secret',
+            'webhook_provider' => 'github',
+        ]), 'api-clone.test');
+
+        // The URL and secret let anyone sign a push and start a deployment, so they follow the
+        // deploy permission, not the clone screen.
+        $viewer = User::factory()->create();
+        grantPermission($viewer, 'app_clone', manage: true);
+
+        // runClone() authenticated as the admin; the guard keeps that user unless told to forget it.
+        Auth::forgetGuards();
+
+        $payload = test()->withHeaders(['Authorization' => 'Bearer '.$viewer->createToken('t')->plainTextToken])
+            ->getJson("/api/clones/{$record->id}")
+            ->assertOk()
+            ->json('clone.target_webhook');
+
+        expect($payload['url'])->not->toBeNull()
+            ->and($payload['secret'])->toBeNull();
+    });
+
+    it('says nothing about a webhook the source never used', function () {
+        fakeCloneServer();
+
+        $record = runClone(gitSource(), 'api-clone.test');
+        $clone = Application::find($record->target_application_id);
+
+        // Credentials nobody asked for would leave a live endpoint with no reason to exist.
+        expect($clone->webhook_enabled)->toBeFalse();
+
+        $payload = test()->withHeaders(cloneHeaders())
+            ->getJson("/api/clones/{$record->id}")
+            ->assertOk()
+            ->json('clone.target_webhook');
+
+        expect($payload)->toBeNull();
+    });
+
+    it('still excludes the checkout for a site type that has none', function () {
+        fakeCloneServer();
+
+        $source = Application::forceCreate([
+            'system_user_id' => test()->systemUser->id,
+            'name' => 'Blog', 'slug' => 'blog', 'domain' => 'blog.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'php_version' => '8.4',
+            'status' => 'active', 'web_root' => '/',
+        ]);
+
+        runClone($source, 'blog-clone.test');
+
+        // A WordPress install has no checkout to preserve; its node_modules is a disposable build dir.
+        Process::assertRan(function ($p) {
+            if (($p->command[0] ?? '') !== 'rsync') {
+                return false;
+            }
+
+            $command = implode(' ', $p->command);
+
+            return str_contains($command, '--exclude .git/')
+                && str_contains($command, '--exclude node_modules/');
+        });
+    });
+});
+
+/*
+ * A cloned Node app copied without node_modules cannot start, and the start check can run before
+ * the process has time to die, so the clone must not report Completed on that alone.
+ */
+it('copies node_modules for a Node site, and leaves it out for anything else', function (string $type, string $profile, bool $kept) {
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id, 'name' => 'Src '.$type,
+        'slug' => 'src-'.$type, 'domain' => "src-{$type}.test", 'site_type' => $type,
+        'serving_profile' => $profile, 'status' => 'active', 'web_root' => '/', 'node_version' => '22',
+        'app_port' => 3002, 'start_command' => 'node server.js', 'php_version' => '8.4',
+    ]);
+
+    runClone($source, "src-{$type}-clone.test");
+
+    Process::assertRan(fn ($p) => in_array('rsync', (array) $p->command, true)
+        && in_array('node_modules/', (array) $p->command, true) === ! $kept);
+})->with([
+    'Uptime Kuma' => ['uptimekuma', 'node', true],
+    'static' => ['static', 'static', false],
+]);
+
+it('fails the clone when the app dies right after starting, instead of calling it Completed', function () {
+    config(['server.applications.settle_seconds' => 1]);
+    $pid = 100;
+
+    Process::fake(function ($process) use (&$pid) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        // A new process each time it is asked: crashed and restarted.
+        if (($args[0] ?? '') === 'systemctl' && ($args[1] ?? '') === 'show' && in_array('--property=MainPID', $args, true)) {
+            return Process::result(output: (string) $pid++);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id, 'name' => 'Kuma',
+        'slug' => 'kuma', 'domain' => 'kuma.test', 'site_type' => 'uptimekuma',
+        'serving_profile' => 'node', 'status' => 'active', 'node_version' => '22',
+        'app_port' => 3003, 'start_command' => 'node server.js',
+    ]);
+
+    $record = runClone($source, 'kuma-clone.test');
+
+    expect($record->status->value)->toBe('failed');
+});
+
+describe('frontend QA 2026-09-26 (CL-B1, CL-B2, CL-B4, CL-B5)', function () {
+    function staticSource(): Application
+    {
+        return Application::forceCreate([
+            'system_user_id' => test()->systemUser->id,
+            'name' => 'Docs', 'slug' => 'docs', 'domain' => 'docs.test', 'site_type' => 'static',
+            'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+        ]);
+    }
+
+    it('refuses a second clone of a site while one is still being made', function () {
+        $source = staticSource();
+        SiteClone::create(['source_application_id' => $source->id, 'domain' => 'first.test', 'status' => 'running']);
+
+        $this->withHeaders(cloneHeaders())
+            ->postJson("/api/applications/{$source->id}/clone", ['domain' => 'second.test'])
+            ->assertStatus(409)
+            ->assertJsonPath('message', __('clone.errors.already_running'));
+
+        expect(SiteClone::count())->toBe(1);
+    });
+
+    it('treats the domain of a clone still being made as taken', function () {
+        $other = staticSource();
+        $source = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id, 'name' => 'Blog', 'slug' => 'blog', 'domain' => 'blog.test',
+            'site_type' => 'static', 'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+        ]);
+        SiteClone::create(['source_application_id' => $other->id, 'domain' => 'copy.test', 'status' => 'pending']);
+
+        $this->withHeaders(cloneHeaders())
+            ->postJson("/api/applications/{$source->id}/clone", ['domain' => 'copy.test'])
+            ->assertJsonValidationErrors('domain');
+    });
+
+    it('releases a clone that never started, so it cannot block the site for good', function () {
+        $source = staticSource();
+        $stuck = SiteClone::create(['source_application_id' => $source->id, 'domain' => 'old.test', 'status' => 'pending']);
+        $stuck->forceFill(['created_at' => now()->subHours(2)])->save();
+        fakeCloneServer();
+
+        $this->withHeaders(cloneHeaders())
+            ->postJson("/api/applications/{$source->id}/clone", ['domain' => 'fresh.test'])
+            ->assertAccepted();
+
+        expect($stuck->fresh()->status->value)->toBe('failed')
+            ->and($stuck->fresh()->reason)->toBe('abandoned');
+    });
+
+    it('stores a reason code and a reference, never the exception text', function () {
+        // A raw exception message can carry SQL and the database path.
+        fakeCloneServer(testPasses: false);
+
+        $record = runClone(staticSource(), 'docs-clone.test');
+
+        expect($record->status->value)->toBe('failed')
+            ->and($record->reason)->toBeIn(['setup_failed', 'copy_failed', 'failed'])
+            ->and($record->reference)->not->toBeEmpty();
+
+        $this->withHeaders(cloneHeaders())
+            ->getJson("/api/clones/{$record->id}")
+            ->assertJsonPath('clone.reason_title', __('clone.cloning_errors.'.$record->reason));
+    });
+
+    it('gives the job more time than the copy it runs', function () {
+        expect((new RunClone(1, 1))->timeout)->toBeGreaterThan((int) config('server.clone.rsync_timeout', 900) + 300);
+    });
+
+    it('removes the half-made copy when the job dies before its own cleanup', function () {
+        fakeCloneServer();
+        $source = staticSource();
+        $clone = SiteClone::create(['source_application_id' => $source->id, 'domain' => 'half.test', 'status' => 'running']);
+        $half = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id, 'name' => 'Docs (Clone)', 'slug' => 'docs-clone',
+            'domain' => 'half.test', 'site_type' => 'static', 'serving_profile' => 'static',
+            'status' => 'pending', 'web_root' => '/', 'cloned_from_application_id' => $source->id,
+        ]);
+
+        (new RunClone($clone->id, $source->id))->failed(new RuntimeException('timed out'));
+
+        expect(Application::find($half->id))->toBeNull()
+            ->and($clone->fresh()->status->value)->toBe('failed')
+            ->and($clone->fresh()->reason)->toBe('crashed');
+    });
+
+    /** The `rm -rf` targets a discard ran (sudo stripped). */
+    function cloneRemovals(callable $run): array
+    {
+        $removed = new ArrayObject;
+        Process::fake(function ($process) use ($removed) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+            if (($args[0] ?? '') === 'rm' && ($args[1] ?? '') === '-rf') {
+                $removed[] = $args[2] ?? '';
+            }
+
+            return Process::result();
+        });
+
+        $run();
+
+        return $removed->getArrayCopy();
+    }
+
+    it('removes the half-made copy\'s files too, and never the source\'s (CL-B4)', function () {
+        $source = staticSource();
+        $clone = SiteClone::create(['source_application_id' => $source->id, 'domain' => 'half.test', 'status' => 'running']);
+        Application::forceCreate([
+            'system_user_id' => $this->systemUser->id, 'name' => 'Docs (Clone)', 'slug' => 'docs-clone',
+            'domain' => 'half.test', 'site_type' => 'static', 'serving_profile' => 'static',
+            'status' => 'pending', 'web_root' => '/', 'cloned_from_application_id' => $source->id,
+        ]);
+
+        $removed = cloneRemovals(fn () => (new RunClone($clone->id, $source->id))->failed(new RuntimeException('timed out')));
+
+        expect($removed)->toContain('/home/siteowner/docs-clone')
+            ->not->toContain('/home/siteowner/docs')
+            ->not->toContain('/home/siteowner');
+    });
+
+    it('keeps the files when the half-made row has no slug, which would mean the whole home', function () {
+        $source = staticSource();
+        $clone = SiteClone::create(['source_application_id' => $source->id, 'domain' => 'half.test', 'status' => 'running']);
+        Application::forceCreate([
+            'system_user_id' => $this->systemUser->id, 'name' => 'Docs (Clone)', 'slug' => null,
+            'domain' => 'half.test', 'site_type' => 'static', 'serving_profile' => 'static',
+            'status' => 'pending', 'web_root' => '/', 'cloned_from_application_id' => $source->id,
+        ]);
+
+        $removed = cloneRemovals(fn () => (new RunClone($clone->id, $source->id))->failed(new RuntimeException('timed out')));
+
+        expect($removed)->not->toContain('/home/siteowner');
+    });
+
+    it('writes the source site\'s own table prefix into the copy\'s wp-config.php', function () {
+        $written = new ArrayObject;
+        Process::fake(function ($process) use ($written) {
+            $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($args[0] ?? '') === 'cat' && str_ends_with($args[1] ?? '', 'wp-config.php')) {
+                return Process::result(output: "<?php\n\$table_prefix = 'shop7_';\n");
+            }
+            if (in_array('tee', $args, true) && str_ends_with((string) end($args), 'wp-config.php')) {
+                $written[] = (string) $process->input;
+            }
+            if (in_array(($args[0] ?? ''), ['mysql', 'mariadb'], true)
+                && str_contains((string) $process->input, 'information_schema.schemata')) {
+                return Process::result(output: '1');
+            }
+
+            return Process::result();
+        });
+
+        $source = Application::forceCreate([
+            'system_user_id' => $this->systemUser->id, 'name' => 'Shop', 'slug' => 'shop', 'domain' => 'shop.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/', 'php_version' => '8.4',
+        ]);
+        $database = Database::create(['name' => 'shop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+        DatabaseUser::create(['database_id' => $database->id, 'username' => 'shop_user', 'password' => 'secret', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+        expect(runClone($source, 'shop-copy.test')->status->value)->toBe('completed');
+
+        $config = collect($written)->first();
+        expect($config)->toContain("\$table_prefix = 'shop7_';")
+            ->not->toContain("\$table_prefix = 'wp_';");
+    });
+});
+
+it('rewrites the clone\'s addresses on the site\'s own PHP', function () {
+    config(['server.php_binary_pattern' => '/usr/bin/php{version}']);
+    fakeCloneServer();
+
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id, 'name' => 'Old Shop', 'slug' => 'oldshop', 'domain' => 'oldshop.test',
+        'site_type' => 'wordpress', 'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/', 'php_version' => '7.4',
+    ]);
+    $database = Database::create(['name' => 'oldshop_db', 'engine' => 'mysql', 'application_id' => $source->id]);
+    DatabaseUser::create(['database_id' => $database->id, 'username' => 'oldshop_user', 'password' => 'secret', 'connection_preference' => 'localhost', 'host' => 'localhost']);
+
+    expect(runClone($source, 'oldshop-clone.test')->status->value)->toBe('completed');
+
+    Process::assertRan(function ($p) {
+        $i = array_search('search-replace', $p->command, true);
+
+        return $i !== false && $p->command[$i - 2] === '/usr/bin/php7.4';
+    });
+});
+
+/** `$usable` bytes free above the reserve, on every disk. */
+function cloneUsableSpace(int $usable): void
+{
+    $folder = Mockery::mock(LocalBackupFolder::class, [app(ServerOps::class), app(HomeDirectoryAccess::class)])->makePartial();
+    $folder->shouldReceive('space')->andReturn(['free' => 1024 ** 3, 'total' => 100 * 1024 ** 3]);
+    app()->instance(LocalBackupFolder::class, $folder);
+    config(['server.backups.local.min_free_percent' => 0, 'server.backups.local.min_free_bytes' => 1024 ** 3 - $usable]);
+}
+
+it('refuses a clone that would not fit, before anything is queued (2026-10-29)', function () {
+    fakeCloneServer();
+    $source = Application::forceCreate([
+        'system_user_id' => $this->systemUser->id, 'name' => 'Big', 'slug' => 'big', 'domain' => 'big.test',
+        'site_type' => 'static', 'serving_profile' => 'static', 'status' => 'active', 'web_root' => '/',
+        'directory_size_bytes' => 100000,
+    ]);
+    cloneUsableSpace(99999);
+
+    $this->withHeaders(cloneHeaders())
+        ->postJson("/api/applications/{$source->id}/clone", ['domain' => 'big-clone.test'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('disk_space');
+
+    expect(SiteClone::count())->toBe(0);
+});

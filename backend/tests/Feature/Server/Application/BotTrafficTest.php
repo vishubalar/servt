@@ -1,0 +1,254 @@
+<?php
+
+use App\Models\Application;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Applications\BotTrafficReporter;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+
+/**
+ * Bot traffic: which crawlers actually hit this site, and which the current settings would block.
+ *
+ * A log the panel could not read must never be reported as "no bots visited you".
+ * `unavailable`, `empty` and `partial` are three different answers.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    ServerCapability::create([
+        'stack' => 'lemp',
+        'web_server' => 'nginx',
+        'capabilities' => ['php' => true],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    $systemUser = SystemUser::create(['username' => 'siteowner', 'home_path' => '/home/siteowner']);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'Blog',
+        'slug' => 'blog',
+        'domain' => 'blog.test',
+        'site_type' => 'php',
+        'serving_profile' => 'php',
+        'status' => 'active',
+        'web_root' => '/',
+        'php_version' => '8.4',
+    ]);
+});
+
+function botTrafficHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->admin->createToken('t')->plainTextToken];
+}
+
+function botTrafficUrl(int $days = 7): string
+{
+    return '/api/applications/'.test()->application->id.'/bot-traffic?days='.$days;
+}
+
+/** One combined-format access line, dated relative to now. */
+function accessLine(string $agent, int $daysAgo = 0): string
+{
+    $stamp = now()->subDays($daysAgo)->format('d/M/Y:H:i:s O');
+
+    return '10.0.0.1 - - ['.$stamp.'] "GET / HTTP/1.1" 200 512 "-" "'.$agent.'"';
+}
+
+/**
+ * `$sslLines` is the HTTPS block's `access-ssl.log` (v7's name); null means the
+ * site has no such file, which is what a site without HTTPS looks like.
+ */
+function fakeAccessLog(array $lines, bool $readable = true, ?array $sslLines = null): void
+{
+    Process::fake(function ($process) use ($lines, $readable, $sslLines) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($args[0] ?? '') === 'tail' && str_ends_with((string) end($args), '/access-ssl.log')) {
+            return $sslLines === null
+                ? Process::result(exitCode: 1, errorOutput: 'No such file or directory')
+                : Process::result(output: implode("\n", $sslLines));
+        }
+
+        if (($args[0] ?? '') === 'tail') {
+            return $readable
+                ? Process::result(output: implode("\n", $lines))
+                : Process::result(exitCode: 1, errorOutput: 'No such file or directory');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+it('counts bot hits and says which ones the current settings block', function () {
+    $this->application->forceFill(['ai_bot_policy' => 'block_training'])->save();
+
+    fakeAccessLog([
+        accessLine('Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)'),
+        accessLine('Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)', 1),
+        accessLine('Mozilla/5.0 (compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot)'),
+        accessLine('Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/120 Safari/537.36'),
+    ]);
+
+    $response = $this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->assertOk();
+
+    $bots = collect($response->json('bot_traffic.bots'))->keyBy('bot');
+
+    expect($response->json('bot_traffic.status'))->toBe('ok')
+        ->and($bots['GPTBot']['hits'])->toBe(2)
+        ->and($bots['GPTBot']['category'])->toBe('training')
+        // block_training blocks it, and the row says so itself.
+        ->and($bots['GPTBot']['blocked'])->toBeTrue()
+        ->and($bots['OAI-SearchBot']['hits'])->toBe(1)
+        ->and($bots['OAI-SearchBot']['category'])->toBe('search')
+        ->and($bots['OAI-SearchBot']['blocked'])->toBeFalse()
+        // A human visitor is not a bot and must not appear.
+        ->and($bots->has('Mozilla'))->toBeFalse();
+});
+
+it('reports unavailable rather than empty when the log cannot be read', function () {
+    fakeAccessLog([], readable: false);
+
+    $this->withHeaders(botTrafficHeaders())
+        ->getJson(botTrafficUrl())
+        ->assertOk()
+        // "I could not look" is not "nothing is there".
+        ->assertJsonPath('bot_traffic.status', 'unavailable')
+        ->assertJsonPath('bot_traffic.totals.hits', 0);
+});
+
+it('reports empty when the log is readable and holds no bot traffic', function () {
+    fakeAccessLog([
+        accessLine('Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/120 Safari/537.36'),
+    ]);
+
+    $this->withHeaders(botTrafficHeaders())
+        ->getJson(botTrafficUrl())
+        ->assertOk()
+        ->assertJsonPath('bot_traffic.status', 'empty')
+        ->assertJsonPath('bot_traffic.totals.bots', 0);
+});
+
+it('ignores hits older than the requested window', function () {
+    fakeAccessLog([
+        accessLine('GPTBot/1.3', 2),
+        accessLine('GPTBot/1.3', 40),
+    ]);
+
+    $response = $this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl(7))->assertOk();
+
+    expect($response->json('bot_traffic.bots.0.hits'))->toBe(1);
+});
+
+it('counts a custom blocked bot and labels it custom', function () {
+    fakeAccessLog([accessLine('Mozilla/5.0 (compatible; SemrushBot/7~bl)')]);
+
+    // Not in the shipped list; it is looked for only because this site added it, so the owner can
+    // see whether their block works.
+    $this->application->botRules()->create(['type' => 'block', 'value' => 'SemrushBot']);
+
+    $bots = collect($this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->json('bot_traffic.bots'))->keyBy('bot');
+
+    expect($bots['SemrushBot']['hits'])->toBe(1)
+        ->and($bots['SemrushBot']['category'])->toBe('custom')
+        ->and($bots['SemrushBot']['blocked'])->toBeTrue();
+});
+
+it('reflects an exemption in the blocked column', function () {
+    $this->application->forceFill(['ai_bot_policy' => 'block_all'])->save();
+    $this->application->botRules()->create(['type' => 'allow', 'value' => 'PerplexityBot']);
+
+    fakeAccessLog([
+        accessLine('Mozilla/5.0 (compatible; PerplexityBot/1.0)'),
+        accessLine('Mozilla/5.0 (compatible; GPTBot/1.3)'),
+    ]);
+
+    $bots = collect($this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->json('bot_traffic.bots'))->keyBy('bot');
+
+    // "Block everything except Perplexity": the report must agree with the vhost.
+    expect($bots['PerplexityBot']['blocked'])->toBeFalse()
+        ->and($bots['GPTBot']['blocked'])->toBeTrue();
+});
+
+it('rejects a window outside the supported range', function () {
+    $this->withHeaders(botTrafficHeaders())
+        ->getJson(botTrafficUrl(400))
+        ->assertStatus(422)
+        ->assertJsonValidationErrors(['days']);
+});
+
+it('refuses a user without log access', function () {
+    fakeAccessLog([accessLine('GPTBot/1.3')]);
+
+    $user = User::factory()->create();
+    grantPermission($user, 'app_bot_blocker', view: true, manage: true);
+
+    // The bot-blocker permission does not imply the log permission; this endpoint is gated separately.
+    $this->withHeaders(['Authorization' => 'Bearer '.$user->createToken('t')->plainTextToken])
+        ->getJson(botTrafficUrl())
+        ->assertForbidden();
+});
+
+it('counts what the server really refused, not what the settings say now (AB-B)', function () {
+    // Blocked by the current settings, but three hits got a 200 before the block existed. Only
+    // the 403 is a refusal.
+    $this->application->forceFill(['ai_bot_policy' => 'block_training'])->save();
+    $line = fn (int $status, int $daysAgo) => str_replace('" 200 ', "\" {$status} ", accessLine('GPTBot/1.0', $daysAgo));
+
+    fakeAccessLog([$line(200, 3), $line(200, 2), $line(200, 2), $line(403, 0)]);
+
+    $response = $this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->assertOk();
+    $bot = collect($response->json('bot_traffic.bots') ?? $response->json('bots'))->firstWhere('bot', 'GPTBot');
+
+    expect($bot['hits'])->toBe(4)
+        ->and($bot['blocked'])->toBeTrue()
+        ->and($bot['blocked_hits'])->toBe(1)
+        ->and($bot['last_status'])->toBe(403);
+
+    expect($response->json('bot_traffic.totals.blocked_hits') ?? $response->json('totals.blocked_hits'))->toBe(1);
+});
+
+it('reports legacy-only bot hits consistently with the v7 Yandex exemption', function () {
+    $this->application->forceFill(['ai_bot_policy' => 'legacy_v7'])->save();
+    fakeAccessLog([accessLine('Jasper/1.0'), accessLine('YandexBot Jasper/1.0')]);
+    $response = $this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->assertOk();
+    $bots = collect($response->json('bot_traffic.bots'))->keyBy('bot');
+    expect($bots['Jasper']['hits'])->toBe(1)->and($bots['Jasper']['blocked'])->toBeTrue();
+});
+
+it('labels a bot from the v7 list as legacy, not as the owner\'s own rule', function () {
+    $this->application->forceFill(['ai_bot_policy' => 'legacy_v7'])->save();
+    // The owner did add this one: it stays theirs, even though v7's list has it too.
+    $this->application->botRules()->create(['type' => 'block', 'value' => 'Cohere']);
+    fakeAccessLog([accessLine('AIMatrix/1.0'), accessLine('Cohere/1.0'), accessLine('GPTBot/1.3')]);
+
+    $bots = collect($this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->assertOk()->json('bot_traffic.bots'))->keyBy('bot');
+
+    expect($bots['AIMatrix']['category'])->toBe('legacy')
+        ->and($bots['Cohere']['category'])->toBe('custom')
+        ->and($bots['GPTBot']['category'])->toBe('training');
+});
+
+it('never labels a bot legacy on a v8 policy', function () {
+    $this->application->forceFill(['ai_bot_policy' => 'block_all'])->save();
+    $this->application->botRules()->create(['type' => 'block', 'value' => 'AIMatrix']);
+    fakeAccessLog([accessLine('AIMatrix/1.0')]);
+
+    $bots = collect($this->withHeaders(botTrafficHeaders())->getJson(botTrafficUrl())->assertOk()->json('bot_traffic.bots'))->keyBy('bot');
+
+    expect($bots['AIMatrix']['category'])->toBe('custom');
+});
+
+it('counts the HTTPS log too, where a site with HTTPS forced logs nearly everything', function () {
+    $this->application->forceFill(['ai_bot_policy' => 'block_training'])->save();
+
+    fakeAccessLog([accessLine('GPTBot/1.0')], sslLines: [accessLine('GPTBot/1.0'), accessLine('GPTBot/1.0')]);
+
+    $bots = collect(app(BotTrafficReporter::class)->report($this->application)['bots']);
+
+    expect($bots->firstWhere('bot', 'GPTBot')['hits'] ?? null)->toBe(3);
+});

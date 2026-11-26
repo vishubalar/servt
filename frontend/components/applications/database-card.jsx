@@ -1,0 +1,84 @@
+import Link from "@/components/ui/app-link";
+import { getTranslations } from "next-intl/server";
+import { Database, TriangleAlert } from "lucide-react";
+import { DatabaseCardActions } from "@/components/applications/database-card-actions";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { SizeText } from "@/components/ui/size-text";
+
+export async function DatabaseCard({
+  application,
+  databases = [],
+  unattached = [],
+  engines = [],
+  failed = false,
+  needsDatabase = false,
+  canSeeDatabases = false,
+  className,
+}) {
+  const t = await getTranslations("applications.databaseCard");
+
+  const missing = databases.length === 0;
+  const warn = missing && needsDatabase && !failed;
+
+  return (
+    <Card className={className}>
+      <CardHeader className="items-center border-b">
+        <CardTitle icon={Database} as="h2" className="flex flex-wrap items-center gap-2">
+          {t("title")}
+          {failed ? null : warn ? (
+            <Badge variant="warning" className="gap-1.5 font-normal">
+              <TriangleAlert className="size-3" />
+              {t("notBackedUp")}
+            </Badge>
+          ) : missing ? null : (
+            <span className="text-xs font-normal tabular-nums text-muted-foreground">
+              {t("count", { count: databases.length })}
+            </span>
+          )}
+        </CardTitle>
+        {canSeeDatabases ? (
+          <CardAction className="row-span-1 flex gap-2 self-center">
+            <DatabaseCardActions
+              application={application}
+              databases={databases}
+              unattached={unattached}
+              engines={engines}
+              warn={warn}
+            />
+          </CardAction>
+        ) : null}
+      </CardHeader>
+
+      <CardContent className="p-0">
+        {failed ? (
+          <p className="px-(--card-spacing) text-sm text-muted-foreground">{t("loadFailed")}</p>
+        ) : missing ? (
+          <p
+            className={`px-(--card-spacing) text-sm ${warn ? "text-warning" : "text-muted-foreground"}`}
+          >
+            {warn ? t("missingWarning") : t("missingFine")}
+          </p>
+        ) : (
+          <ul className="-mt-(--card-spacing) divide-y">
+            {databases.map((database) => (
+              <li key={database.id} className="flex items-center gap-3 px-(--card-spacing) py-3">
+                <Database className="size-4 shrink-0 text-muted-foreground" />
+                <Link
+                  href={`/databases/${database.id}`}
+                  prefetch={false}
+                  className="min-w-0 flex-1 truncate font-mono text-xs underline-offset-4 hover:underline"
+                >
+                  {database.name}
+                </Link>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  <SizeText value={database.size_human} fallback={null} />
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

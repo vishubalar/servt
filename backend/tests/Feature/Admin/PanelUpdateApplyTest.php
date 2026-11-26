@@ -1,0 +1,617 @@
+<?php
+
+use App\Enums\PanelUpdateStatus;
+use App\Http\Resources\PanelUpdateResource;
+use App\Models\ActivityLog;
+use App\Models\PanelUpdate;
+use App\Models\User;
+use App\Services\Panel\PanelUpdateRunner;
+use App\Services\Panel\UpdateScript;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    Cache::flush();
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    // The state dir must not be the real /var/lib path in tests.
+    config()->set('panel_update.state_dir', storage_path('framework/testing/panel-update'));
+    // A state file left by an earlier run is read by reconcile() as the
+    // outcome of whichever row now has that id.
+    File::deleteDirectory(storage_path('framework/testing/panel-update'));
+
+    Http::fake(['api.github.com/*' => Http::response(['tag_name' => 'v99.0.0'])]);
+});
+
+function applyHeader(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+/*
+ * The apply step cannot run end to end here (it checks out a git tag and restarts services), so
+ * these tests assert the generated bash line by line: it is the artefact that runs on a server.
+ */
+describe('the generated update script', function () {
+    beforeEach(function () {
+        $this->update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Pending,
+            'from_version' => '1.0.0',
+            'from_commit' => 'abc1234def5678901234567890abcdef12345678',
+            'to_version' => '99.0.0',
+        ]);
+
+        $this->script = app(UpdateScript::class)->render($this->update, '99.0.0');
+    });
+
+    it('runs every step in the documented order', function () {
+        $positions = collect(UpdateScript::STEPS)
+            ->map(fn (string $step): int => strpos($this->script, "note {$step}"));
+
+        expect($positions->every(fn ($p) => $p !== false))->toBeTrue()
+            ->and($positions->all())->toBe($positions->sort()->values()->all());
+    });
+
+    it('backs up the database before it migrates', function () {
+        expect(strpos($this->script, 'panel:backup-database'))
+            ->toBeLessThan(strpos($this->script, 'artisan migrate --force'));
+    });
+
+    it('takes the panel down before backing up, so no write is lost on rollback', function () {
+        expect(strpos($this->script, 'artisan down'))
+            ->toBeLessThan(strpos($this->script, 'panel:backup-database'));
+    });
+
+    it('seeds permissions after migrating', function () {
+        expect(strpos($this->script, 'artisan migrate --force'))
+            ->toBeLessThan(strpos($this->script, 'db:seed --class=PermissionSeeder'));
+    });
+
+    it('health-checks through the configured URL, not 127.0.0.1', function () {
+        // The web server routes by hostname; a bare-IP request 404s, which
+        // would fail every check and roll back successful updates.
+        expect($this->script)->toContain(rtrim(config('app.url'), '/').'/api/health')
+            ->and($this->script)->not->toContain('127.0.0.1');
+    });
+
+    it('asserts the new version answered, not merely that something answered', function () {
+        expect($this->script)->toContain('EXPECTED_VERSION=\'99.0.0\'')
+            ->and($this->script)->toContain('grep -qF')
+            ->and($this->script)->toContain('$EXPECTED_VERSION')
+            ->and($this->script)->not->toContain('grep -q "');
+    });
+
+    it('retries health checks and records diagnostic output before rollback', function () {
+        expect($this->script)->toContain('seq 1 30')
+            ->and($this->script)->toContain('Health check attempt')
+            ->and($this->script)->toContain('Health response:')
+            ->and($this->script)->toContain('test "$HEALTH_OK" = "1"');
+    });
+
+    it('refuses a target already contained in the current commit before maintenance', function () {
+        $guard = strpos($this->script, 'merge-base --is-ancestor');
+
+        expect($guard)->not->toBeFalse()
+            ->and($guard)->toBeLessThan(strpos($this->script, 'artisan down'))
+            ->and($this->script)->toContain('finish failed target_not_newer');
+    });
+
+    it('restores the previous commit and restarts services on any failure', function () {
+        $phpFpmRestart = 'systemctl restart '.config('panel_update.services.php_fpm');
+
+        expect($this->script)->toContain('trap rollback ERR')
+            ->and($this->script)->toContain('checkout --force abc1234def5678901234567890abcdef12345678')
+            // Both the installed release and the restored checkout need fresh
+            // workers: reload can retain stale OPcache at the unchanged path.
+            ->and(substr_count($this->script, $phpFpmRestart))->toBe(2)
+            ->and($this->script)->not->toContain('systemctl reload '.config('panel_update.services.php_fpm'))
+            // A panel stuck in maintenance is worse than a failed update.
+            ->and(substr_count($this->script, 'artisan up'))->toBeGreaterThan(1);
+    });
+
+    it('restores the database in the rollback only once migrate has started', function () {
+        $touched = strpos($this->script, 'DB_TOUCHED=1');
+        $migrate = strpos($this->script, 'note migrate');
+        $migrateRun = strpos($this->script, 'artisan migrate --force');
+
+        // Set between "note migrate" and the migrate command: a failure before
+        // the migrate step never touches the database.
+        expect($touched)->toBeGreaterThan($migrate)
+            ->and($touched)->toBeLessThan($migrateRun)
+            ->and($this->script)->toContain('if [ "$DB_TOUCHED" = "1" ]; then');
+    });
+
+    it('puts the database back after the old code and before the services restart', function () {
+        $rollback = substr($this->script, strpos($this->script, 'rollback() {'));
+        $composer = strpos($rollback, 'composer install');
+        $restore = strpos($rollback, '-restore.php');
+        $stopQueue = strpos($rollback, 'systemctl stop '.config('panel_update.services.queue'));
+        $restart = strpos($rollback, 'systemctl restart '.config('panel_update.services.php_fpm'));
+
+        expect($composer)->not->toBeFalse()
+            ->and($stopQueue)->not->toBeFalse()
+            ->and($restore)->toBeGreaterThan($composer)
+            // Nothing writes to the database while the file is swapped.
+            ->and($stopQueue)->toBeLessThan($restore)
+            ->and($restart)->toBeGreaterThan($restore)
+            // A failure inside migrate may have changed data only.
+            ->and($rollback)->toContain('if [ "$failed_step" = "migrate" ]; then')
+            ->and($rollback)->toContain('finish failed "$failed_step$DB_SUFFIX" true');
+    });
+
+    it('captures the backup path the rollback restores from', function () {
+        expect($this->script)->toContain('DB_BACKUP="$(sudo -u panel -H ')
+            ->and($this->script)->toContain('artisan panel:backup-database | tail -n 1)"')
+            // Keeps the failed state rather than deleting it.
+            ->and($this->script)->toContain('"${DB_BACKUP%.sqlite}-failed.sqlite"');
+    });
+
+    it('writes the restore helper beside the script, exactly as shipped', function () {
+        $start = strpos($this->script, "<<'PANEL_RESTORE_PHP'\n") + strlen("<<'PANEL_RESTORE_PHP'\n");
+        $end = strpos($this->script, "\nPANEL_RESTORE_PHP\n", $start);
+
+        expect(substr($this->script, $start, $end - $start))
+            ->toBe(rtrim(file_get_contents(resource_path('panel-update/restore-database.php')), "\n"))
+            // Written before the trap can fire, so a failure at any step finds it.
+            ->and(strpos($this->script, 'PANEL_RESTORE_PHP'))->toBeLessThan(strpos($this->script, 'note preflight_git'));
+    });
+
+    it('does not restore automatically when the panel is not on SQLite', function () {
+        // Switched only around the render: the test itself runs on SQLite,
+        // and leaving the default pointed elsewhere breaks every test after.
+        $original = config('database.default');
+        config()->set('database.connections.qa_mysql', ['driver' => 'mysql']);
+        config()->set('database.default', 'qa_mysql');
+
+        try {
+            $script = app(UpdateScript::class)->render($this->update, '99.0.0');
+        } finally {
+            config()->set('database.default', $original);
+        }
+
+        expect($script)->toContain('DB_SUFFIX=":db_not_restored"')
+            ->and($script)->not->toContain('RESTORE_FORCE');
+    });
+
+    it('goes back onto the branch the box was on, not a bare commit', function () {
+        $rollback = substr($this->script, strpos($this->script, 'rollback() {'));
+
+        expect($this->script)->toContain('ORIG_BRANCH="$(')
+            ->and($this->script)->toContain('symbolic-ref --quiet --short HEAD')
+            // Only when that branch still points at the commit being restored.
+            ->and($rollback)->toContain('rev-parse --verify --quiet "$ORIG_BRANCH"')
+            ->and($rollback)->toContain('checkout --force "$ORIG_BRANCH"')
+            ->and(strpos($rollback, 'checkout --force "$ORIG_BRANCH"'))
+            ->toBeGreaterThan(strpos($rollback, 'checkout --force abc1234def5678901234567890abcdef12345678'));
+    });
+
+    it('is still valid bash', function () {
+        $file = tempnam(sys_get_temp_dir(), 'upd');
+        file_put_contents($file, $this->script);
+
+        $check = Process::run(['bash', '-n', $file]);
+        @unlink($file);
+
+        expect($check->successful())->toBeTrue($check->errorOutput());
+    });
+
+    it('defaults to writing progress outside the repository', function () {
+        // A state file inside the tree is destroyed by the checkout whose progress it records.
+        // beforeEach() redirects it to a temp path, so assert the shipped default itself — the value a
+        // real installation runs with.
+        $default = require config_path('panel_update.php');
+
+        expect($default['state_dir'])->not->toStartWith(dirname(base_path()));
+    });
+
+    it('builds as the panel user, because a transient unit has no HOME', function () {
+        // `systemd-run` starts the update with a minimal environment and HOME unset, so Composer refuses
+        // to run ("The HOME or COMPOSER_HOME environment variable must be set") and every update rolled
+        // back at composer_install.
+        //
+        // Running as root is wrong too: vendor/, node_modules/ and .next/ would be root-owned under
+        // services that run as `panel`, and Next.js cannot write its cache into them.
+        $user = config('panel_update.app_user');
+
+        expect($this->script)->toContain("sudo -u {$user} -H composer install")
+            ->and($this->script)->toContain("sudo -u {$user} -H env \"PATH=")
+            // No bare invocation left behind. Asserted on the line start so a step that reverts to root
+            // fails here.
+            ->and($this->script)->not->toMatch('/\n\s*composer install/')
+            ->and($this->script)->not->toMatch('/\n\s*env "PATH=/');
+    });
+
+    it('never runs git as root, or the update wedges the box for good', function () {
+        // `git checkout --force` writes every file as the calling user. Run as root against a tree owned
+        // by `panel`, it left root-owned files the panel could no longer check out or clean, so
+        // preflight's clean_working_tree failed for good and every later update was refused.
+        $user = config('panel_update.app_user');
+
+        foreach (['rev-parse', 'fetch', 'checkout'] as $verb) {
+            expect($this->script)->toMatch('/sudo -u \''.$user.'\' -H git -c [^\n]*'.$verb.'/')
+                ->and($this->script)->not->toMatch('/(?<!-H )git -c [^\n]*'.$verb.'/');
+        }
+    });
+
+    it('runs artisan as the panel account, except the one command needing root', function () {
+        // A successful update must not leave root-owned files under backend/storage: compiled Blade
+        // views from `optimize` (php-fpm runs as `panel` and cannot overwrite them) and the
+        // `panel:backup-database` dump (a root-owned 0640 backup the panel cannot read back).
+        //
+        // migrate is the sharp one: SQLite writes -wal and -shm beside the database, and root-owned
+        // ones make the panel's own database unwritable right after a "successful" update.
+        $user = config('panel_update.app_user');
+
+        foreach (['migrate --force', 'optimize', 'panel:backup-database', 'artisan up', 'artisan down'] as $call) {
+            expect($this->script)->not->toMatch('/\n\s*\/usr\/bin\/php[0-9.]+ [^\n]*'.preg_quote($call, '/').'/');
+        }
+
+        // ...and sudoers stays root, because it writes /etc/sudoers.d.
+        expect($this->script)->toMatch('/\n\s*\/usr\/bin\/php[0-9.]+ [^\n]*panel:sudoers/')
+            ->and($this->script)->not->toContain("sudo -u {$user} -H /usr/bin/php8.4 ".dirname(base_path()).'/backend/artisan panel:sudoers');
+    });
+
+    it('pins PATH for the frontend build', function () {
+        // npm's shebang is `env node`; unpinned, the build silently uses
+        // whatever node happens to be first on PATH.
+        expect($this->script)->toContain('env "PATH='.config('panel_update.node_bin_dir'));
+    });
+
+    it('echoes instead of executing in dry-run mode', function () {
+        $dry = app(UpdateScript::class)->render($this->update, '99.0.0', dryRun: true);
+
+        expect($dry)->toContain('echo DRY-RUN: sudo -u \'panel\' -H git -c')
+            // The mutating ones. `checkout` and `fetch` must never run for
+            // real here; the preflight read below is the deliberate exception.
+            ->and($dry)->not->toContain("\ngit -c safe.directory=/var/www/panel -C '/var/www/panel' checkout")
+            ->and($dry)->not->toContain("\ngit -c safe.directory=/var/www/panel -C '/var/www/panel' fetch");
+    });
+
+    it('really reads the repository during a dry run, rather than echoing that too', function () {
+        // A dry run must answer "would the update work", which echoing every command cannot: where git
+        // refuses the repository as dubiously owned (the update runs as root through systemd-run, which
+        // does not carry root's gitconfig), a dry run reported `succeeded` while the first real command
+        // would have failed.
+        $dry = app(UpdateScript::class)->render($this->update, '99.0.0', dryRun: true);
+
+        expect($dry)->toContain('note preflight_git')
+            ->and($dry)->toMatch('/note preflight_git\n(.|\n)*?sudo -u \'panel\' -H git -c /');
+    });
+
+    it('repairs root-owned files inside .git before fetching', function () {
+        /*
+         * install.sh hands the tree to the app user, then runs `git config` (and `git fetch` on a
+         * re-run) as root, leaving root-owned files inside .git. Every later fetch as the app user fails
+         * ("cannot open '.git/FETCH_HEAD': Permission denied").
+         *
+         * `safe.directory` does not cover it: that forgives git's ownership check, not file permissions.
+         * The repair has to run here, since an installer fix reaches fresh installs only.
+         */
+        $script = app(UpdateScript::class)->render($this->update, '99.0.0');
+
+        expect($script)->toMatch('/chown -R panel:panel \S+\/\.git/');
+    });
+
+    it('proves git can write, not just read, before maintenance mode', function () {
+        /*
+         * `rev-parse HEAD` only reads, so it passed where the next command (a fetch, which writes
+         * FETCH_HEAD) was about to fail; the real failure landed mid-update.
+         */
+        $script = app(UpdateScript::class)->render($this->update, '99.0.0');
+
+        expect($script)->toContain('test -w')
+            // Ordering is the point: after `preflight_git`, before maintenance mode. A write test that runs
+            // later is just a more accurate way to fail at the same bad moment.
+            ->and(strpos($script, 'test -w'))->toBeGreaterThan(strpos($script, 'note preflight_git'))
+            ->and(strpos($script, 'test -w'))->toBeLessThan(strpos($script, 'note maintenance_on'));
+    });
+
+    it('carries the safe.directory exception on every git call', function () {
+        // Not left to ambient config: install.sh writes the exception into
+        // root's ~/.gitconfig, and `systemd-run` starts the update with its
+        // own environment, so git never reads that file.
+        $script = app(UpdateScript::class)->render($this->update, '99.0.0');
+
+        expect($script)->not->toMatch('/(?<!-c )git -C/')
+            ->and(substr_count($script, "git -c 'safe.directory="))->toBeGreaterThanOrEqual(4);
+    });
+
+    it('does not let the dry-run health check fail into a rollback', function () {
+        // The health check is a pipeline. Prefixing it with `echo` would feed
+        // the printed command text into grep, which never matches — so a dry
+        // run would always end in a rollback and tell the operator nothing.
+        $dry = app(UpdateScript::class)->render($this->update, '99.0.0', dryRun: true);
+
+        expect($dry)->toContain("echo 'DRY-RUN: health check skipped'")
+            ->and($dry)->not->toContain('| grep');
+    });
+});
+
+describe('version validation', function () {
+    it('accepts real release versions', function () {
+        foreach (['1.0.0', 'v1.0.0', '0.1', '10.20.30.40'] as $version) {
+            expect(UpdateScript::isValidVersion($version))->toBeTrue();
+        }
+    });
+
+    it('rejects anything that could carry a shell payload', function () {
+        // The version is interpolated into a shell script. Provenance from
+        // the release host is not a reason to extend trust.
+        foreach (['1.0.0; rm -rf /', '$(whoami)', '`id`', '1.0.0 && curl evil', '../../etc', ''] as $version) {
+            expect(UpdateScript::isValidVersion($version))->toBeFalse();
+        }
+    });
+});
+
+describe('starting an update', function () {
+    it('refuses when the panel is already on the newest version', function () {
+        // Its own release URL: `beforeEach` already faked api.github.com with v99 and the first
+        // matching stub wins, so faking the same host here changed nothing.
+        config(['panel_update.releases_url' => 'https://releases.test/latest']);
+        Http::fake(['releases.test/*' => Http::response(['tag_name' => 'v0.0.1'])]);
+
+        $this->withHeaders(applyHeader())->postJson('/api/admin/panel-update')
+            ->assertUnprocessable()->assertJsonValidationErrors('version');
+
+        expect(PanelUpdate::count())->toBe(0);
+    });
+
+    it('refuses a second update while one is in flight', function () {
+        PanelUpdate::create(['status' => PanelUpdateStatus::Running, 'to_version' => '99.0.0']);
+
+        $this->withHeaders(applyHeader())->postJson('/api/admin/panel-update?dry_run=1')
+            ->assertUnprocessable()->assertJsonValidationErrors('version');
+
+        expect(PanelUpdate::count())->toBe(1);
+    });
+
+    it('denies a non-admin', function () {
+        $user = User::factory()->create();
+        $token = $user->createToken('t')->plainTextToken;
+
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/admin/panel-update')
+            ->assertForbidden();
+
+        expect(PanelUpdate::count())->toBe(0);
+    });
+
+    it('denies an unauthenticated request', function () {
+        $this->postJson('/api/admin/panel-update')->assertUnauthorized();
+        expect(PanelUpdate::count())->toBe(0);
+    });
+
+});
+
+describe('progress reconciliation', function () {
+    it('reads a completed run out of the state file and logs it', function () {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Running,
+            'from_version' => '1.0.0',
+            'to_version' => '99.0.0',
+        ]);
+
+        $path = app(UpdateScript::class)->statePath($update);
+        @mkdir(dirname($path), 0750, true);
+        file_put_contents($path, json_encode([
+            'step' => 'health_check',
+            'status' => 'succeeded',
+            'commit' => 'ffffffffffffffffffffffffffffffffffffffff',
+        ]));
+
+        // This is the whole point: the process that started the update is
+        // gone — php-fpm and the queue were restarted underneath it.
+        $reconciled = app(PanelUpdateRunner::class)->reconcile($update);
+
+        expect($reconciled->status)->toBe(PanelUpdateStatus::Succeeded)
+            ->and($reconciled->to_commit)->toBe('ffffffffffffffffffffffffffffffffffffffff')
+            ->and($reconciled->finished_at)->not->toBeNull();
+
+        // The row itself is not where an admin looks to find out what
+        // happened — the activity log is, and reconcile() is the only place
+        // that ever runs once the process that started the update is gone.
+        $log = ActivityLog::where('type', 'panel_update')->where('action', 'succeeded')->first();
+        expect($log)->not->toBeNull()
+            ->and($log->user_id)->toBe($this->admin->id)
+            ->and($log->subject_id)->toBe($update->id)
+            ->and($log->properties['to_version'])->toBe('99.0.0');
+
+        @unlink($path);
+    });
+
+    it('keeps a finished dry run from reading as an update (FS-C2)', function () {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Running,
+            'dry_run' => true,
+            'from_version' => '1.0.0',
+            'to_version' => null,
+        ]);
+
+        $path = app(UpdateScript::class)->statePath($update);
+        @mkdir(dirname($path), 0750, true);
+        file_put_contents($path, json_encode(['step' => 'health_check', 'status' => 'succeeded']));
+
+        $reconciled = app(PanelUpdateRunner::class)->reconcile($update);
+
+        expect(PanelUpdateResource::make($reconciled)->resolve())
+            ->toMatchArray(['dry_run' => true, 'to_version' => null, 'status' => 'succeeded'])
+            ->and(ActivityLog::where('type', 'panel_update')->where('action', 'dry_run_succeeded')->exists())->toBeTrue()
+            ->and(ActivityLog::where('type', 'panel_update')->where('action', 'succeeded')->exists())->toBeFalse();
+
+        @unlink($path);
+    });
+
+    it('records the failed step as the reason, marks the rollback, and logs it', function () {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Running,
+            'from_version' => '1.0.0',
+            'to_version' => '99.0.0',
+        ]);
+
+        $path = app(UpdateScript::class)->statePath($update);
+        @mkdir(dirname($path), 0750, true);
+        file_put_contents($path, json_encode([
+            'step' => 'rollback',
+            'status' => 'failed',
+            'reason' => 'frontend_build',
+        ]));
+
+        $reconciled = app(PanelUpdateRunner::class)->reconcile($update);
+
+        expect($reconciled->status)->toBe(PanelUpdateStatus::Failed)
+            ->and($reconciled->reason)->toBe('frontend_build')
+            ->and($reconciled->rolled_back)->toBeTrue();
+
+        $log = ActivityLog::where('type', 'panel_update')->where('action', 'failed')->first();
+        expect($log)->not->toBeNull()
+            ->and($log->user_id)->toBe($this->admin->id)
+            ->and($log->subject_id)->toBe($update->id)
+            ->and($log->properties['reason'])->toBe('frontend_build')
+            ->and($log->properties['rolled_back'])->toBeTrue();
+
+        @unlink($path);
+    });
+
+    it('does not claim a rollback when the downgrade guard changed nothing', function () {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Running,
+            'from_version' => '1.0.7',
+            'to_version' => '1.0.7',
+        ]);
+
+        $path = app(UpdateScript::class)->statePath($update);
+        @mkdir(dirname($path), 0750, true);
+        file_put_contents($path, json_encode([
+            'step' => 'fetch_release',
+            'status' => 'failed',
+            'reason' => 'target_not_newer',
+            'rolled_back' => false,
+        ]));
+
+        expect(app(PanelUpdateRunner::class)->reconcile($update)->rolled_back)->toBeFalse();
+
+        @unlink($path);
+    });
+
+    it('does not log again once a run has already settled', function () {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Succeeded,
+            'to_version' => '99.0.0',
+        ]);
+
+        $path = app(UpdateScript::class)->statePath($update);
+        @mkdir(dirname($path), 0750, true);
+        file_put_contents($path, json_encode(['step' => 'health_check', 'status' => 'succeeded']));
+
+        app(PanelUpdateRunner::class)->reconcile($update);
+
+        expect(ActivityLog::where('type', 'panel_update')->where('action', 'succeeded')->count())->toBe(0);
+
+        @unlink($path);
+    });
+
+    it('never re-opens a settled run', function () {
+        $update = PanelUpdate::create([
+            'status' => PanelUpdateStatus::Succeeded,
+            'to_version' => '99.0.0',
+        ]);
+
+        $path = app(UpdateScript::class)->statePath($update);
+        @mkdir(dirname($path), 0750, true);
+        file_put_contents($path, json_encode(['step' => 'migrate', 'status' => 'running']));
+
+        expect(app(PanelUpdateRunner::class)->reconcile($update)->status)
+            ->toBe(PanelUpdateStatus::Succeeded);
+
+        @unlink($path);
+    });
+
+    it('leaves the row alone when no state file exists yet', function () {
+        $update = PanelUpdate::create([
+            'status' => PanelUpdateStatus::Pending,
+            'to_version' => '99.0.0',
+        ]);
+
+        expect(app(PanelUpdateRunner::class)->reconcile($update)->status)
+            ->toBe(PanelUpdateStatus::Pending);
+    });
+});
+
+describe('the status endpoint', function () {
+    it('reports the step number and total so a progress bar can be drawn', function () {
+        $update = PanelUpdate::create([
+            'status' => PanelUpdateStatus::Running,
+            'current_step' => 'migrate',
+            'to_version' => '99.0.0',
+        ]);
+
+        $response = $this->withHeaders(applyHeader())
+            ->getJson("/api/admin/panel-update/{$update->id}");
+
+        $response->assertOk()
+            ->assertJsonPath('panel_update.current_step', 'migrate')
+            // Derived, not hardcoded: the ordinal is a property of the step
+            // list, and pinning the number here makes inserting a step fail an
+            // assertion about something else entirely.
+            ->assertJsonPath('panel_update.step_number', array_search('migrate', UpdateScript::STEPS, true) + 1)
+            ->assertJsonPath('panel_update.total_steps', count(UpdateScript::STEPS));
+
+        expect($response->json('panel_update.current_step_title'))
+            ->toBe('Updating the database schema');
+    });
+
+    it('returns a bounded redacted log tail to the administrator', function () {
+        $update = PanelUpdate::create([
+            'user_id' => $this->admin->id,
+            'status' => PanelUpdateStatus::Running,
+            'to_version' => '99.0.0',
+        ]);
+
+        $log = config('panel_update.state_dir').'/update-'.$update->id.'.log';
+        @mkdir(dirname($log), 0750, true);
+        file_put_contents($log, implode("\n", [
+            'Installing dependencies',
+            'Authorization: Bearer secret-token',
+            'APP_KEY=base64:should-not-leak',
+            'Health check attempt 1/30 failed',
+        ]));
+
+        try {
+            $response = $this->withHeaders(applyHeader())
+                ->getJson("/api/admin/panel-update/{$update->id}")
+                ->assertOk()
+                ->assertJsonPath('panel_update.output_truncated', false);
+
+            expect($response->json('panel_update.output'))
+                ->toContain('Installing dependencies')
+                ->toContain('Health check attempt 1/30 failed')
+                ->toContain('[REDACTED]')
+                ->not->toContain('secret-token')
+                ->not->toContain('should-not-leak');
+        } finally {
+            @unlink($log);
+        }
+    });
+
+    it('does not expose update output outside the admin route', function () {
+        $user = User::factory()->create();
+        $token = $user->createToken('t')->plainTextToken;
+        $update = PanelUpdate::create([
+            'status' => PanelUpdateStatus::Running,
+            'to_version' => '99.0.0',
+        ]);
+
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson("/api/admin/panel-update/{$update->id}")
+            ->assertForbidden();
+    });
+});

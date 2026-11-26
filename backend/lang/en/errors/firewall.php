@@ -1,0 +1,13 @@
+<?php
+
+return [
+    'operation_failed' => 'The firewall operation failed on the server.',
+    'duplicate' => 'A firewall rule with these settings already exists.',
+    'conflict' => 'A rule for port :ports with the same protocol and source already exists (:action). ufw keeps only one rule per port, protocol and source, so adding the opposite one would replace it. Edit that rule instead.',
+    'protected_rule' => 'The rule for port :ports is managed by the panel — removing it could cut off access to this server. It cannot be removed while the firewall is on. Turn the firewall off first, or add your own rule alongside it.',
+    'protected_rule_edit' => 'The rule for port :ports is managed by the panel — changing it could cut off access to this server. While the firewall is on, only its description can be changed. Turn the firewall off to edit it, or add your own rule alongside it.',
+    'invalid_source' => 'The source must be a valid IP address or CIDR range.',
+    'ssh_lockout' => 'This is the only rule allowing SSH on port :port. Removing it would lock you out of this server. Add another rule for that port first, or disable the firewall.',
+    'unmanaged_not_found' => 'That rule is no longer in the server\'s firewall. Refresh the page to see the current rules.',
+    'range_needs_protocol' => 'A range of ports needs one protocol. Choose TCP or UDP, or add two rules.',
+];

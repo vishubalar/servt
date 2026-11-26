@@ -1,0 +1,23 @@
+<?php
+
+return [
+    'not_installed' => 'fail2ban no está instalado en este servidor.',
+    'already_installed' => 'fail2ban ya está instalado.',
+    'already_installing' => 'fail2ban ya se está instalando. Espere a que termine esa instalación.',
+    'not_running' => 'fail2ban está instalado pero no se está ejecutando.',
+    'foreign_jail_local' => 'El panel no escribió :path, así que no lo sobrescribirá. Fail2ban ya está configurado ahí a mano o por otro panel: mueve o elimina ese archivo si quieres que el panel gestione estos ajustes.',
+    'jail_not_active' => 'La cárcel :jail no está activa.',
+    'not_banned' => 'Esa dirección IP no está bloqueada actualmente.',
+    'lockout_risk' => 'Activar la cárcel SSH puede dejarle sin acceso a este servidor. Añada su dirección IP a la lista de exclusión o confirme que acepta el riesgo.',
+    'ip_ignored' => 'Esa dirección IP está en su lista de exclusión. Quítela de allí primero si realmente quiere bloquearla.',
+    'ip_own_address' => 'Esa es la propia dirección de este servidor. Bloquearla puede aislar el panel de su base de datos y dejarlo inaccesible, por lo que no se permite.',
+    'ip_your_address' => 'Esa es la dirección desde la que está conectado. Bloquearla le dejaría fuera de este servidor, y en la cárcel recidive también de este panel, por lo que no se puede bloquear desde aquí.',
+    'operation_failed' => 'La operación de fail2ban falló.',
+    'bantime_too_short' => 'El tiempo de bloqueo debe ser de al menos 60 segundos, o -1 para un bloqueo permanente.',
+    // FS-C45: the application's own ban list, ban and unban.
+    'app_jail_not_enabled' => 'Fail2ban no está ejecutando una jaula para esta aplicación. Active primero su protección fail2ban.',
+    // One ignore-list entry at a time (2026-10-16).
+    'ignore_ip_exists' => 'Esa dirección ya está en la lista de ignorados.',
+    'ignore_ip_missing' => 'Esa dirección no está en la lista de ignorados. Recargue la página para ver la lista actual.',
+    'ignore_list_full' => 'La lista de ignorados está llena (100 entradas). Quite una o use un rango que cubra varias.',
+];

@@ -1,0 +1,254 @@
+<?php
+
+use App\Contracts\DatabaseEngine;
+use App\Models\FirewallRule;
+use App\Models\User;
+use App\Services\Server\Databases\DatabaseManager;
+use App\Services\Server\Firewall\RiskyPorts;
+use App\Support\FirewallPresets;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    $this->sshd = sys_get_temp_dir().'/sv-oss-fw-sshd-'.getmypid();
+    File::deleteDirectory($this->sshd);
+    File::makeDirectory($this->sshd, 0755, true);
+    config(['server.sshd_config_dir' => $this->sshd]);
+});
+
+afterEach(fn () => File::deleteDirectory($this->sshd));
+
+/**
+ * `ss -tulpnH` as an unprivileged user: the Process column is blank for
+ * anything we don't own, which is nearly everything.
+ */
+function fakeFirewallEnv(string $ss = ''): void
+{
+    Process::fake(function ($process) use ($ss) {
+        return match ($process->command[0] ?? '') {
+            'ss' => Process::result(output: $ss),
+            default => Process::result(output: "Status: active\nDefault: deny (incoming), allow (outgoing)\n"),
+        };
+    });
+}
+
+function firewall(): array
+{
+    return test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->getJson('/api/firewall')->json();
+}
+
+it('tells the caller its own address, so "only my IP" is one click', function () {
+    fakeFirewallEnv();
+
+    expect(firewall()['your_ip'])->toBe('127.0.0.1');
+});
+
+it('reports the SSH port itself, rather than making the UI ask Settings', function () {
+    File::put("{$this->sshd}/60-panel.conf", "Port 2222\n");
+    fakeFirewallEnv();
+
+    // A firewall-only user gets a 403 from Settings and would fall back to 22: a wrong SSH
+    // port is how somebody locks themselves out.
+    expect(firewall()['ssh_port'])->toBe(2222);
+
+    File::delete("{$this->sshd}/60-panel.conf");
+    expect(firewall()['ssh_port'])->toBe(22);
+});
+
+it('reports what is listening, and where it is bound', function () {
+    fakeFirewallEnv(
+        "tcp LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:((\"nginx\",pid=1073,fd=6))\n"
+        ."tcp LISTEN 0 511 127.0.0.1:6379 0.0.0.0:*\n"
+    );
+
+    $listening = collect(firewall()['listening'])->keyBy('port');
+
+    // Bound to 0.0.0.0 a rule can expose it; bound to loopback no rule can.
+    expect($listening[80]['public'])->toBeTrue()
+        ->and($listening[80]['program'])->toBe('nginx')
+        ->and($listening[6379]['public'])->toBeFalse()
+        ->and($listening[6379]['address'])->toBe('127.0.0.1');
+});
+
+it('says the program is unknown rather than guessing it from the port', function () {
+    fakeFirewallEnv("tcp LISTEN 0 511 0.0.0.0:3306 0.0.0.0:*\n");
+
+    // Naming it "MySQL" because 3306 is conventional would be a guess.
+    expect(collect(firewall()['listening'])->firstWhere('port', 3306)['program'])->toBeNull();
+});
+
+it('counts a service bound to IPv4 and IPv6 once', function () {
+    fakeFirewallEnv(
+        "tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:*\n"
+        ."tcp LISTEN 0 511 [::]:443 [::]:*\n"
+    );
+
+    expect(collect(firewall()['listening'])->where('port', 443))->toHaveCount(1);
+});
+
+it('names risky ports from what is installed, with a reason', function () {
+    fakeFirewallEnv();
+
+    $risky = collect(firewall()['risky_ports'])->keyBy('port');
+
+    // Derived from the installed engines, not hardcoded in the UI.
+    expect($risky->has(3306))->toBeTrue()
+        ->and($risky[3306]['reason'])->toContain('database')
+        ->and($risky->has(6379))->toBeTrue();
+});
+
+it('lets a rule be switched off without losing it', function () {
+    fakeFirewallEnv();
+    $rule = FirewallRule::create([
+        'port_from' => 8080, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'user', 'enabled' => true,
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/firewall/rules/{$rule->id}", ['enabled' => false])
+        ->assertOk()
+        ->assertJsonPath('rule.enabled', false);
+
+    expect(FirewallRule::find($rule->id))->not->toBeNull();
+});
+
+it('does not touch the firewall when only the description changes', function () {
+    $runs = new ArrayObject;
+    Process::fake(function ($process) use ($runs) {
+        $runs[] = $process->command;
+
+        return Process::result(output: "Status: active\n");
+    });
+
+    $rule = FirewallRule::create([
+        'port_from' => 8080, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'user',
+        'description' => 'Aplication', 'enabled' => true,
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/firewall/rules/{$rule->id}", ['description' => 'Application'])
+        ->assertOk();
+
+    expect(collect($runs)->filter(fn ($c) => ($c[0] ?? '') === 'ufw' && in_array('delete', $c, true)))->toBeEmpty();
+});
+
+it('adds the replacement before removing the original when the rule changes', function () {
+    $runs = new ArrayObject;
+    Process::fake(function ($process) use ($runs) {
+        $runs[] = $process->command;
+
+        return Process::result(output: "Status: active\n");
+    });
+
+    $rule = FirewallRule::create([
+        'port_from' => 8080, 'protocol' => 'tcp', 'action' => 'deny', 'origin' => 'user', 'enabled' => true,
+    ]);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson("/api/firewall/rules/{$rule->id}", ['port_from' => 9090])
+        ->assertOk();
+
+    $ufw = collect($runs)->filter(fn ($c) => ($c[0] ?? '') === 'ufw')->values();
+    $addAt = $ufw->search(fn ($c) => ! in_array('delete', $c, true) && in_array('9090/tcp', $c, true));
+    $deleteAt = $ufw->search(fn ($c) => in_array('delete', $c, true));
+
+    // Deleting first leaves a window with no rule; if the add then failed, a deny would
+    // become "allowed".
+    expect($addAt)->not->toBeFalse()
+        ->and($deleteAt)->not->toBeFalse()
+        ->and($addAt)->toBeLessThan($deleteAt);
+});
+
+it('denies editing to a view-only user', function () {
+    fakeFirewallEnv();
+    $rule = FirewallRule::create([
+        'port_from' => 8080, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'user',
+    ]);
+
+    $user = User::factory()->create();
+    grantPermission($user, 'firewall', view: true, manage: false);
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")->getJson('/api/firewall')->assertOk();
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/firewall/rules/{$rule->id}", ['enabled' => false])
+        ->assertForbidden();
+});
+
+describe('the database warning on a port two engines share', function () {
+    /**
+     * @param  array<string, bool>  $installed  engine => available(), in list order
+     */
+    function riskyWith(array $installed): array
+    {
+        $manager = Mockery::mock(DatabaseManager::class);
+        $manager->shouldReceive('engineNames')->andReturn(array_keys($installed));
+
+        foreach ($installed as $engine => $available) {
+            $double = Mockery::mock(DatabaseEngine::class);
+            $double->shouldReceive('available')->andReturn($available);
+            $manager->shouldReceive('engine')->with($engine)->andReturn($double);
+        }
+
+        return collect((new RiskyPorts($manager))->all())->keyBy('port')->all();
+    }
+
+    it('names MySQL on a MySQL server, not the MariaDB that is not there', function () {
+        // MariaDB is listed after MySQL, so a plain "last wins" picks it whatever is installed.
+        $risky = riskyWith(['mysql' => true, 'mariadb' => false]);
+
+        expect($risky[3306]['label'])->toBe('mysql')
+            ->and($risky[3306]['installed'])->toBeTrue();
+    });
+
+    it('names MariaDB on a MariaDB server, whichever order the engines are listed in', function (array $installed) {
+        $risky = riskyWith($installed);
+
+        expect($risky[3306]['label'])->toBe('mariadb')
+            ->and($risky[3306]['installed'])->toBeTrue();
+    })->with([
+        'mysql listed first' => [['mysql' => false, 'mariadb' => true]],
+        'mariadb listed first' => [['mariadb' => true, 'mysql' => false]],
+    ]);
+
+    it('still warns about the port when neither is installed', function () {
+        $risky = riskyWith(['mysql' => false, 'mariadb' => false]);
+
+        expect($risky)->toHaveKey(3306)
+            ->and($risky[3306]['installed'])->toBeFalse();
+    });
+});
+
+it('names the 3306 preset for the database this server runs', function (bool $mariadb, string $label) {
+    $preset = collect(FirewallPresets::all(mariadb: $mariadb))->firstWhere('key', 'mysql');
+
+    // Only the label changes; the key and the rule are the same either way.
+    expect($preset['label'])->toBe($label)
+        ->and($preset['port'])->toBe(3306);
+})->with([
+    'MariaDB server' => [true, 'MariaDB'],
+    'MySQL server, or neither' => [false, 'MySQL'],
+]);
+
+it('asks the server which one it runs when listing the presets', function () {
+    $manager = Mockery::mock(DatabaseManager::class);
+    $engine = Mockery::mock(DatabaseEngine::class);
+    $engine->shouldReceive('available')->andReturn(true);
+    $manager->shouldReceive('engine')->with('mariadb')->andReturn($engine);
+    app()->instance(DatabaseManager::class, $manager);
+
+    $presets = $this->withHeader('Authorization', 'Bearer '.$this->token)
+        ->getJson('/api/firewall/presets')->assertOk()->json('presets');
+
+    expect(collect($presets)->firstWhere('key', 'mysql')['label'])->toBe('MariaDB');
+});
+
+it('finds the 3306 rules when searching for mariadb', function () {
+    expect(FirewallPresets::portFor('MariaDB'))->toBe(3306)
+        ->and(FirewallPresets::portFor('mysql'))->toBe(3306);
+});

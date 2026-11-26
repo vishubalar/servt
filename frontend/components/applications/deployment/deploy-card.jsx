@@ -1,0 +1,303 @@
+import { useState } from "react";
+import Link from "@/components/ui/app-link";
+import { useTranslations } from "next-intl";
+import {
+  Clock,
+  FolderGit2,
+  GitBranch,
+  GitCommitHorizontal,
+  Info,
+  Loader2,
+  Rocket,
+  ScrollText,
+  SquareArrowOutUpRight,
+  TriangleAlert,
+  Unlink,
+} from "lucide-react";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { provisionStepLabel } from "@/lib/applications/provision-steps";
+import { PANEL_CARD } from "@/lib/theme/card-chrome";
+import { cn } from "@/lib/utils";
+import { isDeployIncomplete, liveCommit } from "@/lib/applications/code-on-disk";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { CopyButton } from "@/components/ui/copy-button";
+import { Progress } from "@/components/ui/progress";
+import { StepList } from "@/components/applications/step-list";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { RelinkGitAccountDialog } from "@/components/applications/relink-git-account-dialog";
+import { FACT_CELL, FACT_FRAME, FACT_GRID, FACT_LABEL } from "@/lib/theme/facts";
+
+function commitUrl(repositoryUrl, sha) {
+  if (!repositoryUrl || !sha) return null;
+  try {
+    const u = new URL(repositoryUrl);
+    const path = u.pathname.replace(/\.git$/, "").replace(/^\/+|\/+$/g, "");
+    if (!path) return null;
+    if (u.hostname.includes("github.")) return `${u.origin}/${path}/commit/${sha}`;
+    if (u.hostname.includes("gitlab.")) return `${u.origin}/${path}/-/commit/${sha}`;
+    if (u.hostname.includes("bitbucket."))
+      return `${u.origin}/${path}/commits/${sha}`;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function Fact({ label, children }) {
+  return (
+    <div className={FACT_CELL}>
+      <dt className={FACT_LABEL}>{label}</dt>
+      <dd className="mt-1 min-w-0">{children}</dd>
+    </div>
+  );
+}
+
+function evidenceFor(step, application) {
+  if (step !== "verify") return { kind: "build" };
+  return {
+    kind: "logs",
+    source: application.has_process ? "application_error" : "error",
+  };
+}
+
+export function DeployCard({
+  application,
+  deploying,
+  canManage,
+  canViewLogs = false,
+  onDeploy,
+  onShowBuildLog,
+  gitAccounts = [],
+}) {
+  const t = useTranslations("applications.deployment");
+  const tSource = useTranslations("applications.source");
+  const [relinking, setRelinking] = useState(false);
+  const unlinked = Boolean(application.git_account_missing);
+  const ts = useTranslations("applications.details");
+  const stepLabel = (step) => provisionStepLabel(step, ts);
+  const commit = liveCommit(application);
+  const incomplete = isDeployIncomplete(application);
+  const repository = application.repository ?? application.repository_url;
+  const branch = application.branch ?? "main";
+  const deployFailed =
+    application.status === "active" && (Boolean(application.failed_step) || incomplete);
+  const neverDeployed = !application.last_deployed_at && !commit;
+  const commitHref = commitUrl(application.repository_url, commit);
+  const steps = application.steps ?? [];
+  const evidence = evidenceFor(application.failed_step, application);
+
+  return (
+    <Card className={cn(PANEL_CARD, "border-primary/20 bg-gradient-to-br from-primary/[0.04] via-card to-card")}>
+      <CardHeader className="items-center">
+        <CardTitle className="flex items-center gap-2.5">
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-e1">
+            <Rocket className="size-4" />
+          </span>
+          {t("deploy.title")}
+        </CardTitle>
+        <CardAction className="row-span-1 self-center">
+            <ReasonTooltip
+              reason={!canManage ? DENIED : deploying ? null : unlinked ? tSource("accountMissing") : null}
+            >
+            <Button onClick={onDeploy} disabled={deploying || unlinked || !canManage}>
+              {deploying ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Rocket className="size-4" />
+              )}
+              {deploying
+                ? t("deploy.deploying")
+                : deployFailed
+                  ? t("deploy.redeploy")
+                  : t("deploy.action")}
+            </Button>
+            </ReasonTooltip>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {unlinked ? (
+          <div
+            role="alert"
+            className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-sm text-destructive"
+          >
+            <span className="flex items-start gap-2">
+              <Unlink className="mt-0.5 size-4 shrink-0" />
+              {tSource("accountMissing")}
+            </span>
+            {canManage && gitAccounts.length ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => setRelinking(true)}>
+                {tSource("relink.action")}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+        {deployFailed ? (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/5 px-3 py-2.5 text-sm text-warning"
+          >
+            <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <div className="space-y-0.5">
+                {incomplete ? (
+                  <>
+                    {application.failed_step ? (
+                      <p>{t("deploy.failedAtStep", { step: stepLabel(application.failed_step) })}</p>
+                    ) : null}
+                    <p>{application.code_on_disk?.message || t("deploy.incomplete")}</p>
+                  </>
+                ) : (
+                  <p>{t("deploy.failedAt", { step: stepLabel(application.failed_step) })}</p>
+                )}
+                {application.reference ? (
+                  <p className="font-mono text-xs opacity-90">
+                    {t("deploy.reference", { reference: application.reference })}
+                  </p>
+                ) : null}
+              </div>
+              {evidence.kind === "logs" ? (
+                canViewLogs ? (
+                  <Button variant="outline" size="sm" asChild>
+                    <Link href={`/applications/${application.id}/logs?source=${evidence.source}`}>
+                      <ScrollText className="size-4" />
+                      {evidence.source === "application_error"
+                        ? t("deploy.viewAppErrors")
+                        : t("deploy.viewErrorLog")}
+                    </Link>
+                  </Button>
+                ) : null
+              ) : onShowBuildLog ? (
+                <Button variant="outline" size="sm" onClick={onShowBuildLog}>
+                  <ScrollText className="size-4" />
+                  {t("deploy.viewBuildLog")}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        ) : neverDeployed && !deploying ? (
+          <div className="flex items-start gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2.5 text-sm text-foreground">
+            <Info className="mt-0.5 size-4 shrink-0 text-primary" />
+            <p>{t("deploy.notDeployedYet", { branch })}</p>
+          </div>
+        ) : null}
+
+        <div className={FACT_FRAME}>
+        <dl className={cn(FACT_GRID, "grid-cols-1 sm:grid-cols-2 md:grid-cols-4")}>
+          <Fact icon={FolderGit2} label={t("deploy.repository")}>
+            {repository ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    tabIndex={0}
+                    className="block truncate font-mono text-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  >
+                    {repository}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-sm font-mono text-xs break-all">
+                  {repository}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <span className="block truncate font-mono text-xs">—</span>
+            )}
+          </Fact>
+          <Fact icon={GitBranch} label={t("deploy.branch")}>
+            <span className="block truncate font-mono text-xs">{branch}</span>
+          </Fact>
+          <Fact icon={GitCommitHorizontal} label={t("deploy.liveCommit")}>
+            {commit ? (
+              <span className="flex flex-wrap items-center gap-1.5">
+                {commitHref ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <a
+                        href={commitHref}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 font-mono text-xs text-primary underline-offset-2 hover:underline"
+                      >
+                        {commit.slice(0, 10)}
+                        <SquareArrowOutUpRight className="size-3" />
+                      </a>
+                    </TooltipTrigger>
+                    <TooltipContent>{t("deploy.viewCommit")}</TooltipContent>
+                  </Tooltip>
+                ) : (
+                  <span className="font-mono text-xs">{commit.slice(0, 10)}</span>
+                )}
+                <CopyButton value={commit} className="size-6" />
+                {incomplete ? (
+                  <Badge variant="warning">
+                    {t("deploy.notFullyDeployed")}
+                  </Badge>
+                ) : null}
+              </span>
+            ) : (
+              <span className="text-sm text-muted-foreground">—</span>
+            )}
+          </Fact>
+          <Fact icon={Clock} label={t("deploy.lastDeploy")}>
+            {application.last_deployed_at ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    tabIndex={0}
+                    className="text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  >
+                    {application.last_deployed_at_human ?? application.last_deployed_at}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{application.last_deployed_at}</TooltipContent>
+              </Tooltip>
+            ) : (
+              <span className="text-sm font-medium">{t("deploy.never")}</span>
+            )}
+          </Fact>
+        </dl>
+        </div>
+
+        {deploying ? (
+          <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
+            <p className="flex items-center gap-2 text-sm font-medium">
+              <Loader2 className="size-4 animate-spin" aria-hidden />
+              {t("deploy.inProgress")}
+            </p>
+            <Progress indeterminate className="h-1.5" />
+            <StepList
+              steps={steps}
+              working
+              workingLabel={steps.length ? ts("working") : ts("starting")}
+              label={stepLabel}
+            />
+            <p className="border-t pt-3 text-xs text-muted-foreground">
+              {t("deploy.keepsRunning")}
+            </p>
+          </div>
+        ) : null}
+
+        {canManage && !deploying ? (
+          <p className="text-xs text-muted-foreground">
+            {t("deploy.resetNote", { branch })}
+          </p>
+        ) : null}
+      </CardContent>
+      {unlinked ? (
+        <RelinkGitAccountDialog
+          application={application}
+          accounts={gitAccounts}
+          open={relinking}
+          onOpenChange={setRelinking}
+        />
+      ) : null}
+    </Card>
+  );
+}

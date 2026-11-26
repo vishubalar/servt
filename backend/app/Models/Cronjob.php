@@ -1,0 +1,160 @@
+<?php
+
+namespace App\Models;
+
+use App\Services\Server\CronjobHistory;
+use App\Support\ServerTimezone;
+use Cron\CronExpression;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
+
+#[Fillable(['name', 'slug', 'source_path', 'source_line', 'username', 'system_user_id', 'application_id', 'application_owned', 'command', 'expression', 'active'])]
+class Cronjob extends Model
+{
+    use HasFactory;
+
+    /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'active' => 'boolean',
+            'application_owned' => 'boolean',
+        ];
+    }
+
+    /**
+     * A stable, unique slug from the name, used as the cron.d filename. Suffixes `-2`, `-3`, … on
+     * collision. Stored, not derived from the id, so it survives migration.
+     *
+     * Never longer than {@see MAX_SLUG_LENGTH}, suffix included: a very long cron.d file name
+     * (251 characters) crashes cron itself and stops every job on the server.
+     */
+    public static function uniqueSlug(string $name, ?int $ignoreId = null): string
+    {
+        $base = self::fit(Str::slug($name) ?: 'cronjob', '');
+        $slug = $base;
+        $suffix = 2;
+        $own = $ignoreId ? static::query()->find($ignoreId) : null;
+
+        while (static::query()
+            ->where('slug', $slug)
+            ->when($ignoreId, fn ($query) => $query->where('id', '!=', $ignoreId))
+            ->exists()
+            || ($suffix <= self::MAX_SLUG_PROBES && static::foreignFileAt($slug, $own))
+        ) {
+            $slug = self::fit($base, '-'.$suffix++);
+        }
+
+        return $slug;
+    }
+
+    /** The longest cron.d file name (and log name) a job is given; well under what crashes cron. */
+    public const MAX_SLUG_LENGTH = 64;
+
+    /** `$base` cut so that `$base.$suffix` fits, without a dangling hyphen. */
+    private static function fit(string $base, string $suffix): string
+    {
+        $room = self::MAX_SLUG_LENGTH - strlen($suffix);
+
+        return (rtrim(substr($base, 0, $room), '-') ?: 'cronjob').$suffix;
+    }
+
+    /** How many names {@see uniqueSlug()} checks on disk; past it only the database decides. */
+    private const MAX_SLUG_PROBES = 50;
+
+    /**
+     * Whether cron.d already holds a file of that name that no job owns.
+     *
+     * The slug is the filename, and the reserved-name list only knows the OS's files. Asking the disk
+     * also covers the panel's own files (a job named "panel-scheduler" would overwrite it), so a
+     * clash gets a suffix instead of somebody else's file.
+     */
+    private static function foreignFileAt(string $slug, ?self $own): bool
+    {
+        $path = rtrim((string) config('server.cron_d'), '/').'/'.$slug;
+
+        if (! file_exists($path)) {
+            return false;
+        }
+
+        // A job's own file — or the file it was imported from — is not foreign.
+        return $own === null || ($own->slug !== $slug && $own->source_path !== $path);
+    }
+
+    /**
+     * When cron will next run this job.
+     *
+     * Computed in the SERVER's timezone, not the app's: cron reads schedules against the OS clock.
+     * Null for an inactive job.
+     */
+    public function nextRunAt(): ?Carbon
+    {
+        if (! $this->active || ! CronExpression::isValidExpression((string) $this->expression)) {
+            return null;
+        }
+
+        $timezone = ServerTimezone::get();
+
+        // Carbon::now(), not the string 'now': the cron library resolves the string against the
+        // real clock, which ignores a frozen test time.
+        $date = (new CronExpression((string) $this->expression))
+            ->getNextRunDate(Carbon::now(), 0, false, $timezone);
+
+        return Carbon::instance($date)->setTimezone($timezone);
+    }
+
+    public function systemUser(): BelongsTo
+    {
+        return $this->belongsTo(SystemUser::class);
+    }
+
+    /** The application this job belongs to, if any. Null = server-level job. */
+    public function application(): BelongsTo
+    {
+        return $this->belongsTo(Application::class);
+    }
+
+    /**
+     * The latest run, read from the log by {@see CronjobHistory}; set only where it was read, so
+     * the resource can tell "never ran" (null) from "not asked" (unset).
+     *
+     * @var array<string, mixed>|null
+     */
+    public ?array $lastRun = null;
+
+    public bool $lastRunRead = false;
+
+    /**
+     * @param  array<string, mixed>|null  $run
+     */
+    public function withLastRun(?array $run): static
+    {
+        $this->lastRun = $run;
+        $this->lastRunRead = true;
+
+        return $this;
+    }
+
+    /**
+     * This job's key in the Logs feature, or null when no output has been captured yet.
+     *
+     * Gated on the log file existing, not a stored flag: a job whose entry predates output capture
+     * correctly reports nothing.
+     */
+    public function logKey(): ?string
+    {
+        if ($this->slug === null) {
+            return null;
+        }
+
+        $dir = rtrim((string) config('server.cronjob_log_dir', '/var/log/cronjobs'), '/');
+
+        return is_file("{$dir}/{$this->slug}.log") ? "cronjob_{$this->slug}" : null;
+    }
+}

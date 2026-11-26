@@ -1,0 +1,32 @@
+import { useTranslations } from "next-intl";
+import { FolderOpen } from "lucide-react";
+import { extractFile } from "@/lib/api/files";
+import { dirname } from "@/lib/files/path-helpers";
+import { TargetPathDialog } from "@/components/applications/files/target-path-dialog";
+
+export function ExtractDialog({ appId, file, open, onOpenChange }) {
+  const t = useTranslations("applications.files");
+  if (!file) return null;
+
+  return (
+    <TargetPathDialog
+      appId={appId}
+      file={file}
+      open={open}
+      onOpenChange={onOpenChange}
+      icon={FolderOpen}
+      title={t("extractDialog.title", { name: file.name })}
+      description={t("extractDialog.subtitle")}
+      submitLabel={t("extractDialog.submit")}
+      savingLabel={t("saving")}
+      defaultTarget={dirname(file.path)}
+      allowEmpty
+      emptyPlaceholder={t("targetDialog.rootPlaceholder")}
+      apply={extractFile}
+      successMessage={() => t("extractDialog.done", { name: file.name })}
+      failureMessage={t("extractDialog.failed")}
+      warning={t("extractDialog.warning")}
+      destinationLabel={t("targetDialog.destination")}
+    />
+  );
+}

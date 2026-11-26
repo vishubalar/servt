@@ -1,0 +1,283 @@
+<?php
+
+use App\Models\User;
+use App\Services\ActivityLogger;
+use Illuminate\Support\Facades\Hash;
+use Laravel\Sanctum\PersonalAccessToken;
+
+it('allows an admin to list users', function () {
+    $admin = User::factory()->admin()->create();
+    User::factory()->count(2)->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/users');
+
+    $response->assertOk()->assertJsonCount(3, 'users');
+});
+
+it('denies a regular user from listing users', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/users')
+        ->assertForbidden();
+});
+
+it('allows an admin to create a user', function () {
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/admin/users', userPayload(['username' => 'newuser']));
+
+    $response->assertCreated()->assertJsonPath('user.username', 'newuser');
+    expect(User::where('username', 'newuser')->exists())->toBeTrue();
+});
+
+it('denies a regular user from creating a user', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/admin/users', userPayload(['username' => 'newuser']))
+        ->assertForbidden();
+
+    expect(User::where('username', 'newuser')->exists())->toBeFalse();
+});
+
+it('requires is_admin and at least one role when creating a user', function () {
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/admin/users', [
+            'name' => 'New User', 'username' => 'newuser',
+            'password' => 'Password123', 'password_confirmation' => 'Password123',
+            'role_ids' => [],
+        ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['is_admin', 'role_ids']);
+});
+
+it('allows an admin to reset another user\'s password', function () {
+    $admin = User::factory()->admin()->create();
+    $target = User::factory()->create(['password' => bcrypt('OldPassword123')]);
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/admin/users/{$target->id}/reset-password", [
+            'password' => 'ResetPassword123',
+            'password_confirmation' => 'ResetPassword123',
+        ]);
+
+    $response->assertNoContent();
+    expect(Hash::check('ResetPassword123', $target->fresh()->password))->toBeTrue();
+});
+
+it('denies a regular user from resetting another user\'s password', function () {
+    $user = User::factory()->create();
+    $target = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/admin/users/{$target->id}/reset-password", [
+            'password' => 'ResetPassword123',
+            'password_confirmation' => 'ResetPassword123',
+        ])
+        ->assertForbidden();
+});
+
+it('allows an admin to update a user', function () {
+    $admin = User::factory()->admin()->create();
+    $target = User::factory()->create(['name' => 'Old Name', 'username' => 'oldname']);
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/admin/users/{$target->id}", [
+            'name' => 'New Name',
+            'username' => 'newname',
+            'is_admin' => true,
+        ]);
+
+    $response->assertOk()->assertJsonPath('user.username', 'newname');
+    expect($target->fresh())
+        ->name->toBe('New Name')
+        ->username->toBe('newname')
+        ->is_admin->toBeTrue();
+});
+
+it('denies a regular user from updating a user', function () {
+    $user = User::factory()->create();
+    $target = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson("/api/admin/users/{$target->id}", [
+            'name' => 'New Name',
+            'username' => 'newname',
+            'is_admin' => false,
+        ])
+        ->assertForbidden();
+});
+
+it('allows an admin to delete another user', function () {
+    $admin = User::factory()->admin()->create();
+    $target = User::factory()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/admin/users/{$target->id}")
+        ->assertNoContent();
+
+    expect(User::find($target->id))->toBeNull();
+});
+
+it('keeps a deleted user\'s name on what they did, rather than "System" (FS-C22)', function () {
+    $admin = User::factory()->admin()->create();
+    $target = User::factory()->create(['username' => 'leaver']);
+    app(ActivityLogger::class)->log('user.profile_updated', $target, [], $target);
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/admin/users/{$target->id}")
+        ->assertNoContent();
+
+    $row = collect($this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/activity-log?per_page=100')
+        ->assertOk()
+        ->json('activity_log'))->firstWhere('action', 'profile_updated');
+
+    expect($row['is_system'])->toBeFalse()
+        ->and($row['user'])->toBe(['id' => null, 'username' => 'leaver', 'deleted' => true]);
+});
+
+it('prevents an admin from deleting their own account', function () {
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/admin/users/{$admin->id}")
+        ->assertUnprocessable();
+
+    expect(User::find($admin->id))->not->toBeNull();
+});
+
+it('denies a regular user from deleting a user', function () {
+    $user = User::factory()->create();
+    $target = User::factory()->create();
+    $token = $user->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/admin/users/{$target->id}")
+        ->assertForbidden();
+});
+
+it('lets an admin search users by name or username', function () {
+    // The admin is named explicitly: a random factory name can itself contain
+    // the search term (a "Janet" or a "jane_doe" username), which made this
+    // test fail roughly one run in a hundred.
+    $admin = User::factory()->admin()->create(['name' => 'Zed Admin', 'username' => 'zedadmin']);
+    User::factory()->create(['name' => 'Jane Cooper', 'username' => 'janecooper']);
+    User::factory()->create(['name' => 'John Smith', 'username' => 'johnsmith']);
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/users?search=JANE');
+
+    $response->assertOk()->assertJsonCount(1, 'users')
+        ->assertJsonPath('users.0.username', 'janecooper');
+});
+
+it('lets an admin filter users by is_admin', function () {
+    $admin = User::factory()->admin()->create();
+    User::factory()->count(2)->create(['is_admin' => false]);
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/users?filter[is_admin]=1');
+
+    $response->assertOk()->assertJsonCount(1, 'users')
+        ->assertJsonPath('users.0.username', $admin->username);
+});
+
+it('rejects a non-boolean is_admin filter on the users list', function () {
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/users?filter[is_admin]=maybe')
+        ->assertUnprocessable();
+});
+
+it('rejects an out-of-range per_page on the users list', function () {
+    $admin = User::factory()->admin()->create();
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/users?per_page=999999')
+        ->assertUnprocessable();
+});
+
+it('revokes a deleted user\'s tokens', function () {
+    $admin = User::factory()->admin()->create();
+    $target = User::factory()->create();
+    $target->createToken('target-token');
+    $token = $admin->createToken('test')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/admin/users/{$target->id}")
+        ->assertNoContent();
+
+    expect(PersonalAccessToken::where('tokenable_id', $target->id)->count())->toBe(0);
+});
+
+it('refuses to remove the last administrator', function () {
+    // Deleting yourself is refused, but demoting yourself was not: an only
+    // administrator could clear their own flag and leave nobody able to reach
+    // the admin area (found in code review 2026-09-29).
+    $admin = User::factory()->admin()->create(['username' => 'onlyadmin']);
+
+    $this->actingAs($admin)
+        ->putJson("/api/admin/users/{$admin->id}", ['name' => $admin->name, 'username' => $admin->username, 'is_admin' => false])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('is_admin');
+
+    expect($admin->fresh()->is_admin)->toBeTrue();
+});
+
+it('refuses an administrator removing their own rights, even when another remains', function () {
+    // The frontend locks its own checkbox, but the API allowed it, and the
+    // dialog's second request (role sync) then 403s as a non-admin
+    // (frontend QA FS-C1, 2026-09-29). Another administrator can do it.
+    $admin = User::factory()->admin()->create(['username' => 'steppingdown']);
+    $other = User::factory()->admin()->create();
+
+    $this->actingAs($admin)
+        ->putJson("/api/admin/users/{$admin->id}", ['name' => $admin->name, 'username' => $admin->username, 'is_admin' => false])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors(['is_admin' => __('user.cannot_demote_self')]);
+
+    expect($admin->fresh()->is_admin)->toBeTrue();
+
+    $this->actingAs($other)
+        ->putJson("/api/admin/users/{$admin->id}", ['name' => $admin->name, 'username' => $admin->username, 'is_admin' => false])
+        ->assertOk();
+
+    expect($admin->fresh()->is_admin)->toBeFalse();
+});
+
+it('refuses usernames with letters outside ASCII', function () {
+    // `alpha_dash` alone accepts `qäadmin`, which the form then refuses to
+    // show back as valid (frontend QA FS-A6).
+    $admin = User::factory()->admin()->create();
+
+    $this->actingAs($admin)
+        ->putJson("/api/admin/users/{$admin->id}", ['name' => 'x', 'username' => 'qäadmin', 'is_admin' => true])
+        ->assertJsonValidationErrors('username');
+
+    $this->actingAs($admin)
+        ->putJson('/api/auth/profile', ['name' => 'x', 'username' => 'qäadmin'])
+        ->assertJsonValidationErrors('username');
+});

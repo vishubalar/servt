@@ -1,0 +1,512 @@
+<?php
+
+use App\Enums\DeploymentStatus;
+use App\Enums\DeploymentTrigger;
+use App\Jobs\DeployApplication;
+use App\Models\Application;
+use App\Models\Deployment;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\ActivityLogger;
+use App\Services\Server\Applications\ApplicationProvisioner;
+use App\Services\Server\Applications\DeploymentRecorder;
+use App\Services\Server\Applications\GitDeployer;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Bus\UniqueLock;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    $this->home = sys_get_temp_dir().'/sv-oss-deploy-'.getmypid();
+
+    $systemUser = SystemUser::create([
+        'username' => 'depuser', 'home_path' => $this->home, 'shell' => '/bin/bash', 'sudo' => false,
+    ]);
+
+    $this->application = Application::forceCreate([
+        'system_user_id' => $systemUser->id,
+        'name' => 'App',
+        'slug' => 'app',
+        'domain' => 'app.example.com',
+        'site_type' => 'git',
+        'serving_profile' => 'php',
+        'php_version' => '8.4',
+        'web_root' => '/',
+        'status' => 'active',
+        'repository' => 'acme/app',
+        'repository_url' => 'https://github.com/acme/app.git',
+        'branch' => 'main',
+    ]);
+
+    Process::fake(fn () => Process::result(exitCode: 0));
+});
+
+function runRecordedDeploy(?int $deploymentId = null): void
+{
+    (new DeployApplication(test()->application->id, test()->admin->id, $deploymentId))->handle(
+        app(GitDeployer::class),
+        app(ApplicationProvisioner::class),
+        app(ActivityLogger::class),
+        app(DeploymentRecorder::class),
+    );
+}
+
+it('records a deploy that succeeded, with its commit', function () {
+    Process::fake(function ($process) {
+        return match (true) {
+            in_array('rev-parse', $process->command, true) => Process::result(output: 'a1b2c3d4e5f6'),
+            in_array('log', $process->command, true) => Process::result(output: "Fix the checkout bug\nAda Lovelace"),
+            // A deploy ends by curling the deployed URL and fails on non-2xx. With
+            // `--write-out %{http_code}` the code is the whole stdout, so a fake returning nothing
+            // reads as HTTP 0 and records a failed deploy.
+            ($process->command[0] ?? '') === 'curl' => Process::result(output: '200'),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    $deployment = app(DeploymentRecorder::class)
+        ->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+
+    runRecordedDeploy($deployment->id);
+
+    $deployment->refresh();
+
+    expect($deployment->status)->toBe(DeploymentStatus::Succeeded)
+        ->and($deployment->commit_hash)->toBe('a1b2c3d4e5f6')
+        ->and($deployment->shortCommit())->toBe('a1b2c3d')
+        ->and($deployment->commit_message)->toBe('Fix the checkout bug')
+        ->and($deployment->commit_author)->toBe('Ada Lovelace')
+        ->and($deployment->finished_at)->not->toBeNull();
+});
+
+it('keeps the record of a deploy that failed, and says where', function () {
+    Process::fake(function ($process) {
+        // The fetch fails: the site keeps serving what it served, and the row is the only evidence.
+        return in_array('fetch', $process->command, true) || in_array('clone', $process->command, true)
+            ? Process::result(errorOutput: 'fatal: repository not found', exitCode: 128)
+            : Process::result(exitCode: 0);
+    });
+
+    $deployment = app(DeploymentRecorder::class)
+        ->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+
+    runRecordedDeploy($deployment->id);
+
+    $deployment->refresh();
+
+    expect($deployment->status)->toBe(DeploymentStatus::Failed)
+        ->and($deployment->failed_step)->not->toBeNull()
+        // And why, in words.
+        ->and($deployment->failed_reason)->toBe('git_repository_unreachable')
+        // "Failed" without the output leaves the user guessing.
+        ->and($deployment->output)->toContain('repository not found');
+});
+
+it('records the commit on a deploy that failed after checking it out', function () {
+    // A deploy failing at the script, a restart or the verify has already pulled the code, so
+    // its commit must be shown (not "No commit message").
+    Process::fake(function ($process) {
+        return match (true) {
+            in_array('rev-parse', $process->command, true) => Process::result(output: 'a1b2c3d4e5f6'),
+            in_array('log', $process->command, true) => Process::result(output: "Fix the checkout bug\nAda Lovelace"),
+            // Fails after the working tree is already at the new revision.
+            ($process->command[0] ?? '') === 'chown' => Process::result(errorOutput: 'operation not permitted', exitCode: 1),
+            ($process->command[0] ?? '') === 'curl' => Process::result(output: '200'),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    $deployment = app(DeploymentRecorder::class)
+        ->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+
+    runRecordedDeploy($deployment->id);
+
+    $deployment->refresh();
+
+    expect($deployment->status)->toBe(DeploymentStatus::Failed)
+        ->and($deployment->commit_hash)->toBe('a1b2c3d4e5f6')
+        ->and($deployment->commit_message)->toBe('Fix the checkout bug')
+        ->and($deployment->commit_author)->toBe('Ada Lovelace');
+});
+
+it('records no commit when the deploy failed before checking one out', function () {
+    // A deploy that could not fetch has no revision to name; inventing one would point at
+    // code that was never the problem.
+    Process::fake(function ($process) {
+        return in_array('fetch', $process->command, true) || in_array('clone', $process->command, true)
+            ? Process::result(errorOutput: 'fatal: repository not found', exitCode: 128)
+            : Process::result(exitCode: 0);
+    });
+
+    $deployment = app(DeploymentRecorder::class)
+        ->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+
+    runRecordedDeploy($deployment->id);
+
+    $deployment->refresh();
+
+    expect($deployment->status)->toBe(DeploymentStatus::Failed)
+        ->and($deployment->commit_hash)->toBeNull();
+});
+
+it('never stores a credential that leaked into the output', function () {
+    $recorder = app(DeploymentRecorder::class);
+
+    // Real shapes: a git remote carrying a token, a package manager auth header, a provider token.
+    $dirty = <<<'OUT'
+    fatal: could not read from https://oauth2:ghp_AbCdEfGhIjKlMnOpQrStUvWxYz012345@github.com/acme/app.git
+    npm ERR! authorization: Bearer npm_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c
+    Using password=hunter2correcthorse
+    GITLAB_TOKEN=glpat-XxYyZz1234567890ab
+    OUT;
+
+    $clean = $recorder->redact($dirty);
+
+    expect($clean)->not->toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWxYz012345')
+        ->not->toContain('npm_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c')
+        ->not->toContain('hunter2correcthorse')
+        ->not->toContain('glpat-XxYyZz1234567890ab')
+        // Still readable: redaction must not eat the whole message.
+        ->toContain('could not read from')
+        ->toContain('github.com/acme/app.git');
+});
+
+it('keeps only the most recent deploys', function () {
+    config(['server.deployments.keep' => 3]);
+
+    $recorder = app(DeploymentRecorder::class);
+
+    foreach (range(1, 6) as $ignored) {
+        $recorder->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+    }
+
+    // Every row carries build output; unbounded, this table fills a self-hosted SQLite database.
+    expect(Deployment::count())->toBe(3);
+});
+
+it('does not prune another applications history', function () {
+    config(['server.deployments.keep' => 2]);
+
+    $other = Application::forceCreate([
+        'system_user_id' => $this->application->system_user_id,
+        'name' => 'Other',
+        'slug' => 'other', 'domain' => 'other.example.com', 'site_type' => 'git',
+        'serving_profile' => 'php', 'web_root' => '/', 'status' => 'active',
+    ]);
+
+    $recorder = app(DeploymentRecorder::class);
+    $recorder->open($other, DeploymentTrigger::Manual, null);
+
+    foreach (range(1, 5) as $ignored) {
+        $recorder->open($this->application, DeploymentTrigger::Manual, null);
+    }
+
+    expect($other->deployments()->count())->toBe(1)
+        ->and($this->application->deployments()->count())->toBe(2);
+});
+
+it('opens the row before queueing so the screen has something to show', function () {
+    Queue::fake();
+
+    $response = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->assertStatus(202);
+
+    // Without the row the user sees nothing after clicking Deploy and clicks again.
+    expect($response->json('deployment.status'))->toBe('queued')
+        ->and($response->json('deployment.in_flight'))->toBeTrue();
+
+    Queue::assertPushed(DeployApplication::class);
+});
+
+it('records a webhook deploy as System rather than inventing an actor', function () {
+    $deployment = app(DeploymentRecorder::class)
+        ->open($this->application, DeploymentTrigger::Webhook, null);
+
+    expect($deployment->user_id)->toBeNull()
+        ->and($deployment->trigger)->toBe(DeploymentTrigger::Webhook);
+});
+
+it('closes the row when the worker dies outright', function () {
+    $deployment = app(DeploymentRecorder::class)
+        ->open($this->application, DeploymentTrigger::Manual, $this->admin->id);
+
+    (new DeployApplication($this->application->id, $this->admin->id, $deployment->id))
+        ->failed(new RuntimeException('worker died'));
+
+    // Left running, the screen shows a spinner for a deploy that is not happening.
+    expect($deployment->fresh()->status)->toBe(DeploymentStatus::Failed);
+});
+
+it('keeps the output off the list and on the detail view', function () {
+    $deployment = Deployment::create([
+        'application_id' => $this->application->id,
+        'trigger' => DeploymentTrigger::Manual,
+        'status' => DeploymentStatus::Succeeded,
+        'output' => 'a very long build log',
+    ]);
+
+    $list = $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments")
+        ->assertOk();
+
+    // Fifty full build logs would bloat the list response.
+    expect($list->json('deployments.0'))->not->toHaveKey('output');
+
+    $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments/{$deployment->id}")
+        ->assertOk()
+        ->assertJsonPath('deployment.output', 'a very long build log');
+});
+
+it('does not let one application read another applications deploy', function () {
+    $other = Application::forceCreate([
+        'system_user_id' => $this->application->system_user_id,
+        'name' => 'Other',
+        'slug' => 'other', 'domain' => 'other.example.com', 'site_type' => 'git',
+        'serving_profile' => 'php', 'web_root' => '/', 'status' => 'active',
+    ]);
+
+    $foreign = Deployment::create([
+        'application_id' => $other->id,
+        'trigger' => DeploymentTrigger::Manual,
+        'status' => DeploymentStatus::Succeeded,
+    ]);
+
+    $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$this->application->id}/deployments/{$foreign->id}")
+        ->assertNotFound();
+});
+
+it('needs manage on app_deployment to start one', function () {
+    Queue::fake();
+
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_deployment');
+
+    $this->actingAs($viewer)
+        ->getJson("/api/applications/{$this->application->id}/deployments")
+        ->assertOk();
+
+    $this->actingAs($viewer)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->assertForbidden();
+});
+
+it('has no deployment screen at all on a site that cannot deploy', function () {
+    $wordpress = Application::forceCreate([
+        'system_user_id' => $this->application->system_user_id,
+        'name' => 'Blog',
+        'slug' => 'blog', 'domain' => 'blog.example.com', 'site_type' => 'wordpress',
+        'serving_profile' => 'php', 'web_root' => '/', 'status' => 'active',
+    ]);
+
+    $this->actingAs($this->admin)
+        ->getJson("/api/applications/{$wordpress->id}/deployments")
+        ->assertNotFound();
+});
+
+/*
+ * Deploys are in place: the checkout replaces the files before the script, the dependency check
+ * and the verify run. A deploy failing in one of those leaves the new commit live while
+ * `last_commit` (success only) still names the old one.
+ */
+describe('which commit is on disk', function () {
+    /** Deploy with `rev-parse` answering $commit; `$failChown` fails it after the checkout. */
+    function deployCommit(string $commit, bool $failChown = false): void
+    {
+        Process::fake(function ($process) use ($commit, $failChown) {
+            return match (true) {
+                in_array('rev-parse', $process->command, true) => Process::result(output: $commit),
+                in_array('log', $process->command, true) => Process::result(output: "Change\nAda Lovelace"),
+                $failChown && ($process->command[0] ?? '') === 'chown' => Process::result(errorOutput: 'operation not permitted', exitCode: 1),
+                ($process->command[0] ?? '') === 'curl' => Process::result(output: '200'),
+                default => Process::result(exitCode: 0),
+            };
+        });
+
+        runRecordedDeploy(app(DeploymentRecorder::class)->open(test()->application, DeploymentTrigger::Manual, test()->admin->id)->id);
+    }
+
+    it('names the new commit and says the deploy is incomplete when it failed after the checkout', function () {
+        deployCommit('aaaaaaa1111111');
+        deployCommit('bbbbbbb2222222', failChown: true);
+
+        $this->actingAs($this->admin)->getJson("/api/applications/{$this->application->id}")
+            ->assertOk()
+            // Still the last deploy that succeeded…
+            ->assertJsonPath('application.last_commit', 'aaaaaaa1111111')
+            // …but not what is running.
+            ->assertJsonPath('application.code_on_disk.commit', 'bbbbbbb2222222')
+            ->assertJsonPath('application.code_on_disk.state', 'incomplete')
+            ->assertJsonPath('application.code_on_disk.message', __('application.code_on_disk.incomplete', ['commit' => 'bbbbbbb']));
+
+        $this->actingAs($this->admin)->getJson("/api/applications/{$this->application->id}/deployments")
+            ->assertOk()
+            ->assertJsonPath('settings.code_on_disk.commit', 'bbbbbbb2222222')
+            ->assertJsonPath('settings.code_on_disk.state', 'incomplete');
+    });
+
+    it('is deployed again once a later deploy succeeds', function () {
+        deployCommit('bbbbbbb2222222', failChown: true);
+        deployCommit('ccccccc3333333');
+
+        $this->actingAs($this->admin)->getJson("/api/applications/{$this->application->id}")
+            ->assertJsonPath('application.code_on_disk.commit', 'ccccccc3333333')
+            ->assertJsonPath('application.code_on_disk.state', 'deployed')
+            ->assertJsonPath('application.code_on_disk.message', null);
+    });
+
+    it('ignores a failed deploy that never reached the checkout: the old code is still there', function () {
+        deployCommit('aaaaaaa1111111');
+
+        Process::fake(fn ($process) => in_array('fetch', $process->command, true)
+            ? Process::result(errorOutput: 'fatal: repository not found', exitCode: 128)
+            : Process::result(exitCode: 0));
+        runRecordedDeploy(app(DeploymentRecorder::class)->open($this->application, DeploymentTrigger::Manual, $this->admin->id)->id);
+
+        $this->actingAs($this->admin)->getJson("/api/applications/{$this->application->id}")
+            ->assertJsonPath('application.code_on_disk.commit', 'aaaaaaa1111111')
+            ->assertJsonPath('application.code_on_disk.state', 'deployed');
+    });
+
+    it('falls back to last_commit for a site with no recorded checkout', function () {
+        $this->application->forceFill(['last_commit' => 'ddddddd4444444'])->save();
+
+        $this->actingAs($this->admin)->getJson("/api/applications/{$this->application->id}")
+            ->assertJsonPath('application.code_on_disk.commit', 'ddddddd4444444')
+            ->assertJsonPath('application.code_on_disk.state', 'deployed');
+    });
+
+    it('leaves it out of a list of sites, which does not load it', function () {
+        $this->actingAs($this->admin)->getJson('/api/applications')
+            ->assertOk()
+            ->assertJsonMissingPath('applications.0.code_on_disk');
+    });
+});
+
+/*
+ * What the Deployment screen polls while it is open: a deploy started by a push runs behind the
+ * page, which otherwise only polls after its own button.
+ */
+describe('the newest deploy', function () {
+    function latestUrl(): string
+    {
+        return '/api/applications/'.test()->application->id.'/deployments/latest';
+    }
+
+    it('is the newest deploy only, in the history row\'s shape, without its build output', function () {
+        Deployment::create(['application_id' => $this->application->id, 'trigger' => DeploymentTrigger::Manual, 'status' => DeploymentStatus::Succeeded]);
+        $newest = Deployment::create([
+            'application_id' => $this->application->id, 'trigger' => DeploymentTrigger::Webhook,
+            'status' => DeploymentStatus::Running, 'output' => 'a very long build log',
+        ]);
+
+        $response = $this->actingAs($this->admin)->getJson(latestUrl())
+            ->assertOk()
+            ->assertJsonPath('latest.id', $newest->id)
+            ->assertJsonPath('latest.status', 'running')
+            ->assertJsonPath('latest.in_flight', true)
+            ->assertJsonPath('latest.trigger', 'webhook');
+
+        expect($response->json('latest'))->not->toHaveKey('output')
+            // The same keys as a history row, so the screen can put it straight at the top.
+            ->and(array_keys($response->json('latest')))->toBe(array_keys(
+                $this->actingAs($this->admin)->getJson("/api/applications/{$this->application->id}/deployments")->json('deployments.0'),
+            ));
+    });
+
+    it('is null on a site that has never deployed', function () {
+        $this->actingAs($this->admin)->getJson(latestUrl())
+            ->assertOk()
+            ->assertExactJson(['latest' => null]);
+    });
+
+    it('is readable with view on app_deployment, and refused without it', function () {
+        $viewer = User::factory()->create();
+        grantPermission($viewer, 'app_deployment');
+
+        $this->actingAs($viewer)->getJson(latestUrl())->assertOk();
+        $this->actingAs(User::factory()->create())->getJson(latestUrl())->assertForbidden();
+    });
+
+    it('does not exist on a site that cannot deploy', function () {
+        $this->application->forceFill(['site_type' => 'wordpress'])->save();
+
+        $this->actingAs($this->admin)->getJson(latestUrl())->assertNotFound();
+    });
+});
+
+it('joins the deploy already waiting instead of leaving a row nothing will run', function () {
+    // DeployApplication is unique until processing, so Laravel drops a second dispatch while one
+    // waits; opening a row regardless would leave it `queued` forever.
+    Queue::fake();
+
+    $first = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->assertStatus(202)
+        ->json('deployment.id');
+
+    $second = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->assertStatus(202)
+        ->json('deployment.id');
+
+    expect($second)->toBe($first)
+        ->and($this->application->deployments()->count())->toBe(1);
+
+    Queue::assertPushed(DeployApplication::class, 1);
+});
+
+it('queues a fresh deploy once the waiting one has been picked up', function () {
+    Queue::fake();
+
+    $first = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->json('deployment.id');
+
+    // What the worker does as it starts a unique-until-processing job.
+    (new UniqueLock(app(CacheRepository::class)))->release(new DeployApplication($this->application->id));
+    Deployment::whereKey($first)->update(['status' => DeploymentStatus::Running->value]);
+
+    $second = $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->json('deployment.id');
+
+    // A push during a running deploy must still queue one behind it: that deploy started before
+    // the new commit existed.
+    expect($second)->not->toBe($first)
+        ->and($this->application->deployments()->count())->toBe(2);
+
+    Queue::assertPushed(DeployApplication::class, 2);
+});
+
+it('closes a queued row no job will ever run when the next deploy is queued', function () {
+    Queue::fake();
+
+    $orphan = app(DeploymentRecorder::class)->open($this->application, DeploymentTrigger::Webhook, null);
+    $orphan->forceFill(['created_at' => now()->subDay()])->save();
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->assertStatus(202);
+
+    expect($orphan->fresh()->status)->toBe(DeploymentStatus::Failed)
+        ->and($orphan->fresh()->failed_step)->toBe('worker');
+});
+
+it('leaves a young queued row alone — it may be the one a worker just picked up', function () {
+    Queue::fake();
+
+    $young = app(DeploymentRecorder::class)->open($this->application, DeploymentTrigger::Webhook, null);
+
+    $this->actingAs($this->admin)
+        ->postJson("/api/applications/{$this->application->id}/deployments")
+        ->assertStatus(202);
+
+    expect($young->fresh()->status)->toBe(DeploymentStatus::Queued);
+});

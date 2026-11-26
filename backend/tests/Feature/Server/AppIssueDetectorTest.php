@@ -1,0 +1,296 @@
+<?php
+
+namespace Tests\Feature\Server;
+
+use App\Enums\CertificateStatus;
+use App\Enums\DomainType;
+use App\Models\Application;
+use App\Models\ApplicationDomain;
+use App\Models\Certificate;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Applications\AppIssueDetector;
+use App\Services\Server\Applications\DnsVerifier;
+use Illuminate\Support\Facades\Process;
+use Laravel\Sanctum\Sanctum;
+
+beforeEach(function () {
+    Sanctum::actingAs(User::factory()->admin()->create());
+
+    $this->systemUser = SystemUser::factory()->create();
+    $this->application = Application::factory()->create(['system_user_id' => $this->systemUser->id]);
+});
+
+/**
+ * Resolution is stubbed rather than left to the real resolver: a check that calls out to DNS
+ * depends on the network the test runs on.
+ */
+function fakeDns(?string $resolvesTo): void
+{
+    test()->swap(DnsVerifier::class, new class($resolvesTo) extends DnsVerifier
+    {
+        public function __construct(private ?string $ip)
+        {
+            // Deliberately does not call parent::__construct(): this stub
+            // never runs a server operation.
+        }
+
+        public function resolve(string $domain): ?string
+        {
+            return $this->ip;
+        }
+    });
+}
+
+function makeDetector(): AppIssueDetector
+{
+    return app(AppIssueDetector::class);
+}
+
+// ---------------------------------------------------------------------------
+// Healthy
+// ---------------------------------------------------------------------------
+
+it('returns empty issues for a healthy application', function () {
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// Certificate
+// ---------------------------------------------------------------------------
+
+it('flags an expired certificate', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Active,
+        'expires_at' => now()->subDays(5),
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['type'])->toBe('certificate')
+        ->and($issues->first()['severity'])->toBe('critical');
+});
+
+it('flags DNS drift when stored IP no longer matches current resolution', function () {
+    fakeDns('5.6.7.8');
+    $domain = ApplicationDomain::factory()->create([
+        'application_id' => $this->application->id,
+        'type' => DomainType::Primary,
+        'domain' => 'example.com',
+        'dns_resolved_ip' => '1.2.3.4',
+        'dns_verified_at' => now()->subHour(),
+    ]);
+
+    // Simulate the IP having changed since the last verification.
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['type'])->toBe('dns')
+        ->and($issues->first()['severity'])->toBe('warning')
+        ->and($issues->first()['meta']['stored_ip'])->toBe('1.2.3.4');
+});
+
+it('does not flag DNS when resolved IP matches stored IP', function () {
+    fakeDns('1.2.3.4');
+    ApplicationDomain::factory()->create([
+        'application_id' => $this->application->id,
+        'type' => DomainType::Primary,
+        'domain' => 'example.com',
+        'dns_resolved_ip' => '1.2.3.4',
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues->where('type', 'dns'))->toHaveCount(0);
+});
+
+it('flags a certificate expiring within 30 days', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Active,
+        'expires_at' => now()->addDays(20),
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['type'])->toBe('certificate')
+        ->and($issues->first()['severity'])->toBe('warning');
+});
+
+it('flags a certificate expiring within 7 days as critical', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Active,
+        'expires_at' => now()->addDays(5),
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['severity'])->toBe('critical');
+});
+
+it('does not flag a certificate with more than 30 days remaining', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Active,
+        'expires_at' => now()->addDays(90),
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(0);
+});
+
+/*
+ * The state every application passes through on creation: auto-issue writes a pending row before
+ * certbot runs, so `expires_at` is null. It must not report "expires in 0 days" at critical
+ * severity (`null * -1` is 0, which is inside every threshold below).
+ */
+it('does not flag a pending certificate that has no expiry yet', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Pending,
+        'expires_at' => null,
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues->where('type', 'certificate'))->toHaveCount(0);
+});
+
+it('does not flag a certificate that is still being issued', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Issuing,
+        'expires_at' => null,
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues->where('type', 'certificate'))->toHaveCount(0);
+});
+
+// A failed issue is a real problem and the card reports it through `reason`.
+// Dressing it up as an expiry warning names the wrong cause.
+it('does not flag a failed certificate as expiring', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Failed,
+        'expires_at' => null,
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues->where('type', 'certificate'))->toHaveCount(0);
+});
+
+/*
+ * Carbon 3 returns a float from `diffInDays`, and the `?int` return truncated it toward zero, so
+ * a certificate with hours left reported "0 days" like the pending row above.
+ */
+it('reports a certificate with hours left as one day, not zero', function () {
+    Certificate::factory()->create([
+        'application_id' => $this->application->id,
+        'status' => CertificateStatus::Active,
+        'expires_at' => now()->addHours(10),
+    ]);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['severity'])->toBe('critical')
+        ->and($issues->first()['meta']['days_remaining'])->toBe(1)
+        ->and($issues->first()['message'])->toBe('SSL certificate expires in 1 day.');
+});
+
+// ---------------------------------------------------------------------------
+// Worker
+// ---------------------------------------------------------------------------
+
+it('does not flag a stopped worker when the app has no start command', function () {
+    // The app has no process (no start command), so the worker check is skipped.
+    expect(makeDetector()->issues($this->application))->toHaveCount(0);
+});
+
+/**
+ * What `systemctl show` prints for the unit — it exits 0 whatever the state.
+ */
+function fakeUnitState(string $state): void
+{
+    Process::fake(fn () => Process::result(output: "ActiveState={$state}\nSubState=dead\nExecMainStartTimestamp=\nMemoryCurrent=[not set]\nNRestarts=0\n"));
+}
+
+it('flags a Node app whose unit has stopped or crashed', function (string $state) {
+    $this->application->update(['start_command' => 'node server.js']);
+    fakeUnitState($state);
+
+    $issues = makeDetector()->issues($this->application->fresh());
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['type'])->toBe('worker')
+        ->and($issues->first()['meta']['state'])->toBe($state);
+})->with(['inactive', 'failed']);
+
+it('does not flag a Node app that is running or starting', function (string $state) {
+    $this->application->update(['start_command' => 'node server.js']);
+    fakeUnitState($state);
+
+    expect(makeDetector()->issues($this->application->fresh()))->toHaveCount(0);
+})->with(['active', 'activating', 'unknown']);
+
+// ---------------------------------------------------------------------------
+// PHP EOL
+// ---------------------------------------------------------------------------
+
+it('flags PHP 8.0 as EOL', function () {
+    $this->application->update(['php_version' => '8.0']);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['type'])->toBe('php_eol');
+});
+
+it('does not flag a current PHP version', function () {
+    $this->application->update(['php_version' => '8.4']);
+
+    expect(makeDetector()->issues($this->application))->toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// Deploy failed
+// ---------------------------------------------------------------------------
+
+it('flags a failed last deploy', function () {
+    $this->application->update(['failed_step' => 'build']);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(1)
+        ->and($issues->first()['type'])->toBe('deploy_failed')
+        ->and($issues->first()['severity'])->toBe('warning');
+});
+
+it('does not flag when failed_step is null', function () {
+    $this->application->update(['failed_step' => null]);
+
+    expect(makeDetector()->issues($this->application))->toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// Multiple issues
+// ---------------------------------------------------------------------------
+
+it('returns multiple issues at once', function () {
+    $this->application->update(['php_version' => '8.0', 'failed_step' => 'deploy']);
+
+    $issues = makeDetector()->issues($this->application);
+
+    expect($issues)->toHaveCount(2);
+});

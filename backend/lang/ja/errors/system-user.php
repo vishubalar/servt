@@ -1,0 +1,34 @@
+<?php
+
+return [
+    'create_failed' => 'サーバーでシステムユーザーを作成できませんでした。',
+    'delete_failed' => 'サーバーでシステムユーザーを削除できませんでした。',
+    'has_applications' => 'このシステムユーザーはまだ1つ以上のアプリケーションを所有しているため、削除できません。',
+    'reserved_username' => 'このユーザー名は予約されているため使用できません。',
+    'duplicate_public_key' => 'このSSHキーはすでに追加されています。',
+    'invalid_public_key' => '指定された値は有効なSSH公開鍵ではありません。',
+    'dsa_public_key' => 'これは DSA キーです。Ubuntu は SSH ログインに DSA キーを受け付けなくなったため、このキーは使えません。Ed25519 キー(推奨)または RSA 4096 を使用してください。',
+    'weak_rsa_public_key' => 'この RSA キーは短すぎます。少なくとも :bits ビットを使用してください。RSA 4096 または Ed25519 キーを推奨します。',
+    'ssh_key_exists' => ':username にはこの SSH キーが「:name」として既に登録されています。',
+    'password_failed' => 'システムユーザーのパスワードを設定できませんでした。',
+    'sudo_failed' => 'システムユーザーのsudoアクセスを更新できませんでした。',
+    'shell_failed' => 'システムユーザーのシェルを変更できませんでした。',
+    'ssh_failed' => 'システムユーザーのSSHアクセスを更新できませんでした。',
+
+    // The panel must not record access the server will not grant: sshd
+    // authenticates, then a non-login shell exits and the session closes.
+    'ssh_needs_login_shell' => 'SSH アクセスにはログインできるシェルが必要です。このユーザーのシェルはログインを拒否するため、SSH は接続後すぐに切断されます。先にログイン可能なシェルを選んでください。',
+    'shell_needs_ssh_off' => 'このユーザーには SSH アクセスがあり、選択したシェルはログインを拒否します — SSH は接続後すぐに切断されます。先に SSH アクセスを無効にするか、ログイン可能なシェルを選んでください。',
+
+    'password_control_characters' => 'パスワードに改行やその他の制御文字を含めることはできません。',
+    'shell_not_installed' => 'シェル :shell はこのサーバーにインストールされていません。先にインストールするか、別のシェルを選択してください。',
+    'username_taken_on_server' => 'この名前のユーザーまたはグループはサーバー上に既に存在します。別のユーザー名を選択してください。',
+    'has_processes' => ':username はまだサインイン中か、何かを実行中です（開いている SSH セッションや実行中のジョブなど）。サインアウトするか終了を待つか、「セッションを終了」をオンにしてもう一度削除してください（先に終了させます）。',
+
+    // Container login (RC-28).
+    'container_login_failed' => 'システムユーザーのコンテナーログインを有効にできませんでした。',
+    'container_login_unsupported' => 'このサーバーの SSH 設定はコンテナーログインを適用しません（sshd_config が sshd_config.d を読み込んでいません）。そのため有効にしませんでした。',
+    'container_login_no_owner' => 'このアプリにはシステムユーザーがありません。',
+    'container_login_confirm' => '{1} :username は他に :count 個のアプリを所有しています。SSH と SFTP はこのコンテナーだけを開くようになります。続行するには確認してください。|[2,*] :username は他に :count 個のアプリを所有しています。SSH と SFTP はこのコンテナーだけを開くようになります。続行するには確認してください。',
+    'container_login_needs_key' => 'このサーバーではパスワードログインが無効なため、:username には SSH 鍵が必要です。コンテナーログインを有効にするには鍵を追加してください。',
+];

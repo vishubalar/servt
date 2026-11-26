@@ -1,0 +1,185 @@
+import { useCallback, useEffect, useImperativeHandle, useState } from "react";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { CircleAlert, CircleCheck, GitCommitHorizontal, Loader2, Rocket } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { fetchDeployment } from "@/lib/api/deployment";
+import { deploymentResponseSchema } from "@/lib/schemas/deploy-history";
+import { apiMessage } from "@/lib/api/error-message";
+import { AutoRefresh } from "@/components/ui/auto-refresh";
+import { Badge } from "@/components/ui/badge";
+import { PANEL_CARD } from "@/lib/theme/card-chrome";
+import { Card, CardContent } from "@/components/ui/card";
+import { CopyButton } from "@/components/ui/copy-button";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { RefreshButton } from "@/components/data-table/refresh-button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+const LOG_POLL_MS = 3000;
+
+function humanDuration(seconds) {
+  if (seconds === null || seconds === undefined || seconds === "") return null;
+  const total = Number(seconds);
+  if (!Number.isFinite(total) || total < 0) return null;
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
+const TONE = {
+  succeeded: { icon: CircleCheck, badge: "success", dot: "text-success" },
+  failed: { icon: CircleAlert, badge: "destructive", dot: "text-destructive" },
+  running: { icon: Loader2, badge: "warning", dot: "text-warning", spin: true },
+  queued: { icon: Loader2, badge: "muted", dot: "text-muted-foreground", spin: true },
+};
+
+export function DeployHistoryCard({ ref, applicationId, deployments }) {
+  const t = useTranslations("applications.deployment.history");
+  const [open, setOpen] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [logFailed, setLogFailed] = useState(false);
+
+  const running = deployments.some((deployment) => deployment.in_flight);
+
+  const show = useCallback(
+    async (deployment) => {
+      setOpen({ ...deployment, output: null });
+      setLogFailed(false);
+      setLoading(true);
+      try {
+        const { data } = await fetchDeployment(applicationId, deployment.id);
+        const parsed = deploymentResponseSchema.safeParse(data);
+        if (parsed.success) setOpen(parsed.data.deployment);
+      } catch (error) {
+        setLogFailed(true);
+        toast.error(apiMessage(error, t("logFailed")));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [applicationId, t],
+  );
+
+  const openId = open?.id ?? null;
+  const openRunning = Boolean(open?.in_flight);
+  useEffect(() => {
+    if (!openId || !openRunning) return undefined;
+    let live = true;
+    const timer = setInterval(async () => {
+      try {
+        const { data } = await fetchDeployment(applicationId, openId);
+        const parsed = deploymentResponseSchema.safeParse(data);
+        if (live && parsed.success) setOpen(parsed.data.deployment);
+      } catch {
+        // retry on the next poll
+      }
+    }, LOG_POLL_MS);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [applicationId, openId, openRunning]);
+
+  useImperativeHandle(ref, () => ({ show }), [show]);
+
+  if (deployments.length === 0) {
+    return <EmptyState icon={Rocket} title={t("empty.title")} description={t("empty.description")} />;
+  }
+
+  return (
+    <Card className={cn("gap-0 overflow-hidden py-0", PANEL_CARD)}>
+      {running ? <AutoRefresh intervalMs={5000} stopAfterMs={900000} /> : null}
+
+      <div className="flex items-center justify-between gap-3 border-b px-5 py-4">
+        <p className="min-w-0 font-semibold">{t("title")}</p>
+        <RefreshButton />
+      </div>
+
+      <CardContent className="p-0">
+        <ul className="divide-y">
+          {deployments.map((deployment) => {
+            const tone = TONE[deployment.status] ?? TONE.queued;
+            const Icon = tone.icon;
+            return (
+              <li
+                key={deployment.id}
+                className="flex flex-wrap items-center gap-3 px-5 py-3.5 transition-colors hover:bg-muted/40"
+              >
+                <Icon className={cn("size-4 shrink-0", tone.dot, tone.spin && "animate-spin")} />
+
+                <button
+                  type="button"
+                  onClick={() => show(deployment)}
+                  className="min-w-0 flex-1 text-left"
+                >
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-medium">
+                      {deployment.commit_message || t("noMessage")}
+                    </span>
+                    <Badge variant={tone.badge} className="font-normal">
+                      {deployment.status_title ?? deployment.status}
+                    </Badge>
+                  </span>
+                  <span className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    {deployment.commit_short ? (
+                      <span className="flex items-center gap-1 font-mono">
+                        <GitCommitHorizontal className="size-3" />
+                        {deployment.commit_short}
+                      </span>
+                    ) : null}
+                    {deployment.branch ? <span className="font-mono">{deployment.branch}</span> : null}
+                    <span>{deployment.trigger_title ?? deployment.trigger}</span>
+                    <span>{deployment.user?.username ?? t("system")}</span>
+                    {deployment.created_at_human ? <span>{deployment.created_at_human}</span> : null}
+                    {humanDuration(deployment.duration) ? (
+                      <span>{humanDuration(deployment.duration)}</span>
+                    ) : null}
+                  </span>
+                </button>
+
+              </li>
+            );
+          })}
+        </ul>
+      </CardContent>
+
+      <Dialog open={open !== null} onOpenChange={(next) => (next ? null : setOpen(null))}>
+        <DialogContent className="grid-rows-[auto_minmax(0,1fr)] h-[80vh] sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle className="truncate">
+              {open?.commit_message || t("noMessage")}
+            </DialogTitle>
+            <DialogDescription>
+              {[open?.status_title, open?.branch, open?.commit_short, open?.created_at_human]
+                .filter(Boolean)
+                .join(" · ")}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-console-border bg-console">
+            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-console-border px-3 py-1.5">
+              <span className="font-mono text-xs text-console-muted">{t("output")}</span>
+              {open?.output ? (
+                <CopyButton
+                  value={open.output}
+                  label={t("copy")}
+                  className="text-console-muted hover:bg-console-foreground/10 hover:text-console-foreground"
+                />
+              ) : null}
+            </div>
+            <pre className="console-scroll min-h-0 flex-1 overflow-auto p-3 font-mono text-xs leading-6 text-console-foreground">
+              {loading ? t("loadingLog") : logFailed ? t("logFailed") : (open?.output ?? t("noOutput"))}
+            </pre>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </Card>
+  );
+}

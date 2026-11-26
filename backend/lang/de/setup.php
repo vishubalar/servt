@@ -1,0 +1,46 @@
+<?php
+
+return [
+
+    'installing' => ':component wird installiert',
+
+    'detail' => [
+        'cache_in_use' => 'wird für den Panel-Cache verwendet',
+    ],
+
+    'components' => [
+        'database' => [
+            'title' => 'Datenbank',
+            'description' => 'Erforderlich, bevor Sie WordPress oder eine andere Anwendung mit Datenspeicherung installieren.',
+        ],
+        'php' => [
+            'title' => 'PHP',
+            'description' => 'Fügen Sie eine weitere Version hinzu, wenn eine Website sie benötigt.',
+        ],
+        'node' => [
+            'title' => 'Node.js',
+            'description' => 'Mit fnm verwaltet, damit Websites ihre eigene Version festlegen können.',
+        ],
+        'docker' => [
+            'title' => 'Docker',
+            'description' => 'Die Container-Engine, auf der dieser Server seine Anwendungen ausführt. Der Installer richtet sie ein.',
+        ],
+        'redis' => [
+            'title' => 'Redis',
+            'description' => 'Wird für den Panel-Cache verwendet. Ohne Redis nutzt das Panel die Datenbank — das funktioniert, ist aber langsamer.',
+        ],
+        'fail2ban' => [
+            'title' => 'fail2ban',
+            'description' => 'Blockiert wiederholte fehlgeschlagene Anmeldungen an SSH und Ihren Websites.',
+        ],
+        'build_tools' => [
+            'title' => 'Build-Tools',
+            'description' => 'Ermöglicht dem Server, App-Komponenten zu kompilieren, die nicht vorgebaut ausgeliefert werden. Manche Node-Apps benötigen dies zur Installation.',
+        ],
+        'wp_cli' => [
+            'title' => 'WP-CLI',
+            'description' => 'Das Kommandozeilen-Tool von WordPress. Das Panel nutzt es für jede WordPress-Aufgabe und lädt es mit der ersten WordPress-Seite, falls es fehlt.',
+        ],
+    ],
+
+];

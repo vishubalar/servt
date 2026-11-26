@@ -1,0 +1,420 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\DiskCleaner\Targets\JournalTarget;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    // Temp "service logs" pointed at a writable dir: service_logs is the one fully
+    // deterministic target (its estimate reads real filesizes).
+    $this->logDir = sys_get_temp_dir().'/sv-oss-dc-'.uniqid();
+    File::ensureDirectoryExists($this->logDir);
+    File::put($this->logDir.'/access.log', str_repeat('x', 4096));
+    File::put($this->logDir.'/error.log', str_repeat('y', 2048));
+    config(['server.disk_cleaner.service_log_globs' => [$this->logDir.'/*.log']]);
+});
+
+afterEach(function () {
+    File::deleteDirectory($this->logDir);
+});
+
+/**
+ * Default fake: df returns a fixed filesystem; estimate/clean commands succeed
+ * with benign output so any host-present target (apt/journal/find) is safe.
+ */
+function fakeDisk(): void
+{
+    Process::fake(function ($process) {
+        if ($found = answerFind($process)) {
+            return $found;
+        }
+
+        return match ($process->command[0] ?? '') {
+            'df' => Process::result(output: "Filesystem 1B-blocks Used Available Capacity Mounted\n/dev/vda1 100000000000 60000000000 40000000000 60% /\n"),
+            'du' => Process::result(output: "1048576\t/path"),
+            'journalctl' => Process::result(output: 'Archived and active journals take up 200.0M in the file system.'),
+            'apt-get' => Process::result(output: 'After this operation, 50.0 MB disk space will be freed.'),
+            'find' => Process::result(output: "1024\n2048\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+}
+
+it('previews disk usage and available categories with paths', function () {
+    fakeDisk();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/disk-cleaner')->assertOk();
+
+    $response->assertJsonPath('disk.percent', 60)
+        ->assertJsonPath('disk.total', 100000000000);
+
+    $service = collect($response->json('categories'))->firstWhere('key', 'service_logs');
+    expect($service)->not->toBeNull();
+    expect($service['method'])->toBe('truncate');
+    expect($service['group'])->toBe('logs');
+    expect($service['note'])->not->toBeEmpty();          // plain-language "what happens" note
+    expect($service['reclaimable'])->toBe(6144);              // 4096 + 2048
+    expect($service['paths'])->toContain($this->logDir.'/access.log');
+});
+
+it('cleans selected categories, truncating service logs and logging activity', function () {
+    fakeDisk();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => ['service_logs']])
+        ->assertOk()
+        ->assertJsonPath('cleaned.0.key', 'service_logs')
+        ->assertJsonStructure(['disk', 'cleaned' => [['key', 'freed', 'freed_human']], 'freed_total']);
+
+    Process::assertRan(fn ($p) => $p->command[0] === 'truncate'
+        && in_array($this->logDir.'/access.log', $p->command, true));
+
+    expect(ActivityLog::where('type', 'disk_cleaner')->where('action', 'cleaned')->exists())->toBeTrue();
+});
+
+it('rejects an unknown / unavailable category', function () {
+    fakeDisk();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => ['not_a_category']])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('categories.0');
+});
+
+it('requires at least one category', function () {
+    fakeDisk();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => []])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('categories');
+});
+
+it('returns a translated error with reference when the clean fails', function () {
+    Process::fake(function ($process) {
+        if ($found = answerFind($process)) {
+            return $found;
+        }
+
+        return match ($process->command[0] ?? '') {
+            'df' => Process::result(output: "fs 1B-blocks Used Avail Cap Mount\n/dev/vda1 100 60 40 60% /\n"),
+            'truncate' => Process::result(output: '', errorOutput: 'boom', exitCode: 1),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => ['service_logs']])
+        ->assertStatus(500)
+        ->assertJsonStructure(['message', 'reference']);
+});
+
+it('excludes service_logs when no matching files exist', function () {
+    config(['server.disk_cleaner.service_log_globs' => [$this->logDir.'/none/*.log']]);
+    fakeDisk();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/disk-cleaner')->assertOk();
+
+    expect(collect($response->json('categories'))->pluck('key'))->not->toContain('service_logs');
+});
+
+it('denies a viewer without manage from cleaning', function () {
+    fakeDisk();
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'disk_cleaner', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => ['service_logs']])
+        ->assertForbidden();
+});
+
+it('denies a user without the permission from previewing', function () {
+    fakeDisk();
+    $stranger = User::factory()->create();
+    $token = $stranger->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/disk-cleaner')->assertForbidden();
+});
+
+it('never deletes a database binary log when clearing rotated logs', function () {
+    // The predicate is the risky part, so it runs for real against a tree shaped like /var/log
+    // instead of being asserted on argv. Only the root is substituted.
+    $root = sys_get_temp_dir().'/sv-oss-varlog-'.uniqid();
+    File::ensureDirectoryExists($root.'/nginx');
+    File::ensureDirectoryExists($root.'/mysql');
+
+    $files = [
+        // Rotated: should go.
+        $root.'/nginx/access.log.1' => true,
+        $root.'/nginx/access.log.2.gz' => true,
+        $root.'/syslog.1' => true,
+        $root.'/dpkg.log.old' => true,
+        // Not rotated, or not ours to touch: must stay.
+        $root.'/nginx/access.log' => false,
+        $root.'/mysql/mysql-bin.000001' => false,
+        $root.'/mysql/error.log' => false,
+        // Six digits outside mysql: still not a logrotate suffix.
+        $root.'/somedaemon.000042' => false,
+    ];
+
+    foreach (array_keys($files) as $path) {
+        File::put($path, 'x');
+    }
+
+    $argv = null;
+    Process::fake(function ($process) use (&$argv) {
+        if ($found = answerFind($process)) {
+            return $found;
+        }
+
+        if (is_array($process->command) && $process->command[0] === 'find' && in_array('-delete', $process->command, true)) {
+            $argv = $process->command;
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => ['rotated_logs']]);
+
+    expect($argv)->not->toBeNull();
+
+    $argv = array_map(fn (string $arg) => match ($arg) {
+        '/var/log' => $root,
+        '/var/log/mysql/*' => $root.'/mysql/*',
+        default => $arg,
+    }, $argv);
+
+    exec(implode(' ', array_map('escapeshellarg', $argv)));
+
+    foreach ($files as $path => $shouldBeDeleted) {
+        expect(file_exists($path))->toBe(! $shouldBeDeleted, $path);
+    }
+
+    File::deleteDirectory($root);
+});
+
+it('refuses to schedule the package removal', function () {
+    // Every other category removes files that come back; this one removes packages.
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/disk-cleaner/schedule', [
+            'enabled' => true,
+            'frequency' => 'daily',
+            'categories' => ['apt_orphans'],
+        ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('categories.0');
+});
+
+it('still offers the package removal for a manual clean', function () {
+    Process::fake();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/disk-cleaner/clean', ['categories' => ['apt_orphans']])
+        ->assertOk();
+
+    Process::assertRan(fn ($p) => $p->command === aptCommand('-y', 'autoremove', '--purge'));
+});
+
+describe('the journal estimate', function () {
+    /**
+     * Fake whose journal directory holds one open file and two archived ones (a fresh one and
+     * one 10 days old), answered per -name pattern the way find would.
+     */
+    function dcFakeJournal(ArrayObject $ran): void
+    {
+        $now = now()->getTimestamp();
+        $files = [
+            'system.journal' => [8192, $now],
+            'system@aa-01.journal' => [1024, $now - 3600],
+            'system@aa-02.journal' => [2048, $now - 10 * 86400],
+        ];
+
+        Process::fake(function ($process) use ($ran, $files) {
+            if ($found = answerFind($process)) {
+                return $found;
+            }
+
+            $args = ($process->command[0] ?? '') === 'sudo' ? array_slice($process->command, 2) : $process->command;
+            $ran->append($args);
+
+            if (($args[0] ?? '') === 'find' && ($args[1] ?? '') === '/var/log/journal') {
+                $pattern = $args[array_search('-name', $args, true) + 1];
+
+                return Process::result(output: collect($files)
+                    ->filter(fn ($file, string $name) => fnmatch($pattern, $name))
+                    ->map(fn (array $file) => "{$file[0]}\t{$file[1]}\n")
+                    ->implode(''));
+            }
+
+            // Deliberately large: the number that would come back if the estimate still asked
+            // journalctl.
+            return match ($args[0] ?? '') {
+                'journalctl' => Process::result(output: 'Archived and active journals take up 200.0M in the file system.'),
+                default => Process::result(exitCode: 0),
+            };
+        });
+    }
+
+    it('counts only what a vacuum would actually remove', function () {
+        $ran = new ArrayObject;
+        dcFakeJournal($ran);
+
+        // No choice = the default week: only the archived file past 7 days. `system.journal` is
+        // the open one and a time vacuum never removes it, so the estimate must not count it.
+        expect(app(JournalTarget::class)->estimate())->toBe(2048);
+    });
+
+    it('prices every keep choice from what each would remove', function () {
+        $ran = new ArrayObject;
+        dcFakeJournal($ran);
+
+        expect(app(JournalTarget::class)->estimates([0, 1, 7, 14]))->toBe([
+            // Delete all: every archived file. The open one is rotated away too, but journald
+            // preallocates its replacement to the same size.
+            0 => 1024 + 2048,
+            1 => 2048,
+            7 => 2048,
+            14 => 0,
+        ]);
+    });
+
+    it('vacuums by the same window it estimated with', function () {
+        $ran = new ArrayObject;
+        dcFakeJournal($ran);
+
+        $target = app(JournalTarget::class);
+        $target->clean();
+        $target->clean(30);
+
+        $vacuums = collect($ran)->filter(fn (array $c) => $c[0] === 'journalctl')->values();
+
+        expect($vacuums[0])->toBe(['journalctl', '--vacuum-time=7d'])
+            ->and($vacuums[1])->toBe(['journalctl', '--vacuum-time=30d']);
+    });
+
+    it('deletes all by rotating and vacuuming to one byte, not by a time window', function () {
+        // `--vacuum-time=1s` races the rotate: files it just sealed can survive the window.
+        $ran = new ArrayObject;
+        dcFakeJournal($ran);
+
+        app(JournalTarget::class)->clean(0);
+
+        expect(collect($ran)->first(fn (array $c) => $c[0] === 'journalctl'))
+            ->toBe(['journalctl', '--rotate', '--vacuum-size=1']);
+    });
+});
+
+describe('found on a live OpenLiteSpeed server, 2026-09-23', function () {
+    /**
+     * The server's answer for root-only directories the test process cannot list itself
+     * (PHP's glob() saw nothing there).
+     *
+     * @param  array<string, string>  $listings  directory => find output
+     */
+    function fakeRootOnly(array $listings, ?ArrayObject $ran = null): void
+    {
+        Process::fake(function ($process) use ($listings, $ran) {
+            $ran?->append($process->command);
+            $cmd = $process->command;
+
+            // Answered like find: only lines matching the -name pattern, so current logs are not
+            // also returned as rotated copies.
+            if ($cmd[0] === 'find' && isset($listings[$cmd[1]])) {
+                $pattern = $cmd[array_search('-name', $cmd, true) + 1];
+
+                return Process::result(output: collect(explode("\n", $listings[$cmd[1]]))
+                    ->filter(fn (string $line) => $line !== '' && fnmatch($pattern, basename($line)))
+                    ->map(fn (string $line) => $line."\n")
+                    ->implode(''));
+            }
+
+            if ($found = answerFind($process)) {
+                return $found;
+            }
+
+            return $cmd[0] === 'df'
+                ? Process::result(output: "Filesystem 1B-blocks Used Available Capacity Mounted\n/dev/vda1 100000000000 60000000000 40000000000 60% /\n")
+                : Process::result();
+        });
+    }
+
+    it("includes OpenLiteSpeed's logs, which the panel account cannot list", function () {
+        // /usr/local/lsws/logs is root:nogroup 0750: glob() could not see it.
+        config(['server.disk_cleaner.service_log_globs' => ['/usr/local/lsws/logs/*.log']]);
+        fakeRootOnly(['/usr/local/lsws/logs' => "1088468\t1761400000\t/usr/local/lsws/logs/error.log\n3082438\t1761400000\t/usr/local/lsws/logs/access.log\n"]);
+
+        $service = collect($this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/disk-cleaner')->assertOk()->json('categories'))->firstWhere('key', 'service_logs');
+
+        expect($service['paths'])->toBe(['/usr/local/lsws/logs/access.log', '/usr/local/lsws/logs/error.log'])
+            ->and($service['reclaimable'])->toBe(1088468 + 3082438);
+    });
+
+    it("cleans every site's own logs, as its own category", function () {
+        // Site logs live in {home}/{slug}/logs, not /usr/local/lsws/conf/vhosts/*/logs.
+        $user = SystemUser::create(['username' => 'shopuser', 'home_path' => '/home/shopuser', 'shell' => '/bin/bash']);
+        Application::forceCreate([
+            'system_user_id' => $user->id, 'name' => 'Shop', 'slug' => 'shop', 'domain' => 'shop.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'php_version' => '8.4', 'status' => 'active', 'web_root' => '/',
+        ]);
+        $ran = new ArrayObject;
+        fakeRootOnly(['/home/shopuser/shop/logs' => "70541\t1761400000\t/home/shopuser/shop/logs/access.log\n"], $ran);
+
+        $site = collect($this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/disk-cleaner')->assertOk()->json('categories'))->firstWhere('key', 'site_logs');
+
+        expect($site['paths'])->toBe(['/home/shopuser/shop/logs/access.log']);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->postJson('/api/disk-cleaner/clean', ['categories' => ['site_logs']])->assertOk();
+
+        expect(collect($ran)->map(fn ($c) => implode(' ', $c)))
+            ->toContain('truncate --no-create -s 0 /home/shopuser/shop/logs/access.log');
+    });
+
+    it('lets site logs go on a schedule (Dipali, 2026-10-26: servers whose disks fill up)', function () {
+        $user = SystemUser::create(['username' => 'shopuser', 'home_path' => '/home/shopuser', 'shell' => '/bin/bash']);
+        Application::forceCreate([
+            'system_user_id' => $user->id, 'name' => 'Shop', 'slug' => 'shop', 'domain' => 'shop.test',
+            'site_type' => 'wordpress', 'serving_profile' => 'php', 'php_version' => '8.4', 'status' => 'active', 'web_root' => '/',
+        ]);
+        fakeRootOnly(['/home/shopuser/shop/logs' => "70541\t1761400000\t/home/shopuser/shop/logs/access.log\n"]);
+
+        // Emptying a site's logs erases its visitor history: only the keep choice makes it
+        // acceptable unattended.
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/disk-cleaner/schedule', ['enabled' => true, 'frequency' => 'weekly', 'categories' => ['site_logs'], 'keep_days' => 7])
+            ->assertOk()
+            ->assertJsonPath('schedule.categories', ['site_logs'])
+            ->assertJsonPath('schedule.keep_days', 7);
+    });
+});
+
+/*
+ * "Service logs" is safe and schedulable, so it must never empty ufw.log or fail2ban.log: they
+ * are the record of attacks, and fail2ban's recidive jail reads them. A live log is never
+ * emptied.
+ */
+it('never empties the security logs', function () {
+    $globs = (require base_path('config/server.php'))['disk_cleaner']['service_log_globs'];
+
+    foreach (['/var/log/ufw.log', '/var/log/fail2ban.log', '/var/log/auth.log'] as $log) {
+        foreach ($globs as $glob) {
+            expect(fnmatch($glob, $log))->toBeFalse("{$glob} would empty {$log}");
+        }
+    }
+});

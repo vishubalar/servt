@@ -1,0 +1,100 @@
+import Link from "@/components/ui/app-link";
+import { getTranslations } from "next-intl/server";
+import { CircleAlert, FileText, Plus } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { CopyButton } from "@/components/ui/copy-button";
+import { PanelServer } from "@/components/illustrations/steel/panel-server";
+
+const CHIP = "inline-flex h-6 items-center rounded-[2px] px-2 font-mono text-xs font-medium tracking-[0.08em] uppercase ring-1 ring-[var(--hero-line)]";
+
+export async function DashboardHero({
+  facts,
+  health,
+  findings = [],
+  applications = null,
+  canCreate = false,
+  canViewLogs = false,
+}) {
+  const t = await getTranslations("serverDashboard");
+  const tApplications = await getTranslations("applications");
+  const down = health?.down?.length ?? 0;
+  const problems = new Set(findings.map((finding) => finding.kind)).size;
+
+  const title = down
+    ? t("hero.down", { count: down })
+    : problems
+      ? t("hero.running")
+      : applications && !applications.length
+        ? t("hero.welcome")
+        : health || applications
+          ? t("hero.healthy")
+          : t("hero.unknown");
+
+  const online = applications?.filter((a) => a.status === "active" && !a.is_disabled).length ?? 0;
+  const summary = applications
+    ? applications.length
+      ? t("hero.apps", { online, total: applications.length })
+      : t("hero.noApps")
+    : null;
+
+  const ip = facts?.public_ip ?? facts?.ip;
+
+  return (
+    <section className="relative overflow-hidden rounded-2xl bg-hero">
+      <div className="bg-hero-grid pointer-events-none absolute inset-0" />
+      <span aria-hidden className="pointer-events-none absolute top-1.5 left-1.5 size-4 border-t-2 border-l-2 border-primary" />
+      <span aria-hidden className="pointer-events-none absolute right-1.5 bottom-1.5 size-4 border-r-2 border-b-2 border-primary" />
+      <div className="relative flex flex-wrap items-center gap-x-6 gap-y-3 px-5 py-4 md:px-6">
+        <PanelServer
+          total={applications ? applications.length : null}
+          online={online}
+          alert={down > 0}
+          className="pointer-events-none -my-2 hidden h-16 w-auto shrink-0 sm:block"
+        />
+        <div className="min-w-0 flex-1 basis-72">
+          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight text-balance">
+            {down ? (
+              <CircleAlert className="size-5 shrink-0 text-destructive" aria-hidden />
+            ) : (
+              <span aria-hidden className={`size-2 shrink-0 ${health || applications ? "bg-primary" : "bg-muted-foreground"}`} />
+            )}
+            {title}
+          </h1>
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs">
+            {summary ? <p className="text-sm text-[var(--hero-muted)]">{summary}</p> : null}
+            {facts?.uptime?.human ? <span className={CHIP}>{t("hero.up", { time: facts.uptime.human })}</span> : null}
+            {ip ? (
+              <span className={`${CHIP} gap-1 pr-0.5`}>
+                {ip}
+                <CopyButton
+                  value={ip}
+                  label={t("info.copyIp")}
+                  className="size-5 rounded-[2px] text-[var(--hero-muted)] hover:bg-[var(--hero-wash)] hover:text-[var(--hero-fg)] [&_svg]:size-3"
+                />
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        {canCreate || canViewLogs ? (
+          <div className="flex max-w-full shrink-0 flex-wrap items-center gap-2">
+            {canViewLogs ? (
+              <Button asChild variant="ghost" className="border border-[var(--hero-line)] text-[var(--hero-fg)] hover:bg-[var(--hero-wash)] hover:text-[var(--hero-fg)] dark:hover:bg-[var(--hero-wash)]">
+                <Link href="/logs" prefetch={false}>
+                  <FileText /> {t("hero.viewLogs")}
+                </Link>
+              </Button>
+            ) : null}
+            {canCreate ? (
+              <Button asChild className="shadow-none">
+                <Link href="/applications/create" prefetch={false}>
+                  <Plus /> {tApplications("create")}
+                </Link>
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}

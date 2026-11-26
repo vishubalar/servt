@@ -1,0 +1,635 @@
+<?php
+
+namespace App\Services\Server\Fail2ban;
+
+use App\Exceptions\Server\Fail2ban\Fail2banException;
+use App\Services\Server\Applications\ApplicationFail2banManager;
+use App\Services\Server\Applications\DnsVerifier;
+use App\Services\Server\ServerAddresses;
+use App\Services\Server\ServerOps;
+use App\Services\Server\ServerOpsResult;
+use App\Services\Server\ServerPublicIp;
+use App\Support\IpAddress;
+use App\Support\SshPort;
+use Symfony\Component\HttpFoundation\IpUtils;
+
+/**
+ * fail2ban: watches logs for repeated failures and bans the source IP.
+ *
+ * No DB. Live state (jails, bans) comes from `fail2ban-client`; the settings we manage live in
+ * `jail.local` ({@see dropInPath()}), which fail2ban loads after `jail.d/*.conf`, so ours win.
+ * That matters: Ubuntu's `jail.d/defaults-debian.conf` enables `[sshd]`, and without our file
+ * installing fail2ban would start banning SSH at once.
+ *
+ * `jail.local` may be hand-written and this class replaces it wholesale: see {@see MANAGED_HEADER}.
+ * This feature locks people out and cannot tell an attacker from an admin having a bad day,
+ * hence the ignore list and the refusal to enable the SSH jail without an acknowledgement.
+ */
+class Fail2banManager
+{
+    /** Always ignored: banning the machine from itself helps nobody. */
+    public const ALWAYS_IGNORED = ['127.0.0.1/8', '::1'];
+
+    /**
+     * First line of every file the panel writes to `jail.local`: how it tells its own file from
+     * one an administrator wrote by hand before overwriting.
+     */
+    public const MANAGED_HEADER = '# Managed by the control panel — do not edit by hand';
+
+    public function __construct(private ServerOps $serverOps) {}
+
+    public function installed(): bool
+    {
+        return $this->serverOps->run(
+            ['which', 'fail2ban-client'],
+            ['feature' => 'fail2ban', 'op' => 'detect'],
+        )->ok;
+    }
+
+    public function running(): bool
+    {
+        return $this->installed() && $this->client(['ping'])->ok;
+    }
+
+    public function version(): ?string
+    {
+        if (! $this->installed()) {
+            return null;
+        }
+
+        $output = trim($this->client(['--version'])->output());
+
+        return preg_match('/(\d+\.\d+\.\d+)/', $output, $m) === 1 ? $m[1] : null;
+    }
+
+    /**
+     * The jails the panel manages, with their live state.
+     *
+     * `sshd` protects the way into the server; `recidive` bans repeat offenders for much longer.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function jails(): array
+    {
+        $active = $this->activeJails();
+
+        return array_map(function (array $jail) use ($active) {
+            $enabled = in_array($jail['name'], $active, true);
+
+            return [
+                ...$jail,
+                'enabled' => $enabled,
+                'banned' => $enabled ? $this->bannedIn($jail['name']) : [],
+                'stats' => $enabled ? $this->stats($jail['name']) : null,
+            ];
+        }, (array) config('server.fail2ban.jails', []));
+    }
+
+    /**
+     * A jail's counters.
+     *
+     * `currently_failed` means an attack is in progress now; the totals only say one happened.
+     *
+     * @return array<string, int>
+     */
+    public function stats(string $jail): array
+    {
+        $output = $this->client(['status', $jail])->output();
+
+        $number = function (string $label) use ($output): int {
+            return preg_match('/'.preg_quote($label, '/').':\s*(\d+)/i', $output, $m) === 1 ? (int) $m[1] : 0;
+        };
+
+        return [
+            'currently_failed' => $number('Currently failed'),
+            'total_failed' => $number('Total failed'),
+            'currently_banned' => $number('Currently banned'),
+            'total_banned' => $number('Total banned'),
+        ];
+    }
+
+    /**
+     * Every currently banned IP, with the jail that banned it.
+     *
+     * @return array<int, array{ip: string, jail: string}>
+     */
+    public function banned(): array
+    {
+        $banned = [];
+
+        foreach ($this->activeJails() as $jail) {
+            $times = $this->banTimes($jail);
+
+            foreach ($this->bannedIn($jail) as $ip) {
+                $banned[] = [
+                    'ip' => $ip,
+                    'jail' => $jail,
+                    // Null when this fail2ban is too old to report timings.
+                    ...($times[$ip] ?? ['banned_at' => null, 'expires_at' => null, 'seconds_left' => null]),
+                ];
+            }
+        }
+
+        return $banned;
+    }
+
+    /**
+     * Ban and expiry times per IP for a jail.
+     *
+     * An older fail2ban ignores `--with-time` and prints bare addresses; no timestamps parsed
+     * means no timings.
+     *
+     * @return array<string, array{banned_at: string, expires_at: string, seconds_left: int}>
+     */
+    private function banTimes(string $jail): array
+    {
+        $output = $this->client(['get', $jail, 'banip', '--with-time'])->output();
+        $now = time();
+        $times = [];
+
+        // 1.2.3.4 	2026-07-29 11:00:00 + 3600 = 2026-07-29 12:00:00
+        preg_match_all(
+            '/^\s*(\S+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\+\s*(-?\d+)\s*=\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/m',
+            $output,
+            $matches,
+            PREG_SET_ORDER,
+        );
+
+        foreach ($matches as $match) {
+            $expires = strtotime($match[4]) ?: 0;
+
+            $times[$match[1]] = [
+                'banned_at' => $match[2],
+                // A negative bantime is fail2ban's permanent ban.
+                'expires_at' => (int) $match[3] < 0 ? null : $match[4],
+                'seconds_left' => (int) $match[3] < 0 ? null : max(0, $expires - $now),
+            ];
+        }
+
+        return $times;
+    }
+
+    /**
+     * Release every banned address (e.g. an office or VPN range banned by mistake).
+     *
+     * @return array<int, string> the addresses released
+     */
+    public function unbanAll(): array
+    {
+        $released = [];
+
+        foreach ($this->activeJails() as $jail) {
+            foreach ($this->bannedIn($jail) as $ip) {
+                if ($this->client(['set', $jail, 'unbanip', $ip])->ok) {
+                    $released[] = $ip;
+                }
+            }
+        }
+
+        return array_values(array_unique($released));
+    }
+
+    /**
+     * Settings from our drop-in, i.e. what the settings form controls.
+     *
+     * Not read back from fail2ban: the effective value can come from another file, and showing
+     * it in a form that writes ours would offer a number that then refuses to change.
+     *
+     * @return array<string, mixed>
+     */
+    public function settings(): array
+    {
+        $config = $this->readDropIn();
+
+        return [
+            'bantime' => (int) ($config['bantime'] ?? config('server.fail2ban.defaults.bantime')),
+            'findtime' => (int) ($config['findtime'] ?? config('server.fail2ban.defaults.findtime')),
+            'maxretry' => (int) ($config['maxretry'] ?? config('server.fail2ban.defaults.maxretry')),
+            'ignore_ips' => $this->ignoreIps(),
+        ];
+    }
+
+    /**
+     * The ignore list, without the loopback entries we always add.
+     *
+     * @return array<int, string>
+     */
+    public function ignoreIps(): array
+    {
+        $raw = (string) ($this->readDropIn()['ignoreip'] ?? '');
+
+        return array_values(array_diff(
+            array_filter(preg_split('/\s+/', trim($raw)) ?: []),
+            self::ALWAYS_IGNORED,
+        ));
+    }
+
+    /**
+     * Is this one of the machine's own addresses, which the panel never lets you ban?
+     *
+     * A manual ban on loopback holds even when the address is in `ignoreip` (that only governs
+     * detection). On `recidive` (all ports) banning 127.0.0.1 blocks MariaDB, Redis and the
+     * panel's own loopback, and the panel cannot unban itself through the API it just cut off;
+     * recovery is SSH only.
+     *
+     * Matched with `IpUtils`, not string equality: {@see ALWAYS_IGNORED} holds `127.0.0.1/8`.
+     * Not applied to the user's own ignore entries: blocking one host inside a trusted range is valid.
+     */
+    public function isOwnAddress(string $ip): bool
+    {
+        $ip = IpAddress::canonical($ip);
+
+        if (IpUtils::checkIp($ip, self::ALWAYS_IGNORED)) {
+            return true;
+        }
+
+        // Its other addresses too: banning the public IP on `recidive` cuts the panel off like
+        // loopback does. Interface addresses plus the public one (behind NAT it is on no
+        // interface; it comes from the cloud's metadata).
+        $own = [
+            ...app(ServerAddresses::class)->local(),
+            app(ServerPublicIp::class)->detect(fn () => app(DnsVerifier::class)->serverIp()),
+        ];
+
+        return IpUtils::checkIp($ip, array_values(array_filter($own)));
+    }
+
+    /**
+     * Rewrite the drop-in and reload.
+     *
+     * @param  array<string, mixed>  $settings
+     * @param  array<int, string>  $ignoreIps
+     * @param  array<string, bool>  $enabled  jail name => enabled
+     */
+    public function write(array $settings, array $ignoreIps, array $enabled): void
+    {
+        $ignore = implode(' ', array_unique([...self::ALWAYS_IGNORED, ...$ignoreIps]));
+
+        $body = self::MANAGED_HEADER."\n"
+            ."[DEFAULT]\n"
+            ."bantime = {$settings['bantime']}\n"
+            ."findtime = {$settings['findtime']}\n"
+            ."maxretry = {$settings['maxretry']}\n"
+            // No `backend` in [DEFAULT]: the systemd backend makes fail2ban ignore `logpath`, which
+            // would disable every file-watching jail. It is set on the `sshd` jail instead
+            // (see `server.fail2ban.jails`).
+            ."ignoreip = {$ignore}\n";
+
+        foreach ((array) config('server.fail2ban.jails', []) as $jail) {
+            $body .= "\n[{$jail['name']}]\n"
+                .'enabled = '.(($enabled[$jail['name']] ?? false) ? 'true' : 'false')."\n";
+
+            foreach ($this->jailOptions($jail) as $key => $value) {
+                $body .= "{$key} = {$value}\n";
+            }
+        }
+
+        $this->ensureRecidiveFilter();
+
+        $path = $this->dropInPath();
+
+        // Whose file is this? Checked before writing, through ServerOps: the panel account is
+        // unprivileged, so PHP's own read of a root-owned file returns false ("nothing to keep").
+        $previous = $this->currentDropIn($path);
+
+        $result = $this->serverOps->run(
+            ['tee', $path],
+            ['feature' => 'fail2ban', 'op' => 'write_config'],
+            input: $body,
+        );
+
+        if ($result->failed()) {
+            throw Fail2banException::operationFailed($result->reference);
+        }
+
+        // Validate the exact file we just wrote before it can be loaded.
+        $test = $this->client(['-t']);
+        if ($test->failed()) {
+            $this->restoreDropIn($path, $previous);
+            throw Fail2banException::operationFailed($test->reference);
+        }
+
+        try {
+            $this->reload();
+        } catch (Fail2banException $exception) {
+            $this->restoreDropIn($path, $previous);
+            // Reload the known-good configuration; ServerOps logs a failure here.
+            $this->client(['reload']);
+            throw $exception;
+        }
+    }
+
+    /**
+     * fail2ban's own `recidive` filter, minus the per-site jails.
+     *
+     * `recidive` bans every port for a week after three bans in a day. Counting site jails would
+     * let three wrong-password streaks on one site black out the whole server for that address.
+     * `_jailname` is overridden in `[DEFAULT]`, where recidive defines it; a `[Definition]`
+     * override has no effect.
+     */
+    private function ensureRecidiveFilter(): void
+    {
+        $path = rtrim((string) config('server.fail2ban_apps.filter_d', '/etc/fail2ban/filter.d'), '/').'/panel-recidive.conf';
+        $body = self::MANAGED_HEADER."\n"
+            ."[INCLUDES]\n"
+            ."before = recidive.conf\n\n"
+            ."[DEFAULT]\n"
+            .'_jailname = (?:recidive|'.preg_quote(ApplicationFail2banManager::NAME_PREFIX, '/').'[^\]]+)'."\n";
+
+        $current = $this->serverOps->probe(['cat', $path], ['feature' => 'fail2ban', 'op' => 'recidive_filter_read'], timeout: 15);
+
+        if ($current->ok && $current->output() === $body) {
+            return;
+        }
+
+        $written = $this->serverOps->run(['tee', $path], ['feature' => 'fail2ban', 'op' => 'recidive_filter_write'], input: $body);
+
+        if ($written->failed()) {
+            throw Fail2banException::operationFailed($written->reference);
+        }
+    }
+
+    /**
+     * What is at `jail.local` now, or null when nothing is.
+     *
+     * Refuses rather than guesses: a file the panel did not write (e.g. from another panel) is
+     * someone's configuration, and replacing it would silently destroy it. An unreadable file is
+     * the same with less information.
+     *
+     * @throws Fail2banException
+     */
+    private function currentDropIn(string $path): ?string
+    {
+        $present = $this->serverOps->probe(
+            ['test', '-f', $path],
+            ['feature' => 'fail2ban', 'op' => 'config_exists'],
+            timeout: 15,
+        );
+
+        if (! $present->answered) {
+            throw Fail2banException::operationFailed($present->reference);
+        }
+
+        if (! $present->ok) {
+            return null;
+        }
+
+        $current = $this->serverOps->run(
+            ['cat', $path],
+            ['feature' => 'fail2ban', 'op' => 'config_read'],
+            timeout: 30,
+        );
+
+        if ($current->failed()) {
+            throw Fail2banException::operationFailed($current->reference);
+        }
+
+        if (! str_starts_with(ltrim($current->output()), self::MANAGED_HEADER)) {
+            throw Fail2banException::foreignJailLocal($path);
+        }
+
+        return $current->output();
+    }
+
+    private function restoreDropIn(string $path, ?string $previous): void
+    {
+        // Only when we established there was nothing here before; an unreadable file must not
+        // be deleted by the rollback.
+        if ($previous === null) {
+            $this->serverOps->run(['rm', '-f', $path], ['feature' => 'fail2ban', 'op' => 'restore_config']);
+
+            return;
+        }
+
+        $this->serverOps->run(['tee', $path], ['feature' => 'fail2ban', 'op' => 'restore_config'], input: $previous);
+    }
+
+    /**
+     * A jail's options, with `{ssh_port}` resolved.
+     *
+     * The sshd jail defaults to `port = ssh` (22), but the user can move SSH; otherwise fail2ban
+     * would ban a port nobody uses while the screen reported the server as protected.
+     *
+     * @param  array<string, mixed>  $jail
+     * @return array<string, string>
+     */
+    private function jailOptions(array $jail): array
+    {
+        $port = (string) $this->sshPort();
+
+        return array_map(
+            fn ($value) => str_replace('{ssh_port}', $port, (string) $value),
+            (array) ($jail['options'] ?? []),
+        );
+    }
+
+    /**
+     * Shared with the firewall (which must never close this port) and Settings (which changes it).
+     */
+    public function sshPort(): int
+    {
+        return SshPort::current();
+    }
+
+    /**
+     * Reload, not restart: a restart forgets every active ban.
+     */
+    public function reload(): void
+    {
+        $result = $this->client(['reload']);
+
+        if ($result->failed()) {
+            throw Fail2banException::operationFailed($result->reference);
+        }
+    }
+
+    /**
+     * Restart the running jails whose options name the SSH port, so their firewall rule is
+     * rebuilt for the port SSH is on now.
+     *
+     * A reload keeps a running jail's nftables rule, so after a port move bans would still land on
+     * the old port. `reload --restart <jail>` rebuilds it; bans return from fail2ban's database.
+     */
+    public function restartSshJails(): void
+    {
+        $active = $this->activeJails();
+
+        foreach ((array) config('server.fail2ban.jails', []) as $jail) {
+            $usesSshPort = collect($jail['options'] ?? [])
+                ->contains(fn ($value): bool => str_contains((string) $value, '{ssh_port}'));
+
+            if (! $usesSshPort || ! in_array($jail['name'], $active, true)) {
+                continue;
+            }
+
+            $result = $this->client(['reload', '--restart', $jail['name']]);
+
+            if ($result->failed()) {
+                throw Fail2banException::operationFailed($result->reference);
+            }
+        }
+    }
+
+    public function ban(string $ip, string $jail): void
+    {
+        $this->assertJailActive($jail);
+
+        $result = $this->client(['set', $jail, 'banip', $ip]);
+
+        if ($result->failed()) {
+            throw Fail2banException::operationFailed($result->reference);
+        }
+    }
+
+    /**
+     * Unban an IP. Without a jail, from every jail holding it.
+     *
+     * @return array<int, string> the jails it was released from
+     */
+    public function unban(string $ip, ?string $jail = null): array
+    {
+        $jails = $jail !== null ? [$jail] : $this->activeJails();
+        $released = [];
+
+        foreach ($jails as $name) {
+            if (in_array($ip, $this->bannedIn($name), true) && $this->client(['set', $name, 'unbanip', $ip])->ok) {
+                $released[] = $name;
+            }
+        }
+
+        if ($released === []) {
+            throw Fail2banException::notBanned();
+        }
+
+        return $released;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    /**
+     * Which jails the *file* has enabled, not which ones are running.
+     *
+     * {@see activeJails()} asks the daemon and answers `[]` when it is down; a rewrite based on
+     * that would persist "nothing enabled" and switch off SSH protection. So this reads the file.
+     *
+     * Returns an empty array when the panel does not own the file; callers must treat that as
+     * "do not write", not "disable everything".
+     *
+     * @return array<string, bool> jail name => enabled
+     */
+    public function configuredJails(): array
+    {
+        try {
+            $contents = $this->currentDropIn($this->dropInPath());
+        } catch (Fail2banException) {
+            // `currentDropIn()` refuses a foreign file, which is right for the save path. This runs
+            // unattended from a deploy, where an exception would abort the update.
+            return [];
+        }
+
+        if ($contents === null) {
+            return [];
+        }
+
+        $enabled = [];
+        $section = null;
+
+        foreach (preg_split('/\r?\n/', $contents) ?: [] as $line) {
+            if (preg_match('/^\s*\[([^\]]+)\]/', $line, $matches) === 1) {
+                $section = trim($matches[1]);
+
+                continue;
+            }
+
+            if ($section === null || $section === 'DEFAULT') {
+                continue;
+            }
+
+            if (preg_match('/^\s*enabled\s*=\s*(\S+)/i', $line, $matches) === 1) {
+                $enabled[$section] = filter_var($matches[1], FILTER_VALIDATE_BOOL);
+            }
+        }
+
+        return $enabled;
+    }
+
+    public function activeJails(): array
+    {
+        if (! $this->running()) {
+            return [];
+        }
+
+        $output = $this->client(['status'])->output();
+
+        if (preg_match('/Jail list:\s*(.*)$/m', $output, $m) !== 1) {
+            return [];
+        }
+
+        return array_values(array_filter(array_map('trim', explode(',', $m[1]))));
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    public function bannedIn(string $jail): array
+    {
+        $output = $this->client(['get', $jail, 'banned'])->output();
+
+        // Returned as a Python list literal: ['1.2.3.4', '5.6.7.8']
+        preg_match_all("/'([^']+)'/", $output, $matches);
+
+        return $matches[1] ?? [];
+    }
+
+    private function assertJailActive(string $jail): void
+    {
+        if (! in_array($jail, $this->activeJails(), true)) {
+            throw Fail2banException::jailNotActive($jail);
+        }
+    }
+
+    /**
+     * Our drop-in's `key = value` pairs, or an empty array when it doesn't
+     * exist yet.
+     *
+     * @return array<string, string>
+     */
+    private function readDropIn(): array
+    {
+        $path = $this->dropInPath();
+
+        if (! is_readable($path)) {
+            return [];
+        }
+
+        $values = [];
+        foreach (preg_split('/\r?\n/', (string) @file_get_contents($path)) ?: [] as $line) {
+            // Only the [DEFAULT] block holds what the settings form edits.
+            if (preg_match('/^\s*\[/', $line) === 1 && ! str_contains($line, 'DEFAULT')) {
+                break;
+            }
+            if (preg_match('/^\s*([a-z_.]+)\s*=\s*(.*)$/i', $line, $m) === 1) {
+                $values[strtolower($m[1])] = trim($m[2]);
+            }
+        }
+
+        return $values;
+    }
+
+    public function dropInPath(): string
+    {
+        return (string) config('server.fail2ban.jail_local', '/etc/fail2ban/jail.local');
+    }
+
+    /**
+     * @param  array<int, string>  $args
+     */
+    private function client(array $args): ServerOpsResult
+    {
+        return $this->serverOps->run(
+            [(string) config('server.fail2ban.client', 'fail2ban-client'), ...$args],
+            ['feature' => 'fail2ban', 'op' => $args[0] ?? 'client'],
+        );
+    }
+}

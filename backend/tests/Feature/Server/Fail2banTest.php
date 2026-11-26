@@ -1,0 +1,1018 @@
+<?php
+
+use App\Jobs\InstallFail2ban;
+use App\Models\ActivityLog;
+use App\Models\User;
+use App\Services\Runtime\InstallTracker;
+use App\Services\Server\Fail2ban\Fail2banManager;
+use App\Services\Server\ServerAddresses;
+use App\Services\Server\ServerPublicIp;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Testing\TestResponse;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    $this->jailD = sys_get_temp_dir().'/sv-oss-f2b-'.getmypid();
+    File::deleteDirectory($this->jailD);
+    File::makeDirectory($this->jailD, 0755, true);
+
+    config([
+        'server.fail2ban.jail_d' => $this->jailD,
+        'server.fail2ban.jail_local' => $this->jailD.'/jail.local',
+        'server.fail2ban_apps.filter_d' => $this->jailD,
+    ]);
+});
+
+afterEach(fn () => File::deleteDirectory($this->jailD));
+
+/**
+ * Fake fail2ban-client. `$installed` false makes `which` fail, which is what
+ * a server that has never had fail2ban looks like.
+ *
+ * @param  array<string, array<int, string>>  $bans  jail => banned IPs
+ */
+function fakeFail2ban(bool $installed = true, array $bans = ['sshd' => []], bool $running = true): ArrayObject
+{
+    $runs = new ArrayObject;
+
+    Process::fake(function ($process) use ($runs, $installed, $bans, $running) {
+        $runs[] = ['command' => $process->command, 'input' => (string) $process->input];
+        $command = $process->command;
+        if (($command[0] ?? null) === 'sudo' && ($command[1] ?? null) === '-n') {
+            $command = array_slice($command, 2);
+        }
+
+        if ($command[0] === 'which') {
+            return Process::result(output: $installed ? "/usr/bin/fail2ban-client\n" : '', exitCode: $installed ? 0 : 1);
+        }
+
+        // Let `tee` do what tee does, so the config we write is the config
+        // the next read parses — otherwise the round trip is never exercised.
+        if ($command[0] === 'tee') {
+            File::put($command[1], (string) $process->input);
+
+            return Process::result(exitCode: 0);
+        }
+
+        // The panel asks whose file jail.local is before replacing it, so the fake must answer from
+        // the same disk `tee` writes to, or every save looks like it clobbers a stranger's file.
+        if ($command[0] === 'test' && ($command[1] ?? '') === '-f') {
+            return Process::result(exitCode: File::exists($command[2] ?? '') ? 0 : 1);
+        }
+
+        if ($command[0] === 'cat') {
+            return File::exists($command[1] ?? '')
+                ? Process::result(output: File::get($command[1]))
+                : Process::result(errorOutput: 'No such file or directory', exitCode: 1);
+        }
+
+        if ($command[0] === 'rm') {
+            File::delete(array_slice($command, 1));
+
+            return Process::result(exitCode: 0);
+        }
+
+        if ($command[0] !== 'fail2ban-client') {
+            return Process::result(exitCode: 0);
+        }
+
+        return match ($command[1] ?? '') {
+            'ping' => Process::result(output: 'Server replied: pong', exitCode: $running ? 0 : 1),
+            '--version' => Process::result(output: 'fail2ban-client v1.0.2'),
+            'status' => count($command) === 2
+                ? Process::result(output: "Status\n|- Jail list:\t".implode(', ', array_keys($bans))."\n")
+                : Process::result(output: 'Status for the jail'),
+            'get' => Process::result(output: "['".implode("', '", $bans[$command[2]] ?? [])."']"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    return $runs;
+}
+
+function f2b(string $method, string $uri, array $body = []): TestResponse
+{
+    return test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->json($method, $uri, $body);
+}
+
+function dropIn(): string
+{
+    return (string) @file_get_contents(test()->jailD.'/jail.local');
+}
+
+it('reports honestly when fail2ban is not installed, instead of failing', function () {
+    fakeFail2ban(installed: false);
+
+    // The screen has to render on a server that has never had fail2ban —
+    // that is the normal starting state, not an error.
+    f2b('GET', '/api/fail2ban')
+        ->assertOk()
+        ->assertJsonPath('fail2ban.installed', false)
+        ->assertJsonPath('fail2ban.settings', null)
+        ->assertJsonPath('fail2ban.jails', []);
+});
+
+it('tells the caller its own IP, so it can be added to the ignore list', function () {
+    fakeFail2ban();
+
+    // Without this the operator has to go and find their own address before
+    // they can safely turn on the SSH jail.
+    f2b('GET', '/api/fail2ban')->assertOk()->assertJsonPath('fail2ban.your_ip', '127.0.0.1');
+});
+
+it('queues the install and refuses to install twice', function () {
+    Queue::fake();
+    fakeFail2ban(installed: false);
+
+    f2b('POST', '/api/fail2ban/install')->assertStatus(202);
+    Queue::assertPushed(InstallFail2ban::class);
+
+    fakeFail2ban(installed: true);
+    f2b('POST', '/api/fail2ban/install')->assertUnprocessable();
+});
+
+/*
+ * The install wrote every jail off, so Setup said "You're all set" over a fail2ban protecting
+ * nothing. Debian's own default turns the SSH jail on; the rest stay off until asked for.
+ */
+it('protects SSH as soon as fail2ban is installed, and nothing else', function () {
+    fakeFail2ban();
+
+    dispatch_sync(new InstallFail2ban);
+
+    $section = fn (string $jail) => (string) preg_replace('/\n\[.*$/s', '', (string) strstr(dropIn(), "[{$jail}]"));
+
+    expect($section('sshd'))->toContain('enabled = true')
+        ->and($section('recidive'))->toContain('enabled = false')
+        ->and(dropIn())->toContain('ignoreip = 127.0.0.1/8');
+});
+
+it('refuses to enable the SSH jail without an acknowledgement', function () {
+    fakeFail2ban(bans: []);
+
+    // This is the one action that can lock the operator out of their own
+    // server. It stays possible — but not by accident.
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'jails' => ['sshd' => true],
+    ])->assertUnprocessable();
+
+    expect(dropIn())->toBe('');
+});
+
+it('enables the SSH jail once the risk is acknowledged', function () {
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'jails' => ['sshd' => true], 'acknowledged' => true,
+    ])->assertOk();
+
+    expect(dropIn())->toContain("[sshd]\nenabled = true");
+});
+
+it('enables the SSH jail without acknowledgement when the caller is already ignored', function () {
+    fakeFail2ban(bans: []);
+
+    // Their address is on the ignore list, so the lockout this guards against
+    // cannot happen to them.
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'ignore_ips' => ['127.0.0.1'],
+        'jails' => ['sshd' => true],
+    ])->assertOk();
+
+    expect(dropIn())->toContain("[sshd]\nenabled = true");
+});
+
+it('always ignores loopback, whatever the user submits', function () {
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'ignore_ips' => ['203.0.113.5'],
+    ])->assertOk();
+
+    // Banning the machine from itself helps nobody, and the user did not ask
+    // for these — so they are not theirs to remove either.
+    expect(dropIn())->toContain('ignoreip = 127.0.0.1/8 ::1 203.0.113.5');
+
+    f2b('GET', '/api/fail2ban')->assertJsonPath('fail2ban.settings.ignore_ips', ['203.0.113.5']);
+});
+
+it('owns jail.local, and says so in the file', function () {
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])->assertOk();
+
+    // Server-level settings live in jail.local, where existing installations already have one.
+    // The header is how the panel recognises its own file before replacing it, so it is asserted.
+    expect(dropIn())->toStartWith(Fail2banManager::MANAGED_HEADER)
+        ->and(dropIn())->toContain('bantime = 7200');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Which backend each jail reads
+|--------------------------------------------------------------------------
+|
+| `backend` decides where a jail looks: `systemd` reads the journal, anything
+| else reads the file named by `logpath`. Set in `[DEFAULT]` it applies to
+| EVERY jail, and a systemd default makes fail2ban ignore `logpath` entirely:
+| `recidive` and the per-site jails would match nothing and ban nobody while
+| the panel reported them enabled.
+|
+| SSH is the one jail that genuinely wants the journal, so the setting belongs
+| on it.
+*/
+
+it('keeps the backend off [DEFAULT], where it would apply to every jail', function () {
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])->assertOk();
+
+    $default = substr(dropIn(), 0, (int) strpos(dropIn(), '[sshd]'));
+
+    expect($default)->not->toContain('backend');
+});
+
+it('gives the SSH jail the journal, since that is where sshd logs', function () {
+    // The negative control, and the half that matters most: SSH is the jail that protects the box.
+    // `%(sshd_backend)s` rather than a literal `systemd`: it is fail2ban's own variable and
+    // resolves to whatever the distribution uses.
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])->assertOk();
+
+    $sshd = substr(dropIn(), (int) strpos(dropIn(), '[sshd]'));
+    $sshd = substr($sshd, 0, (int) strpos($sshd, '[recidive]'));
+
+    expect($sshd)->toContain('backend = %(sshd_backend)s');
+});
+
+it('leaves recidive reading its log file, not the journal', function () {
+    // It names a `logpath`; inheriting a systemd backend made that a file
+    // fail2ban never opened.
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])->assertOk();
+
+    $recidive = substr(dropIn(), (int) strpos(dropIn(), '[recidive]'));
+
+    expect($recidive)->toContain('logpath = /var/log/fail2ban.log')
+        ->and($recidive)->not->toContain('backend');
+});
+
+it('refuses to overwrite a jail.local it did not write', function () {
+    // A server migrated from another panel, or set up by hand, owns this file, and this feature
+    // replaces it wholesale. Silently losing someone's brute-force configuration is worse than
+    // declining to save a setting.
+    fakeFail2ban(bans: []);
+
+    $theirs = "[DEFAULT]\nbantime = 99999\nignoreip = 198.51.100.7\n";
+    File::put("{$this->jailD}/jail.local", $theirs);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])
+        ->assertStatus(409);
+
+    // Untouched, byte for byte. The point of the test.
+    expect(dropIn())->toBe($theirs);
+});
+
+it('refuses rather than guessing when it cannot read jail.local', function () {
+    // Unreadable is not "there was nothing here": read as absent, the write goes ahead and the
+    // file is gone (and rollback would `rm -f` the file it was restoring).
+    fakeFail2ban(bans: []);
+    File::put("{$this->jailD}/jail.local", "[DEFAULT]\n");
+
+    Process::fake(function ($process) {
+        $command = $process->command;
+
+        if (($command[0] ?? null) === 'which') {
+            return Process::result(output: "/usr/bin/fail2ban-client\n");
+        }
+
+        // `cat` refused: the panel cannot tell whose file this is.
+        return ($command[0] ?? null) === 'cat'
+            ? Process::result(errorOutput: 'cat: Permission denied', exitCode: 1)
+            : Process::result(exitCode: 0);
+    });
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])
+        ->assertStatus(500);
+
+    expect(dropIn())->toBe("[DEFAULT]\n");
+});
+
+it('reloads rather than restarts, so active bans survive a settings change', function () {
+    $runs = fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 3600, 'findtime' => 600, 'maxretry' => 5])->assertOk();
+
+    $commands = collect($runs)->pluck('command');
+
+    // A restart forgets every ban — quietly undoing the protection the user
+    // came here to configure.
+    expect($commands)->toContain(['fail2ban-client', 'reload'])
+        ->and($commands)->not->toContain(['systemctl', 'restart', 'fail2ban']);
+});
+
+it('does not silently disable a jail the request did not mention', function () {
+    // sshd is already running; the request only talks about recidive.
+    fakeFail2ban(bans: ['sshd' => [], 'recidive' => []]);
+
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'jails' => ['recidive' => true],
+    ])->assertOk();
+
+    // The file is rewritten whole, so an unmentioned jail must keep its
+    // current state rather than defaulting to off.
+    expect(dropIn())->toContain("[sshd]\nenabled = true");
+});
+
+it('lists who is banned, across every jail', function () {
+    fakeFail2ban(bans: ['sshd' => ['203.0.113.5'], 'recidive' => ['198.51.100.9']]);
+
+    f2b('GET', '/api/fail2ban')
+        ->assertOk()
+        ->assertJsonPath('fail2ban.banned.0.ip', '203.0.113.5')
+        ->assertJsonPath('fail2ban.banned.0.jail', 'sshd')
+        ->assertJsonPath('fail2ban.banned.1.ip', '198.51.100.9')
+        ->assertJsonPath('fail2ban.banned.1.jail', 'recidive');
+});
+
+it('unbans an address from every jail holding it', function () {
+    $runs = fakeFail2ban(bans: ['sshd' => ['203.0.113.5'], 'recidive' => ['203.0.113.5']]);
+
+    f2b('DELETE', '/api/fail2ban/bans/203.0.113.5')
+        ->assertOk()
+        ->assertJsonPath('unbanned.jails', ['sshd', 'recidive']);
+
+    // "Unban" means the address can connect again — not that it stays banned
+    // by the jail the user wasn't looking at.
+    $commands = collect($runs)->pluck('command');
+    expect($commands)->toContain(['fail2ban-client', 'set', 'sshd', 'unbanip', '203.0.113.5'])
+        ->and($commands)->toContain(['fail2ban-client', 'set', 'recidive', 'unbanip', '203.0.113.5']);
+});
+
+it('reports unbanning an address that is not banned', function () {
+    fakeFail2ban(bans: ['sshd' => []]);
+
+    // Agreeing with a stale list is how stale lists survive.
+    f2b('DELETE', '/api/fail2ban/bans/203.0.113.5')->assertNotFound();
+});
+
+it('bans an address by hand and records it', function () {
+    $runs = fakeFail2ban(bans: ['sshd' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => '203.0.113.5', 'jail' => 'sshd'])->assertOk();
+
+    expect(collect($runs)->pluck('command'))
+        ->toContain(['fail2ban-client', 'set', 'sshd', 'banip', '203.0.113.5']);
+
+    $entry = ActivityLog::where('type', 'fail2ban')->where('action', 'ip_banned')->first();
+    expect($entry->properties['ip'])->toBe('203.0.113.5');
+});
+
+it('refuses to ban an address that is on the ignore list', function () {
+    fakeFail2ban(bans: ['sshd' => []]);
+    File::put(
+        "{$this->jailD}/jail.local",
+        Fail2banManager::MANAGED_HEADER."\n[DEFAULT]\nignoreip = 127.0.0.1/8 ::1 203.0.113.5\n",
+    );
+
+    // Refused because the user listed it as trusted, not because it would fail: `ignoreip`
+    // governs detection, not manual bans, so such a ban survives a reload.
+    f2b('POST', '/api/fail2ban/bans', ['ip' => '203.0.113.5', 'jail' => 'sshd'])->assertUnprocessable();
+});
+
+/*
+ * The server's own address is never bannable.
+ *
+ * The guard used `ignoreIps()`, which leaves out ALWAYS_IGNORED on purpose (it lists only the
+ * user's own entries), so loopback was never covered.
+ *
+ * Worst on `recidive`, whose rule rejects every port, not just 22: the server would reject its
+ * own traffic to MariaDB and Redis, and unbanning goes through the API that became unreachable.
+ */
+it('refuses to ban the loopback address, whatever the jail', function (string $ip, string $jail) {
+    fakeFail2ban(bans: ['sshd' => [], 'recidive' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => $ip, 'jail' => $jail])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_own_address'));
+
+    Process::assertNotRan(fn ($p) => in_array('banip', $p->command, true));
+})->with([
+    'IPv4 loopback' => ['127.0.0.1', 'sshd'],
+    'IPv6 loopback' => ['::1', 'sshd'],
+    // The all-ports jail is the one that takes the panel down.
+    'recidive bans every port' => ['127.0.0.1', 'recidive'],
+]);
+
+it('refuses any address inside the loopback range, not just the literal one', function () {
+    // ALWAYS_IGNORED holds `127.0.0.1/8` while the address banned was `127.0.0.1`: an exact string
+    // compare never matches, so CIDR handling is required. Special-casing the literal address
+    // passes the test above and fails this one.
+    fakeFail2ban(bans: ['sshd' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => '127.0.0.5', 'jail' => 'sshd'])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_own_address'));
+});
+
+it('refuses to ban the server\'s own public and interface addresses (bug #27)', function (string $ip) {
+    // Behind NAT the public address is on no interface, so the two come from
+    // different places; banning either on `recidive` cut the panel off.
+    $addresses = Mockery::mock(ServerAddresses::class);
+    $addresses->shouldReceive('local')->andReturn(['127.0.0.1', '::1', '10.50.0.52']);
+    app()->instance(ServerAddresses::class, $addresses);
+    $public = Mockery::mock(ServerPublicIp::class);
+    $public->shouldReceive('detect')->andReturn('23.172.120.118');
+    app()->instance(ServerPublicIp::class, $public);
+    fakeFail2ban(bans: ['recidive' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => $ip, 'jail' => 'recidive'])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_own_address'));
+
+    Process::assertNotRan(fn ($p) => in_array('banip', $p->command, true));
+})->with(['public, from metadata' => ['23.172.120.118'], 'private interface' => ['10.50.0.52']]);
+
+it('refuses to ban the address the request comes from', function (string $jail) {
+    fakeFail2ban(bans: ['sshd' => [], 'recidive' => []]);
+
+    test()->withServerVariables(['REMOTE_ADDR' => '203.0.113.9'])
+        ->withHeader('Authorization', 'Bearer '.test()->token)
+        ->postJson('/api/fail2ban/bans', ['ip' => '203.0.113.9', 'jail' => $jail])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_your_address'));
+
+    Process::assertNotRan(fn ($p) => in_array('banip', $p->command, true));
+})->with(['sshd', 'recidive']);
+
+it('still bans an ordinary address, so the guard is not simply refusing everything', function () {
+    // The counterweight. A guard that refuses real bans is a worse bug than
+    // the one it replaced, and nothing else here would notice.
+    fakeFail2ban(bans: ['sshd' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => '198.51.100.9', 'jail' => 'sshd'])->assertOk();
+
+    Process::assertRan(fn ($p) => in_array('banip', $p->command, true)
+        && in_array('198.51.100.9', $p->command, true));
+});
+
+it('no longer claims a ban on an ignored address would not hold', function () {
+    // It does hold. Advice that is confidently wrong is worse than none: a
+    // user reading it would conclude the feature is broken rather than that
+    // they had asked for something the panel declines to do.
+    foreach (['en', 'de', 'es', 'fr', 'pt', 'ja', 'ru', 'hi'] as $locale) {
+        $message = __('errors/fail2ban.ip_ignored', [], $locale);
+
+        expect($message)->not->toBe('errors/fail2ban.ip_ignored')
+            ->and($message)->not->toMatch('/would not hold|nicht greifen|no se mantendr|ne tiendrait|não se manteria|維持されません|не сохранится|टिकेगा नहीं/u')
+            ->and(__('errors/fail2ban.ip_own_address', [], $locale))->not->toBe('errors/fail2ban.ip_own_address');
+    }
+});
+
+it('rejects a malformed address or an unknown jail', function () {
+    fakeFail2ban(bans: ['sshd' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => 'not-an-ip', 'jail' => 'sshd'])
+        ->assertUnprocessable()->assertJsonValidationErrors('ip');
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => '203.0.113.5', 'jail' => 'made-up'])
+        ->assertUnprocessable()->assertJsonValidationErrors('jail');
+
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'ignore_ips' => ['nonsense'],
+    ])->assertUnprocessable();
+});
+
+it('rejects a ban time too short to mean anything', function () {
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 5, 'findtime' => 600, 'maxretry' => 5])
+        ->assertUnprocessable()->assertJsonValidationErrors('bantime');
+
+    // One failed login is a typo, not an attack.
+    f2b('PUT', '/api/fail2ban', ['bantime' => 3600, 'findtime' => 600, 'maxretry' => 1])
+        ->assertUnprocessable()->assertJsonValidationErrors('maxretry');
+});
+
+it('denies a user with view-only access', function () {
+    fakeFail2ban();
+    $user = User::factory()->create();
+    grantPermission($user, 'fail2ban', view: true, manage: false);
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")->getJson('/api/fail2ban')->assertOk();
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson('/api/fail2ban', ['bantime' => 3600, 'findtime' => 600, 'maxretry' => 5])
+        ->assertForbidden();
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson('/api/fail2ban/bans/203.0.113.5')->assertForbidden();
+});
+
+it('denies a user with no fail2ban permission at all', function () {
+    fakeFail2ban();
+    $user = User::factory()->create();
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")->getJson('/api/fail2ban')->assertForbidden();
+});
+
+it('bans on the port SSH is actually listening on, not the default', function () {
+    fakeFail2ban(bans: []);
+
+    $sshd = sys_get_temp_dir().'/sv-oss-sshd-'.getmypid();
+    File::deleteDirectory($sshd);
+    File::makeDirectory($sshd, 0755, true);
+    File::put("{$sshd}/60-panel.conf", "Port 2222\nPermitRootLogin no\n");
+    config(['server.sshd_config_dir' => $sshd]);
+
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'jails' => ['sshd' => true], 'acknowledged' => true,
+    ])->assertOk();
+
+    // fail2ban's own default is `port = ssh`, i.e. 22. On a server whose SSH
+    // this panel moved, that bans a port nobody is using while the screen
+    // says the server is protected.
+    expect(dropIn())->toContain('port = 2222')
+        ->and(dropIn())->not->toContain('port = ssh');
+
+    File::deleteDirectory($sshd);
+});
+
+it('falls back to the default SSH port when nothing has changed it', function () {
+    fakeFail2ban(bans: []);
+    config(['server.sshd_config_dir' => '/nonexistent-sshd-dir']);
+
+    f2b('PUT', '/api/fail2ban', [
+        'bantime' => 3600, 'findtime' => 600, 'maxretry' => 5,
+        'jails' => ['sshd' => true], 'acknowledged' => true,
+    ])->assertOk();
+
+    expect(dropIn())->toContain('port = 22');
+});
+
+it('reports how hard a jail is being hit right now', function () {
+    Process::fake(function ($process) {
+        $command = $process->command;
+
+        if ($command[0] === 'which') {
+            return Process::result(output: "/usr/bin/fail2ban-client\n");
+        }
+
+        return match (true) {
+            ($command[1] ?? '') === 'ping' => Process::result(output: 'pong'),
+            $command === ['fail2ban-client', 'status'] => Process::result(output: "|- Jail list:\tsshd\n"),
+            ($command[1] ?? '') === 'status' => Process::result(output: "Status for the jail: sshd\n|- Filter\n|  |- Currently failed:\t3\n|  `- Total failed:\t1847\n"
+                ."`- Actions\n   |- Currently banned:\t2\n   `- Total banned:\t42\n"),
+            default => Process::result(output: "['203.0.113.5']"),
+        };
+    });
+
+    // "Currently failed" is the number that says an attack is happening now,
+    // as opposed to the totals, which only say one happened at some point.
+    f2b('GET', '/api/fail2ban')
+        ->assertOk()
+        ->assertJsonPath('fail2ban.jails.0.stats.currently_failed', 3)
+        ->assertJsonPath('fail2ban.jails.0.stats.total_failed', 1847)
+        ->assertJsonPath('fail2ban.jails.0.stats.total_banned', 42);
+});
+
+it('says how long each ban has left to run', function () {
+    $expires = date('Y-m-d H:i:s', time() + 1800);
+    $started = date('Y-m-d H:i:s', time() - 1800);
+
+    Process::fake(function ($process) use ($started, $expires) {
+        $command = $process->command;
+
+        if ($command[0] === 'which') {
+            return Process::result(output: "/usr/bin/fail2ban-client\n");
+        }
+
+        return match (true) {
+            ($command[1] ?? '') === 'ping' => Process::result(output: 'pong'),
+            $command === ['fail2ban-client', 'status'] => Process::result(output: "|- Jail list:\tsshd\n"),
+            in_array('--with-time', $command, true) => Process::result(output: "203.0.113.5 \t{$started} + 3600 = {$expires}\n"),
+            ($command[1] ?? '') === 'get' => Process::result(output: "['203.0.113.5']"),
+            default => Process::result(output: ''),
+        };
+    });
+
+    // A list of bare addresses doesn't tell you whether to wait or to unban.
+    $ban = f2b('GET', '/api/fail2ban')->json('fail2ban.banned.0');
+
+    expect($ban['ip'])->toBe('203.0.113.5')
+        ->and($ban['expires_at'])->toBe($expires)
+        ->and($ban['seconds_left'])->toBeGreaterThan(1700)
+        ->and($ban['seconds_left'])->toBeLessThanOrEqual(1800);
+});
+
+it('leaves the timings out rather than guessing when fail2ban cannot report them', function () {
+    // An older fail2ban answers `--with-time` with plain addresses.
+    fakeFail2ban(bans: ['sshd' => ['203.0.113.5']]);
+
+    $ban = f2b('GET', '/api/fail2ban')->json('fail2ban.banned.0');
+
+    expect($ban['ip'])->toBe('203.0.113.5')
+        ->and($ban['expires_at'])->toBeNull()
+        ->and($ban['seconds_left'])->toBeNull();
+});
+
+it('releases every ban at once', function () {
+    $runs = fakeFail2ban(bans: ['sshd' => ['203.0.113.5', '198.51.100.9']]);
+
+    f2b('DELETE', '/api/fail2ban/bans')
+        ->assertOk()
+        ->assertJsonPath('unbanned.ips', ['203.0.113.5', '198.51.100.9']);
+
+    $commands = collect($runs)->pluck('command');
+    expect($commands)->toContain(['fail2ban-client', 'set', 'sshd', 'unbanip', '203.0.113.5'])
+        ->and($commands)->toContain(['fail2ban-client', 'set', 'sshd', 'unbanip', '198.51.100.9']);
+});
+
+it('reports unban-all when there is nothing banned', function () {
+    fakeFail2ban(bans: ['sshd' => []]);
+
+    f2b('DELETE', '/api/fail2ban/bans')->assertNotFound();
+});
+
+it('offers ban-time presets so the form need not ask for seconds', function () {
+    fakeFail2ban();
+
+    $presets = f2b('GET', '/api/fail2ban')->json('fail2ban.bantime_presets');
+
+    // Backend-driven for the same reason as the cron schedule presets: the
+    // frontend should not keep its own copy of a list that has to agree with
+    // what this endpoint accepts.
+    expect(collect($presets)->pluck('key')->all())->toBe(['10m', '1h', '1d', '1w', 'permanent'])
+        ->and(collect($presets)->firstWhere('key', '1h')['seconds'])->toBe(3600)
+        ->and(collect($presets)->firstWhere('key', '1h')['label'])->toBe('1 hour')
+        // fail2ban's permanent ban.
+        ->and(collect($presets)->firstWhere('key', 'permanent')['seconds'])->toBe(-1);
+});
+
+it('accepts a permanent ban time but not a uselessly short one', function () {
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => -1, 'findtime' => 600, 'maxretry' => 5])->assertOk();
+    expect(dropIn())->toContain('bantime = -1');
+
+    // Anything under a minute expires before it inconveniences anyone, and
+    // only looks like protection.
+    f2b('PUT', '/api/fail2ban', ['bantime' => 30, 'findtime' => 600, 'maxretry' => 5])
+        ->assertUnprocessable()->assertJsonValidationErrors('bantime');
+});
+
+it('denies unban-all to a view-only user', function () {
+    fakeFail2ban(bans: ['sshd' => ['203.0.113.5']]);
+    $user = User::factory()->create();
+    grantPermission($user, 'fail2ban', view: true, manage: false);
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson('/api/fail2ban/bans')->assertForbidden();
+});
+
+it('shows an install in flight, and why it failed, instead of a boolean that never moves', function () {
+    fakeFail2ban(installed: false);
+    Queue::fake();
+
+    // Never asked: nothing to report.
+    f2b('GET', '/api/fail2ban')->assertJsonPath('fail2ban.install', null);
+
+    f2b('POST', '/api/fail2ban/install')->assertStatus(202);
+
+    // In flight. `installed` is still false — it is derived from the package
+    // being on disk — so without this the screen cannot tell "apt is working"
+    // from "nothing is happening", for the ten minutes apt is allowed.
+    f2b('GET', '/api/fail2ban')
+        ->assertJsonPath('fail2ban.installed', false)
+        ->assertJsonPath('fail2ban.install.status', 'installing');
+
+    // Failed, with a classified reason rendered in the viewer's locale; the screen must not keep
+    // saying false forever after the job logged and returned.
+    app(InstallTracker::class)->fail(
+        InstallFail2ban::RUNTIME,
+        InstallFail2ban::VERSION,
+        null,
+        'no_space',
+        'ref-123',
+    );
+
+    $response = f2b('GET', '/api/fail2ban')
+        ->assertJsonPath('fail2ban.install.status', 'failed')
+        ->assertJsonPath('fail2ban.install.reason', 'no_space')
+        ->assertJsonPath('fail2ban.install.reference', 'ref-123');
+
+    // Translated, and not the raw apt output — which names paths and cannot
+    // be translated.
+    expect($response->json('fail2ban.install.reason_title'))
+        ->toBe(__('runtime.fail2ban_install_failed.no_space'))
+        ->not->toContain('fail2ban_install_failed');
+
+    // Success deletes the row: `installed` becomes the honest answer again.
+    app(InstallTracker::class)->succeed(InstallFail2ban::RUNTIME, InstallFail2ban::VERSION);
+
+    f2b('GET', '/api/fail2ban')->assertJsonPath('fail2ban.install', null);
+});
+
+/*
+|--------------------------------------------------------------------------
+| fail2ban:resync — carrying a corrected render to a server that exists
+|--------------------------------------------------------------------------
+|
+| jail.local is written at install and when the settings screen is saved, and
+| nowhere else, so a template fix repairs new installs and leaves every
+| existing server with the file it was given. This command carries it over.
+*/
+
+it('rewrites jail.local through the current template, keeping the settings', function () {
+    fakeFail2ban(bans: []);
+
+    // A server configured before the fix: the same values, rendered by the
+    // old template, with the backend in the place that broke every other jail.
+    File::put("{$this->jailD}/jail.local", implode("\n", [
+        Fail2banManager::MANAGED_HEADER,
+        '[DEFAULT]',
+        'bantime = 7200',
+        'findtime = 900',
+        'maxretry = 4',
+        'ignoreip = 127.0.0.1/8 ::1 203.0.113.7',
+        'backend = systemd',
+        '',
+        '[sshd]',
+        'enabled = true',
+        '',
+        '[recidive]',
+        'enabled = false',
+        '',
+    ]));
+
+    $this->artisan('fail2ban:resync')->assertExitCode(0);
+
+    $after = dropIn();
+    $default = substr($after, 0, (int) strpos($after, '[sshd]'));
+
+    // The bug is gone…
+    expect($default)->not->toContain('backend')
+        // …and nothing the operator chose went with it. A resync that reset someone's ban time or
+        // ignore list would be a worse bug than the one it fixes.
+        ->and($default)->toContain('bantime = 7200')
+        ->and($default)->toContain('findtime = 900')
+        ->and($default)->toContain('maxretry = 4')
+        ->and($default)->toContain('203.0.113.7')
+        // Including which jails were on: this runs unattended from a deploy, and disabling the SSH
+        // jail would be the worst outcome.
+        ->and($after)->toContain("[sshd]\nenabled = true")
+        ->and($after)->toContain("[recidive]\nenabled = false");
+});
+
+it('reads the enabled jails from the file, not from a daemon that disagrees', function () {
+    // 🔴 The guard that stops this command doing harm. `activeJails()` asks fail2ban-client, which
+    // reports what is *running*, not what the file says (daemon down, mid-restart, out of step).
+    // Sourcing the rewrite from it would persist the daemon's view and could switch off SSH.
+    //
+    // The two disagree deliberately: the file has sshd on and recidive off, the daemon reports the
+    // opposite. With no active jails the command returns early without writing, so a test that
+    // read back its own fixture could not fail.
+    fakeFail2ban(bans: ['recidive' => []]);
+
+    File::put("{$this->jailD}/jail.local", implode("\n", [
+        Fail2banManager::MANAGED_HEADER,
+        '[DEFAULT]',
+        'bantime = 3600',
+        'findtime = 600',
+        'maxretry = 5',
+        'ignoreip = 127.0.0.1/8 ::1',
+        '',
+        '[sshd]',
+        'enabled = true',
+        '',
+        '[recidive]',
+        'enabled = false',
+        '',
+    ]));
+
+    $this->artisan('fail2ban:resync')->assertExitCode(0);
+
+    expect(dropIn())->toContain("[sshd]\nenabled = true")
+        ->and(dropIn())->toContain("[recidive]\nenabled = false");
+});
+
+it('leaves a jail.local it does not own completely alone', function () {
+    // An administrator's own file, or one from another panel: there is no panel configuration to
+    // preserve, and a deploy must not decide which jails this server runs.
+    fakeFail2ban(bans: []);
+
+    $theirs = "[DEFAULT]\nbantime = 99999\n\n[sshd]\nenabled = true\n";
+    File::put("{$this->jailD}/jail.local", $theirs);
+
+    $this->artisan('fail2ban:resync')->assertExitCode(0);
+
+    expect(dropIn())->toBe($theirs);
+});
+
+it('does nothing on a server that has never installed fail2ban', function () {
+    fakeFail2ban(installed: false);
+
+    $this->artisan('fail2ban:resync')->assertExitCode(0);
+
+    expect(File::exists("{$this->jailD}/jail.local"))->toBeFalse();
+});
+
+it('restarts only the jails that watch the SSH port, so their rule moves with it (bug #31)', function () {
+    fakeFail2ban(bans: ['sshd' => [], 'recidive' => []]);
+
+    app(Fail2banManager::class)->restartSshJails();
+
+    // A reload kept the running rule on the old port; a restart of that jail rebuilds it.
+    // recidive bans every port and is left alone.
+    Process::assertRan(fn ($p) => array_slice($p->command, -3) === ['reload', '--restart', 'sshd']);
+    Process::assertNotRan(fn ($p) => in_array('--restart', $p->command, true) && in_array('recidive', $p->command, true));
+});
+
+/*
+| `::ffff:<ip>` is the same host to fail2ban, which converts it and bans the IPv4 address, but a
+| different string to every guard. Banning `::ffff:<own IP>` on sshd locked the caller out of SSH.
+*/
+
+it('sees through the IPv4-mapped form of the loopback address', function (string $ip) {
+    fakeFail2ban(bans: ['sshd' => [], 'recidive' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => $ip, 'jail' => 'recidive'])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_own_address'));
+
+    Process::assertNotRan(fn ($p) => in_array('banip', $p->command, true));
+})->with(['::ffff:127.0.0.1', '::FFFF:127.0.0.1', '::ffff:7f00:1']);
+
+it('sees through the IPv4-mapped form of the caller\'s own address', function () {
+    fakeFail2ban(bans: ['sshd' => []]);
+
+    test()->withServerVariables(['REMOTE_ADDR' => '203.0.113.9'])
+        ->withHeader('Authorization', 'Bearer '.test()->token)
+        ->postJson('/api/fail2ban/bans', ['ip' => '::ffff:203.0.113.9', 'jail' => 'sshd'])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_your_address'));
+
+    Process::assertNotRan(fn ($p) => in_array('banip', $p->command, true));
+});
+
+it('sees through the mapped form, and through a range, on the ignore list', function (string $ip) {
+    fakeFail2ban(bans: ['sshd' => []]);
+    File::put(
+        "{$this->jailD}/jail.local",
+        Fail2banManager::MANAGED_HEADER."\n[DEFAULT]\nignoreip = 127.0.0.1/8 ::1 203.0.113.5 198.51.100.0/24\n",
+    );
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => $ip, 'jail' => 'sshd'])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', __('errors/fail2ban.ip_ignored'));
+})->with(['::ffff:203.0.113.5', '198.51.100.77']);
+
+it('bans the address in the form fail2ban uses', function () {
+    $runs = fakeFail2ban(bans: ['sshd' => []]);
+
+    f2b('POST', '/api/fail2ban/bans', ['ip' => '::ffff:192.0.2.44', 'jail' => 'sshd'])->assertSuccessful();
+
+    expect(collect($runs)->pluck('command')->contains(fn ($c) => in_array('banip', $c, true) && in_array('192.0.2.44', $c, true)))->toBeTrue();
+});
+
+it('keeps the per-site jails\' bans out of recidive (FB-K)', function () {
+    // recidive bans on every port for a week after three bans in a day from any jail. A site jail
+    // bans for one site, so counting it would let three of them take the whole server away.
+    fakeFail2ban(bans: []);
+
+    f2b('PUT', '/api/fail2ban', ['bantime' => 7200, 'findtime' => 900, 'maxretry' => 3])->assertOk();
+
+    $recidive = substr(dropIn(), (int) strpos(dropIn(), '[recidive]'));
+    $filter = (string) @file_get_contents($this->jailD.'/panel-recidive.conf');
+
+    expect($recidive)->toContain('filter = panel-recidive')
+        ->and($filter)->toContain('before = recidive.conf')
+        // [DEFAULT], where fail2ban's own recidive.conf sets it; a [Definition] override
+        // changes nothing.
+        ->and($filter)->toContain("[DEFAULT]\n_jailname = (?:recidive|panel\\-site\\-[^\\]]+)");
+
+    // The exclusion really is a regex that leaves out site jails and keeps
+    // every other one, the way recidive's failregex uses it: `[(?!X\])`.
+    preg_match('/_jailname = (.+)$/m', $filter, $m);
+    $line = fn (string $jail) => "NOTICE  [{$jail}] Ban 203.0.113.9";
+    $counted = fn (string $jail) => preg_match('/NOTICE\s+\[(?!'.$m[1].'\])(?:.*)\]\s+Ban\s+/', $line($jail)) === 1;
+
+    expect($counted('panel-site-wordpress'))->toBeFalse()
+        ->and($counted('recidive'))->toBeFalse()
+        ->and($counted('sshd'))->toBeTrue()
+        ->and($counted('panel-app-generic'))->toBeTrue();
+});
+
+describe('one ignore-list entry at a time (v7 ignore-ip add/remove)', function () {
+    beforeEach(function () {
+        fakeFail2ban(bans: ['sshd' => []]);
+        File::put("{$this->jailD}/jail.local", Fail2banManager::MANAGED_HEADER."\n[DEFAULT]\nbantime = 7200\nfindtime = 300\nmaxretry = 4\nignoreip = 127.0.0.1/8 ::1 203.0.113.5\n\n[sshd]\nenabled = true\n");
+    });
+
+    it('adds one address and keeps everything else in the file as it was', function () {
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => '198.51.100.0/24'])
+            ->assertOk()
+            ->assertJsonPath('fail2ban.settings.ignore_ips', ['203.0.113.5', '198.51.100.0/24']);
+
+        // Not the defaults: the settings someone else saved stay theirs.
+        expect(dropIn())->toContain('ignoreip = 127.0.0.1/8 ::1 203.0.113.5 198.51.100.0/24')
+            ->toContain('bantime = 7200')->toContain('maxretry = 4');
+        expect(ActivityLog::where('type', 'fail2ban')->where('action', 'ignore_ip_added')->exists())->toBeTrue();
+    });
+
+    it('stores the form fail2ban uses, so a mapped address is not a second entry', function () {
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => '::ffff:203.0.113.5'])
+            ->assertUnprocessable()
+            ->assertJsonPath('message', __('errors/fail2ban.ignore_ip_exists'))
+            ->assertJsonPath('reason', 'ignore_ip_exists');
+    });
+
+    it('refuses a malformed address or an open-to-everyone range', function (string $ip) {
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => $ip])->assertUnprocessable()->assertJsonValidationErrors('ip');
+    })->with(['not-an-ip', '0.0.0.0/0', '203.0.113.5/33', '1.2.3.4 5.6.7.8']);
+
+    it('refuses the 101st entry', function () {
+        $ips = implode(' ', array_map(fn ($i) => "10.0.{$i}.1", range(1, 100)));
+        File::put("{$this->jailD}/jail.local", Fail2banManager::MANAGED_HEADER."\n[DEFAULT]\nignoreip = 127.0.0.1/8 ::1 {$ips}\n");
+
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => '198.51.100.7'])
+            ->assertUnprocessable()
+            ->assertJsonPath('message', __('errors/fail2ban.ignore_list_full'))
+            ->assertJsonPath('reason', 'ignore_list_full');
+    });
+
+    it('removes one entry, a range given in the query', function () {
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => '198.51.100.0/24'])->assertOk();
+
+        f2b('DELETE', '/api/fail2ban/ignore-ips?ip=198.51.100.0/24')
+            ->assertOk()
+            ->assertJsonPath('fail2ban.settings.ignore_ips', ['203.0.113.5']);
+
+        expect(dropIn())->toContain('ignoreip = 127.0.0.1/8 ::1 203.0.113.5')->toContain('bantime = 7200');
+        expect(ActivityLog::where('type', 'fail2ban')->where('action', 'ignore_ip_removed')->exists())->toBeTrue();
+    });
+
+    it('says so when the entry is not on the list, instead of agreeing', function () {
+        f2b('DELETE', '/api/fail2ban/ignore-ips', ['ip' => '198.51.100.9'])
+            ->assertNotFound()
+            ->assertJsonPath('message', __('errors/fail2ban.ignore_ip_missing'))
+            ->assertJsonPath('reason', 'ignore_ip_missing');
+    });
+
+    it('will not take your own address off while the SSH jail runs, unless you confirm', function () {
+        $as = fn () => test()->withServerVariables(['REMOTE_ADDR' => '203.0.113.5'])->withHeader('Authorization', 'Bearer '.test()->token);
+
+        $as()->deleteJson('/api/fail2ban/ignore-ips', ['ip' => '203.0.113.5'])
+            ->assertUnprocessable()
+            ->assertJsonPath('message', __('errors/fail2ban.lockout_risk'))
+            ->assertJsonPath('reason', 'lockout_risk');
+        expect(dropIn())->toContain('203.0.113.5');
+
+        $as()->deleteJson('/api/fail2ban/ignore-ips', ['ip' => '203.0.113.5', 'acknowledged' => true])->assertOk();
+        expect(dropIn())->not->toContain('203.0.113.5');
+    });
+
+    it('lets you remove your own address when another entry still covers you', function () {
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => '203.0.113.0/24'])->assertOk();
+
+        test()->withServerVariables(['REMOTE_ADDR' => '203.0.113.5'])->withHeader('Authorization', 'Bearer '.test()->token)
+            ->deleteJson('/api/fail2ban/ignore-ips', ['ip' => '203.0.113.5'])->assertOk();
+    });
+
+    it('is refused to a view-only user', function () {
+        $user = User::factory()->create();
+        grantPermission($user, 'fail2ban', view: true, manage: false);
+        $token = $user->createToken('t')->plainTextToken;
+
+        $this->withHeader('Authorization', "Bearer {$token}")->postJson('/api/fail2ban/ignore-ips', ['ip' => '198.51.100.7'])->assertForbidden();
+        $this->withHeader('Authorization', "Bearer {$token}")->deleteJson('/api/fail2ban/ignore-ips', ['ip' => '203.0.113.5'])->assertForbidden();
+        expect(dropIn())->not->toContain('198.51.100.7')->toContain('203.0.113.5');
+    });
+
+    it('needs fail2ban to be installed', function () {
+        fakeFail2ban(installed: false);
+
+        f2b('POST', '/api/fail2ban/ignore-ips', ['ip' => '198.51.100.7'])
+            ->assertUnprocessable()
+            ->assertJsonPath('message', __('errors/fail2ban.not_installed'));
+    });
+});

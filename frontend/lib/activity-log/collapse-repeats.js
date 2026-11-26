@@ -1,0 +1,40 @@
+const actor = (entry) => entry.user?.id ?? entry.user?.username ?? null;
+
+const sameEvent = (a, b) =>
+  a.action === b.action &&
+  a.type === b.type &&
+  actor(a) === actor(b) &&
+  Boolean(a.is_system) === Boolean(b.is_system);
+
+const identity = (entry) =>
+  [entry.type, entry.action, actor(entry) ?? "", Boolean(entry.is_system)].join("|");
+
+export function collapseRepeats(entries = [], { max = Infinity, mergeAcross = [] } = {}) {
+  const groups = [];
+  const merged = new Map();
+
+  for (const entry of entries) {
+    if (mergeAcross.includes(entry.action)) {
+      const existing = merged.get(identity(entry));
+      if (existing) {
+        existing.count += 1;
+        existing.oldest = entry;
+        continue;
+      }
+      const group = { key: String(entry.id), newest: entry, oldest: entry, count: 1 };
+      merged.set(identity(entry), group);
+      groups.push(group);
+      continue;
+    }
+
+    const last = groups[groups.length - 1];
+    if (last && sameEvent(last.newest, entry)) {
+      last.count += 1;
+      last.oldest = entry;
+      continue;
+    }
+    groups.push({ key: String(entry.id), newest: entry, oldest: entry, count: 1 });
+  }
+
+  return groups.slice(0, max);
+}

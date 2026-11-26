@@ -1,0 +1,1195 @@
+<?php
+
+use App\Http\Resources\ActivityLogResource;
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Applications\ApplicationFail2banManager;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Validation\ValidationException;
+
+/**
+ * Per-application fail2ban, raw-INI variant: GET / POST / DELETE /api/applications/{id}/fail2ban,
+ * the auto-migrate from the old structured schema, and the jail + filter written to
+ * /etc/fail2ban/{jail,filter}.d/. The config test runs before apply, the auto-migrate rebuilds
+ * INI on first GET, and disable() leaves no trace on disk.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+
+    ServerCapability::create([
+        'stack' => 'lemp',
+        'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => true],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    $this->systemUser = SystemUser::create(['username' => 'siteowner', 'home_path' => '/home/siteowner']);
+
+    // Stage fail2ban directories in temp so the manager writes files we can inspect without
+    // touching the real /etc/fail2ban. Same layout as the install script.
+    $this->jailD = sys_get_temp_dir().'/sv-oss-f2b-jail-'.getmypid();
+    $this->filterD = sys_get_temp_dir().'/sv-oss-f2b-filter-'.getmypid();
+    @mkdir($this->jailD, 0755, true);
+    @mkdir($this->filterD, 0755, true);
+    config([
+        'server.fail2ban_apps.jail_d' => $this->jailD,
+        'server.fail2ban_apps.filter_d' => $this->filterD,
+    ]);
+});
+
+afterEach(function () {
+    foreach ([$this->jailD, $this->filterD] as $dir) {
+        if (! is_dir($dir)) {
+            continue;
+        }
+        foreach (glob($dir.'/*.conf') ?: [] as $file) {
+            @unlink($file);
+        }
+        foreach (glob($dir.'/*.local') ?: [] as $file) {
+            @unlink($file);
+        }
+        @rmdir($dir);
+    }
+});
+
+function appFail2banHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->admin->createToken('t')->plainTextToken];
+}
+
+/**
+ * Fake the fail2ban-client calls; `$testOk=false` makes the `-t` validation fail.
+ *
+ * @param  array<string, string>  $writes  jail/filter path => written content
+ */
+/**
+ * fail2ban as the panel meets it on a real server.
+ *
+ * `-t` with no `-c` tests the LIVE tree, which is valid, so it passes whatever was submitted.
+ * The fake therefore judges `-c <stage>` by what was written into that stage, and anything
+ * containing `[broken` fails as the real client does (exit 255).
+ *
+ * @param  array<string, string>  $writes  path => content, every `tee`
+ */
+function fakeAppFail2ban(
+    bool $testOk = true,
+    array &$writes = [],
+    bool $reloadOk = true,
+    bool $existing = true,
+    ?ArrayObject $runs = null,
+    array $packageOwned = [],
+    string $reloadError = '',
+    ?string $ownershipStat = null,
+    bool $packageUnavailable = false,
+): void {
+    Process::fake(function ($process) use ($testOk, &$writes, $reloadOk, $existing, $runs, $packageOwned, $reloadError, $ownershipStat, $packageUnavailable) {
+        $args = $process->command[0] === 'sudo'
+            ? array_slice($process->command, 2)
+            : $process->command;
+
+        $runs?->append($args);
+
+        if (($args[0] ?? '') === 'stat') {
+            if ($ownershipStat !== null) {
+                return Process::result(output: $ownershipStat);
+            }
+            if ($args[2] === '%u:%a:%F') {
+                return Process::result(output: "0:755:directory\n");
+            }
+
+            return is_file(end($args)) && ! is_link(end($args)) ? Process::result(output: "0:1:regular file\n") : Process::result(exitCode: 1);
+        }
+        if (($args[0] ?? '') === 'cat' && ($args[1] ?? '') === '--') {
+            return is_file(end($args)) ? Process::result(output: (string) file_get_contents(end($args))) : Process::result(exitCode: 1);
+        }
+        if (($args[0] ?? '') === 'find') {
+            // Same set the real `find` is asked for: *.conf and *.local.
+            return Process::result(output: implode("\n", array_merge(glob(test()->jailD.'/*.{conf,local}', GLOB_BRACE) ?: [], glob(test()->filterD.'/*.{conf,local}', GLOB_BRACE) ?: [])));
+        }
+
+        if (($args[0] ?? '') === 'cp' && ($args[1] ?? '') === '-p' && is_file($args[2])) {
+            copy($args[2], $args[3]);
+
+            return Process::result();
+        }
+        if (($args[0] ?? '') === 'mv' && is_file($args[count($args) - 2])) {
+            rename($args[count($args) - 2], end($args));
+
+            return Process::result();
+        }
+
+        if (($args[0] ?? '') === 'tee') {
+            $writes[$args[1] ?? ''] = (string) $process->input;
+
+            return Process::result(exitCode: 0);
+        }
+
+        // Whether a jail/filter is already on disk, for the backup step.
+        if (($args[0] ?? '') === 'test' && ($args[1] ?? '') === '-f') {
+            return Process::result(exitCode: $existing ? 0 : 1);
+        }
+
+        // `rm -f <path>` is what disableForApp() runs; Process::fake does not delete the file,
+        // so mirror the call here.
+        if (($args[0] ?? '') === 'rm' && in_array(($args[1] ?? ''), ['-f', '--force'], true)) {
+            foreach (array_slice($args, 2) as $target) {
+                if (file_exists($target)) {
+                    @unlink($target);
+                }
+            }
+
+            return Process::result(exitCode: 0);
+        }
+
+        // `dpkg-query -S <path>`: 0 when the package owns the file, otherwise exit 1 *and* a line
+        // on stderr (a silent "not owned" once let code read it as "could not find out").
+        if (($args[0] ?? '') === 'dpkg-query') {
+            if ($packageUnavailable) {
+                return Process::result(exitCode: 1, errorOutput: 'sudo: a password is required');
+            }
+
+            return in_array($args[2] ?? '', $packageOwned, true)
+                ? Process::result(output: 'fail2ban: '.($args[2] ?? '')."\n")
+                : Process::result(errorOutput: 'dpkg-query: no path found matching pattern '.($args[2] ?? '')."\n", exitCode: 1);
+        }
+
+        if (($args[0] ?? '') === 'fail2ban-client') {
+            if (in_array('-t', $args, true)) {
+                $c = array_search('-c', $args, true);
+
+                // No -c: the live tree, which is fine — so it passes.
+                if ($c === false) {
+                    return Process::result(output: "OK: configuration test is successful\n");
+                }
+
+                $stage = $args[$c + 1] ?? '';
+                $staged = array_filter($writes, fn (string $content, string $path) => str_starts_with($path, $stage.'/'), ARRAY_FILTER_USE_BOTH);
+                $broken = ! $testOk || collect($staged)->contains(fn (string $content) => str_contains($content, '[broken'));
+
+                return $broken
+                    ? Process::result(errorOutput: "ERROR: test configuration failed\n", exitCode: 255)
+                    : Process::result(output: "OK: configuration test is successful\n");
+            }
+
+            return match ($args[1] ?? '') {
+                'ping' => Process::result(output: 'Server replied: pong'),
+                'reload' => Process::result(errorOutput: $reloadOk ? '' : $reloadError, exitCode: $reloadOk ? 0 : 255),
+                default => Process::result(exitCode: 0),
+            };
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function appFail2banUrl(): string
+{
+    return '/api/applications/'.test()->application->id.'/fail2ban';
+}
+
+/**
+ * Create an application like CreateApplication does, including `slug` via uniqueSlug(), so the
+ * jail name is `shop` and not the domain fallback `shop.test`.
+ */
+function createFail2banApp(string $name, string $domain, string $siteType = 'php', array $extra = []): Application
+{
+    // forceCreate: `slug` is not in $fillable (server-derived); CreateApplication does the same.
+    return Application::forceCreate(array_merge([
+        'system_user_id' => test()->systemUser->id,
+        'name' => $name,
+        'domain' => $domain,
+        'slug' => Application::uniqueSlug($name),
+        'site_type' => $siteType,
+        'serving_profile' => $siteType,
+        'status' => 'active',
+        'web_root' => '/',
+        'php_version' => '8.4',
+    ], $extra));
+}
+
+it('returns null fail2ban with templates for a never-configured application', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    $this->withHeaders(appFail2banHeaders())
+        ->getJson(appFail2banUrl())
+        ->assertOk()
+        ->assertJsonPath('fail2ban', null)
+        ->assertJsonStructure(['fail2ban', 'jail_template', 'filter_template']);
+});
+
+it('says the default filter is WordPress\'s on any other site type (FB-wp)', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'joomla');
+
+    $this->withHeaders(appFail2banHeaders())->getJson(appFail2banUrl())
+        ->assertOk()
+        ->assertJsonPath('filter_scope', 'wordpress_only')
+        ->assertJsonPath('filter_note', 'This application has no login rule yet, so nobody is banned. Add a rule for its login page.');
+});
+
+it('has nothing to warn about on WordPress', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'wordpress');
+
+    $this->withHeaders(appFail2banHeaders())->getJson(appFail2banUrl())
+        ->assertOk()
+        ->assertJsonPath('filter_scope', 'wordpress')
+        ->assertJsonPath('filter_note', null);
+});
+
+it('hands the form a filled-in template, not one full of placeholders', function () {
+    // The default must be rendered, not returned raw: the form was pre-filled with literal
+    // `{name}`/`{filter}`/`{logpath}` while the file on disk had them substituted.
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    $response = $this->withHeaders(appFail2banHeaders())
+        ->getJson(appFail2banUrl())
+        ->assertOk();
+
+    $jail = $response->json('jail_template');
+    $filter = $response->json('filter_template');
+
+    expect($jail)->not->toContain('{name}')
+        ->and($jail)->not->toContain('{filter}')
+        ->and($jail)->not->toContain('{logpath}')
+        // The real values, so the user can see what will be written.
+        ->and($jail)->toContain('[panel-site-shop]')
+        ->and($jail)->toContain('filter   = panel-site-shop')
+        // The site's own log directory (fail2ban follows `logPaths()`), both access logs, HTTP and
+        // HTTPS (v7's `-ssl` file): with HTTPS forced the logins are all in the second.
+        ->and($jail)->toContain('logpath  = /home/siteowner/shop/logs/access*log')
+        ->and($filter)->not->toContain('{name}');
+});
+
+it('states the backend, so the jail reads its log file whatever [DEFAULT] says', function () {
+    // A jail with a `logpath` must state its `backend`: inheriting `backend = systemd` from
+    // [DEFAULT] makes fail2ban read the journal, so the jail matches nothing and bans nobody.
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    $jail = $this->withHeaders(appFail2banHeaders())
+        ->getJson(appFail2banUrl())
+        ->assertOk()
+        ->json('jail_template');
+
+    expect($jail)->toContain('backend  = auto');
+});
+
+it('generates a filter fail2ban can actually read', function () {
+    // A filter names its section `Definition` (only a jail is named after itself); without it
+    // fail2ban finds no failregex and the jail bans nobody.
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    $filter = $this->withHeaders(appFail2banHeaders())
+        ->getJson(appFail2banUrl())
+        ->assertOk()
+        ->json('filter_template');
+
+    expect($filter)->toContain('[Definition]')
+        ->and($filter)->not->toContain('[shop]')
+        ->and($filter)->toContain('failregex');
+});
+
+it('saves INI, tests it, and applies the configuration on success', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+    // PHP closures capture by value, so the outer $writes stays empty until the same in-memory
+    // array is read through this alias.
+
+    // The site's own name, spelled out rather than as `{name}`, is accepted.
+    $jail = "[panel-site-shop]\nenabled  = true\nfilter   = panel-site-shop\nlogpath  = /tmp/log\nmaxretry = 5\n";
+    $filter = "[Definition]\nfailregex = ^<HOST> .* \"(POST|PUT|DELETE) .*wp-login.php\nignoreregex =\n";
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => $jail,
+            'filter_config_content' => $filter,
+        ])
+        ->assertOk()
+        ->assertJsonPath('testOk', true);
+
+    // Changes what gets banned on a live site — it has to be on the record.
+    $this->assertDatabaseHas('activity_logs', ['type' => 'application', 'action' => 'fail2ban_enabled', 'subject_id' => $this->application->id]);
+
+    $application = $this->application->fresh();
+    expect($application->fail2ban_jail_name)->toBe('panel-site-shop')
+        ->and($application->fail2ban_jail_content)->toContain('maxretry = 5')
+        ->and($application->fail2ban_filter_content)->toContain('failregex');
+
+    // The jail and filter files were actually written to disk via tee.
+    expect($writes)->toHaveKey($this->jailD.'/panel-site-shop.conf')
+        ->and($writes)->toHaveKey($this->filterD.'/panel-site-shop.conf');
+
+    // The manager replaces {name}/{filter}/{logpath}/{slug}: the file must hold the resolved
+    // logpath, not the literal placeholder.
+    expect($writes[$this->jailD.'/panel-site-shop.conf'])->toContain('logpath  = ')
+        ->not->toContain('{logpath}');
+});
+
+/*
+ * `[broken` must fail the config test: the fake judges what was staged, as the real client does,
+ * so this fails if the test ever stops pointing at the stage (no `testOk: false` here).
+ */
+it('refuses a broken config because it tests the config it was given', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $writes = [];
+    $runs = new ArrayObject;
+    fakeAppFail2ban(writes: $writes, runs: $runs);
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), ['jail_config_content' => '[broken', 'filter_config_content' => '[broken'])
+        ->assertStatus(422)
+        ->assertJsonPath('testOk', false);
+
+    $commands = collect($runs->getArrayCopy());
+    $test = $commands->first(fn (array $c) => ($c[0] ?? '') === 'fail2ban-client' && in_array('-t', $c, true));
+    $stage = $test[array_search('-c', $test, true) + 1];
+
+    // The whole live tree copied into the stage, and the stage removed.
+    expect($commands)->toContain(['cp', '-a', dirname($this->jailD).'/.', $stage.'/'])
+        ->toContain(['rm', '-rf', $stage]);
+
+    // Nothing reached the live files, nothing was reloaded, nothing saved. (The shared ban action
+    // and its script are the server's, written before the test that needs them.)
+    expect(collect(array_keys($writes))->filter(fn (string $p) => ! str_starts_with($p, $stage.'/') && ! banTool($p)))->toBeEmpty()
+        ->and($commands->contains(fn (array $c) => ($c[1] ?? '') === 'reload'))->toBeFalse()
+        ->and($this->application->fresh()->fail2ban_jail_content)->toBeNull();
+});
+
+it('puts the previous jail back and reloads again when the reload fails', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $runs = new ArrayObject;
+    fakeAppFail2ban(reloadOk: false, existing: true, runs: $runs);
+
+    $jail = "[{name}]\nenabled = true\nfilter = {filter}\nlogpath = {logpath}\n";
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), ['jail_config_content' => $jail, 'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n"])
+        ->assertStatus(500);
+
+    $commands = collect($runs->getArrayCopy());
+    $jailPath = $this->jailD.'/panel-site-shop.conf';
+
+    expect($commands)->toContain(['cp', '-p', $jailPath, $jailPath.'.panel-bak'])
+        ->toContain(['mv', '-f', $jailPath.'.panel-bak', $jailPath])
+        ->and($commands->filter(fn (array $c) => ($c[1] ?? '') === 'reload'))->toHaveCount(2)
+        // Applied first, recorded after: a rolled-back config is not saved.
+        ->and($this->application->fresh()->fail2ban_jail_content)->toBeNull();
+});
+
+it('gives fail2ban\'s own reason when it refuses the jail on reload (bug #95)', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $runs = new ArrayObject;
+    // `-t` passes this filter, but the reload refuses it.
+    fakeAppFail2ban(reloadOk: false, existing: true, runs: $runs, reloadError: "2026-10-03 13:02:42,878 fail2ban                [281466]: ERROR   NOK: (\"No failure-id group in '^foo bar'\",)\n");
+
+    $jail = "[{name}]\nenabled = true\nfilter = {filter}\nlogpath = {logpath}\n";
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), ['jail_config_content' => $jail, 'filter_config_content' => "[Definition]\nfailregex = ^foo bar\n"])
+        ->assertStatus(422)
+        ->assertJsonPath('testOk', false)
+        ->assertJsonPath('message', __('fail2ban.rejected'))
+        ->assertJsonPath('output', "ERROR NOK: (\"No failure-id group in '^foo bar'\",)");
+
+    // Still rolled back, exactly as for any failed reload.
+    expect(collect($runs->getArrayCopy())->filter(fn (array $c) => ($c[1] ?? '') === 'reload'))->toHaveCount(2)
+        ->and($this->application->fresh()->fail2ban_jail_content)->toBeNull();
+});
+
+it('removes a first-time jail again when its reload fails', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $runs = new ArrayObject;
+    fakeAppFail2ban(reloadOk: false, existing: false, runs: $runs);
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), ['jail_config_content' => "[{name}]\nenabled = true\n", 'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n"])
+        ->assertStatus(500);
+
+    expect(collect($runs->getArrayCopy()))->toContain(['rm', '-f', $this->jailD.'/panel-site-shop.conf']);
+});
+
+it('drops the backup once the new jail is live', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $runs = new ArrayObject;
+    fakeAppFail2ban(existing: true, runs: $runs);
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), ['jail_config_content' => "[{name}]\nenabled = true\n", 'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n"])
+        ->assertOk();
+
+    expect(collect($runs->getArrayCopy()))->toContain(['rm', '-f', $this->jailD.'/panel-site-shop.conf.panel-bak'])
+        ->and($this->application->fresh()->fail2ban_jail_content)->toContain('enabled = true');
+});
+
+it('refuses to save when fail2ban-client -t reports a bad configuration', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    fakeAppFail2ban(testOk: false);
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => '[broken',
+            'filter_config_content' => '[broken',
+        ])
+        // A refused config is the user's to fix — 422, not a server error.
+        ->assertStatus(422)
+        ->assertJsonPath('testOk', false)
+        ->assertJsonStructure(['testOk', 'message', 'output']);
+
+    // Nothing was persisted: the controller must not save what it could not
+    // validate, otherwise a refusal leaves the database ahead of the daemon.
+    expect($this->application->fresh()->fail2ban_jail_content)->toBeNull();
+});
+
+it('disables fail2ban and clears the stored content', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'php', [
+        'fail2ban_jail_name' => 'shop',
+        'fail2ban_jail_content' => "[shop]\nenabled  = true\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST>\n",
+    ]);
+
+    // Enabled before names were prefixed: its files are still `shop.conf`.
+    $jailFile = $this->jailD.'/shop.conf';
+    file_put_contents($jailFile, "[shop]\nenabled  = true\n");
+    $filterFile = $this->filterD.'/shop.conf';
+    file_put_contents($filterFile, "[Definition]\nfailregex = ^<HOST>\n");
+
+    fakeAppFail2ban();
+
+    $this->withHeaders(appFail2banHeaders())
+        ->deleteJson(appFail2banUrl())
+        ->assertOk();
+
+    $application = $this->application->fresh();
+    expect($application->fail2ban_jail_name)->toBeNull()
+        ->and($application->fail2ban_jail_content)->toBeNull()
+        ->and($application->fail2ban_filter_content)->toBeNull();
+
+    expect(file_exists($jailFile))->toBeFalse('jail file removed from disk')
+        // The filter is the site's own too; a left-behind one made a name collision permanent.
+        ->and(file_exists($filterFile))->toBeFalse('filter file removed from disk');
+
+    $this->assertDatabaseHas('activity_logs', ['type' => 'application', 'action' => 'fail2ban_disabled', 'subject_id' => $this->application->id]);
+});
+
+it('reports already disabled when DELETE is called on a never-configured app', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    fakeAppFail2ban();
+
+    $this->withHeaders(appFail2banHeaders())
+        ->deleteJson(appFail2banUrl())
+        ->assertStatus(422)
+        ->assertJsonPath('message', 'Fail2ban is already disabled for this application.');
+});
+
+it('auto-migrates structured columns to raw INI on first GET', function () {
+    $this->application = createFail2banApp('Blog', 'blog.test');
+
+    // Simulate a row from the previous structured schema: the columns are
+    // still on the table because the drop migration has not run yet.
+    if (! Schema::hasColumn('applications', 'fail2ban_maxretry')) {
+        Schema::table('applications', function ($table): void {
+            $table->unsignedInteger('fail2ban_maxretry')->nullable()->after('fail2ban_enabled');
+            $table->unsignedInteger('fail2ban_findtime')->nullable()->after('fail2ban_maxretry');
+            $table->unsignedInteger('fail2ban_bantime')->nullable()->after('fail2ban_findtime');
+            $table->json('fail2ban_ignore_ips')->nullable()->after('fail2ban_bantime');
+        });
+    }
+
+    DB::table('applications')->where('id', $this->application->id)->update([
+        'fail2ban_maxretry' => 7,
+        'fail2ban_findtime' => 900,
+        'fail2ban_bantime' => 7200,
+        'fail2ban_ignore_ips' => json_encode(['127.0.0.1']),
+    ]);
+
+    fakeAppFail2ban();
+
+    $this->withHeaders(appFail2banHeaders())
+        ->getJson(appFail2banUrl())
+        ->assertOk()
+        ->assertJsonPath('fail2ban.jail_name', 'blog');
+
+    $fresh = $this->application->fresh();
+
+    expect($fresh->fail2ban_jail_content)->toContain('maxretry = 7')
+        ->and($fresh->fail2ban_jail_content)->toContain('bantime  = 7200')
+        ->and($fresh->fail2ban_jail_content)->toContain('findtime = 900')
+        ->and($fresh->fail2ban_filter_content)->toContain('failregex')
+        // The current default: a `[{slug}]` header gave fail2ban no failregex, and the copy
+        // kept the wp-admin rule.
+        ->and($fresh->fail2ban_filter_content)->toBe(app(ApplicationFail2banManager::class)->defaultFilterContent());
+
+    // The log path stays a placeholder so the write path substitutes the active web-server
+    // driver's value; a baked-in nginx path watched a file that does not exist on OpenLiteSpeed.
+    expect($fresh->fail2ban_jail_content)
+        ->toContain('logpath  = {logpath}')
+        ->not->toContain('/var/log/nginx/');
+
+    // The old columns are cleared (will be dropped by the migration).
+    $attributes = $fresh->getAttributes();
+    expect($attributes['fail2ban_maxretry'] ?? null)->toBeNull()
+        ->and($attributes['fail2ban_findtime'] ?? null)->toBeNull()
+        ->and($attributes['fail2ban_bantime'] ?? null)->toBeNull();
+});
+
+it('refuses POST without manage permission', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+
+    fakeAppFail2ban();
+
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'app_fail2ban', view: true, manage: false);
+
+    $this->withHeaders(['Authorization' => 'Bearer '.$viewer->createToken('t')->plainTextToken])
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => '[x]',
+            'filter_config_content' => '[x]',
+        ])
+        ->assertStatus(403);
+});
+
+/*
+ * The dashboard card reads `fail2ban_enabled` off the application resource; this screen reads
+ * the jail columns. That column had no working writer and stayed `false`, so the card said
+ * "Off" for sites with a jail running. Both answers are asserted together in one test, the only
+ * shape that fails if they drift apart again.
+ */
+it('agrees with the application resource about whether fail2ban is on', function () {
+    $this->application = createFail2banApp('Nextcloud', 'cloud.test');
+
+    fakeAppFail2ban();
+
+    // Before: no jail, and both screens say so.
+    $before = $this->withHeaders(appFail2banHeaders())
+        ->getJson('/api/applications/'.$this->application->id)->assertOk();
+
+    expect($before->json('application.fail2ban_enabled'))->toBeFalse()
+        ->and($this->withHeaders(appFail2banHeaders())->getJson(appFail2banUrl())->json('fail2ban'))->toBeNull();
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => "[{name}]\nenabled  = true\nfilter   = {filter}\nlogpath  = /tmp/log\nmaxretry = 5\n",
+            'filter_config_content' => "[Definition]\nfailregex = ^<HOST> .*\nignoreregex =\n",
+        ])->assertOk();
+
+    // After: the jail exists, so the card must say on.
+    $after = $this->withHeaders(appFail2banHeaders())
+        ->getJson('/api/applications/'.$this->application->id)->assertOk();
+
+    expect($after->json('application.fail2ban_enabled'))->toBeTrue()
+        ->and($this->withHeaders(appFail2banHeaders())->getJson(appFail2banUrl())->json('fail2ban.jail_name'))
+        ->toBe('panel-site-nextcloud');
+});
+
+it('goes back to off for both screens when the jail is removed', function () {
+    $this->application = createFail2banApp('Nextcloud', 'cloud.test');
+
+    fakeAppFail2ban();
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => "[{name}]\nenabled  = true\nfilter   = {filter}\nlogpath  = /tmp/log\nmaxretry = 5\n",
+            'filter_config_content' => "[Definition]\nfailregex = ^<HOST> .*\nignoreregex =\n",
+        ])->assertOk();
+
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertOk();
+
+    // `destroy()` nulls the jail columns, so the derived flag follows without
+    // anything having to remember to clear a second one.
+    expect($this->withHeaders(appFail2banHeaders())
+        ->getJson('/api/applications/'.$this->application->id)
+        ->json('application.fail2ban_enabled'))->toBeFalse();
+});
+
+/*
+ * The stored boolean is deliberately not consulted any more. Pinned because the column still
+ * exists, so the temptation to "use the field that is right there" outlives the fix.
+ */
+it('ignores the orphaned fail2ban_enabled column entirely', function () {
+    $this->application = createFail2banApp('Docs', 'docs.test');
+
+    // A stale true, of the kind no code path can produce today but a hand-edit
+    // or an old row could: the answer still comes from the jail.
+    $this->application->forceFill(['fail2ban_enabled' => true])->save();
+
+    expect($this->withHeaders(appFail2banHeaders())
+        ->getJson('/api/applications/'.$this->application->id)
+        ->json('application.fail2ban_enabled'))->toBeFalse();
+});
+
+/*
+|--------------------------------------------------------------------------
+| A site's jail can never be one of fail2ban's own
+|--------------------------------------------------------------------------
+|
+| A site called `sshd` once overwrote filter.d/sshd.conf and replaced the server's [sshd] jail.
+*/
+
+it('writes a site called sshd under its own prefixed name, never over fail2ban\'s', function () {
+    $this->application = createFail2banApp('sshd', 'sshd.test');
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => "[{name}]\nenabled = true\nfilter = {filter}\nlogpath = {logpath}\n",
+            'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n",
+        ])
+        ->assertOk();
+
+    $live = collect(array_keys($writes))->reject(fn (string $path) => str_contains($path, 'panel-f2b-test-') || banTool($path));
+
+    expect($live->values()->all())->toEqualCanonicalizing([
+        $this->jailD.'/panel-site-sshd.conf',
+        $this->filterD.'/panel-site-sshd.conf',
+    ])
+        ->and($writes[$this->jailD.'/panel-site-sshd.conf'])->toContain('[panel-site-sshd]')
+        ->and($writes[$this->jailD.'/panel-site-sshd.conf'])->not->toContain('[sshd]');
+});
+
+it('refuses custom config that names a jail or filter other than the site\'s own', function (string $jail) {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    // Valid fail2ban config — `-t` accepts it — and exactly how the server's
+    // SSH jail (or, for [DEFAULT], every jail) gets replaced from a site screen.
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => $jail,
+            'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n",
+        ])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('jail_config_content');
+
+    expect($writes)->toBe([]);
+})->with([
+    'server ssh jail' => "[sshd]\nenabled = true\n",
+    'every jail' => "[DEFAULT]\nbantime = 1\n[{name}]\nenabled = true\n",
+    'fail2ban\'s filter' => "[{name}]\nenabled = true\nfilter = sshd\n",
+    'filter with options' => "[{name}]\nenabled = true\nfilter = sshd[mode=aggressive]\n",
+]);
+
+it('preserves a jail enabled under the bare slug on fail2ban:resync', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'php', [
+        'fail2ban_jail_name' => 'shop',
+        // What the old structured form generated: the name spelled out.
+        'fail2ban_jail_content' => "[shop]\nenabled  = true\nfilter   = shop\nlogpath  = {logpath}\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST>\n",
+    ]);
+    file_put_contents($this->jailD.'/shop.conf', "[shop]\n");
+    file_put_contents($this->filterD.'/shop.conf', "[shop]\n");
+
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    $application = $this->application->fresh();
+
+    expect($application->fail2ban_jail_name)->toBe('shop')
+        ->and($application->fail2ban_jail_content)->toContain('[shop]')
+        ->and($writes)->not->toHaveKey($this->jailD.'/panel-site-shop.conf')
+        ->and(file_get_contents($this->jailD.'/shop.conf'))->toBe("[shop]\n")
+        ->and(file_get_contents($this->filterD.'/shop.conf'))->toBe("[shop]\n");
+});
+
+it('leaves a system collision untouched during resync and refuses to manage it', function () {
+    $this->application = createFail2banApp('sshd', 'sshd.test', 'php', [
+        'fail2ban_jail_name' => 'sshd',
+        'fail2ban_jail_content' => "[{name}]\nenabled = true\nfilter = {filter}\nlogpath = {logpath}\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST>\n",
+    ]);
+    file_put_contents($this->jailD.'/sshd.conf', "[sshd]\n");
+    file_put_contents($this->filterD.'/sshd.conf', "[Definition]\n");
+
+    fakeAppFail2ban(packageOwned: [$this->filterD.'/sshd.conf']);
+
+    // Deleting it would leave the server's [sshd] jail pointing at a filter
+    // that is gone — and fail2ban would not start. Overwritten beats missing.
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertStatus(422);
+
+    expect(file_exists($this->filterD.'/sshd.conf'))->toBeTrue()
+        ->and(file_exists($this->jailD.'/sshd.conf'))->toBeTrue()
+        ->and($this->application->fresh()->fail2ban_jail_name)->toBe('sshd');
+});
+
+it('treats a filter as package-owned when dpkg cannot be asked', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'php', [
+        'fail2ban_jail_name' => 'shop',
+        'fail2ban_jail_content' => "[{name}]\nenabled = true\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST>\n",
+    ]);
+    file_put_contents($this->filterD.'/shop.conf', "[Definition]\n");
+
+    fakeAppFail2ban();
+    // sudo refusing dpkg-query: exit 1 with a different line. Unknown is
+    // treated as owned — keeping a stray file costs nothing, deleting a real
+    // one stops fail2ban from starting.
+    Process::fake(function ($process) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($args[0] ?? '') === 'dpkg-query') {
+            if ($packageUnavailable) {
+                return Process::result(exitCode: 1, errorOutput: 'sudo: a password is required');
+            }
+
+            return Process::result(errorOutput: "sudo: a password is required\n", exitCode: 1);
+        }
+
+        if (($args[0] ?? '') === 'rm') {
+            foreach (array_slice($args, 2) as $target) {
+                @unlink($target);
+            }
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    expect(file_exists($this->filterD.'/shop.conf'))->toBeTrue();
+});
+
+it('does not ban a logged-in WordPress administrator by default', function () {
+    // The default filter matched every POST under /wp-admin/; the Heartbeat API alone calls
+    // admin-ajax.php every 15-60 seconds, so three in ten minutes banned the site's owner.
+    $this->application = createFail2banApp('Shop', 'shop.test', 'wordpress');
+
+    $filter = $this->withHeaders(appFail2banHeaders())
+        ->getJson(appFail2banUrl())
+        ->assertOk()
+        ->json('filter_template');
+
+    $regexes = collect(explode("\n", $filter))
+        ->map(fn (string $line) => trim((string) preg_replace('/^failregex\s*=/', '', trim($line))))
+        ->filter(fn (string $line) => str_starts_with($line, '^<HOST>'))
+        ->map(fn (string $line) => '/'.str_replace(['<HOST>', '/'], ['(?<host>\S+)', '\/'], $line).'/');
+
+    $line = fn (string $request) => '203.0.113.9 - - [28/Sep/2026:06:40:00 +0000] "'.$request.' HTTP/1.1" 200 512 "-" "Mozilla/5.0"';
+    $matches = fn (string $request) => $regexes->contains(fn (string $regex) => preg_match($regex, $line($request)) === 1);
+
+    expect($regexes)->not->toBeEmpty()
+        ->and($matches('POST /wp-admin/admin-ajax.php'))->toBeFalse()
+        ->and($matches('POST /wp-admin/post.php'))->toBeFalse()
+        ->and($matches('POST /wp-admin/options.php'))->toBeFalse()
+        // What it is for is still caught.
+        ->and($matches('POST /wp-login.php'))->toBeTrue()
+        ->and($matches('POST /xmlrpc.php'))->toBeTrue();
+});
+
+it('takes the wp-admin rule out of a filter still on the old default, on fail2ban:resync', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'wordpress', [
+        'fail2ban_jail_name' => 'panel-site-shop',
+        'fail2ban_jail_content' => "[{name}]\nenabled  = true\nfilter   = {filter}\nlogpath  = {logpath}\n",
+        // Re-indented, as a round trip through the form may leave it.
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST> .* \"(POST|PUT|DELETE) .*wp-login.php\n"
+            ."  ^<HOST> .* \"(POST|PUT|DELETE) .*xmlrpc.php\n"
+            ."  ^<HOST> .* \"(POST|PUT|DELETE) .*wp-admin.*\nignoreregex =\n",
+    ]);
+
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    expect($this->application->fresh()->fail2ban_filter_content)->not->toContain('wp-admin')
+        ->and($writes[$this->filterD.'/panel-site-shop.conf'] ?? '')->toContain('wp-login\.php')
+        ->and($writes[$this->filterD.'/panel-site-shop.conf'] ?? '')->not->toContain('wp-admin');
+});
+
+it('leaves the old default filter of a v7 site named panel-site-… alone on fail2ban:resync', function () {
+    $filter = "[Definition]\nfailregex = ^<HOST> .* \"(POST|PUT|DELETE) .*wp-login.php\n"
+        ."  ^<HOST> .* \"(POST|PUT|DELETE) .*xmlrpc.php\n"
+        ."  ^<HOST> .* \"(POST|PUT|DELETE) .*wp-admin.*\nignoreregex =\n";
+    // Its bare v7 name only looks like the panel's prefix.
+    $this->application = createFail2banApp('panel-site-shop', 'shop.test', 'wordpress', [
+        'fail2ban_jail_name' => 'panel-site-shop',
+        'fail2ban_jail_content' => "[{name}]\nenabled  = true\nfilter   = {filter}\nlogpath  = {logpath}\n",
+        'fail2ban_filter_content' => $filter,
+    ]);
+    // Owned files on disk, so the ownership check passes and only the
+    // "a kept v7 jail is the user's" rule stands between it and a rewrite.
+    $configs = app(ApplicationFail2banManager::class)->renderConfigs($this->application, $this->application->fail2ban_jail_content, $filter);
+    file_put_contents($this->jailD.'/panel-site-shop.conf', $configs['jail']);
+    file_put_contents($this->filterD.'/panel-site-shop.conf', $configs['filter']);
+
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    expect($this->application->fresh()->fail2ban_filter_content)->toBe($filter)
+        ->and($writes)->not->toHaveKey($this->filterD.'/panel-site-shop.conf');
+});
+
+it('leaves a filter the user edited alone on fail2ban:resync', function () {
+    $edited = "[Definition]\nfailregex = ^<HOST> .* \"POST .*wp-admin.*\nignoreregex =\n";
+
+    $this->application = createFail2banApp('Shop', 'shop.test', 'wordpress', [
+        'fail2ban_jail_name' => 'panel-site-shop',
+        'fail2ban_jail_content' => "[{name}]\nenabled  = true\nfilter   = {filter}\nlogpath  = {logpath}\n",
+        'fail2ban_filter_content' => $edited,
+    ]);
+
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    expect($this->application->fresh()->fail2ban_filter_content)->toBe($edited)
+        ->and($writes)->not->toHaveKey($this->filterD.'/panel-site-shop.conf');
+});
+
+describe('the settings a site jail may use', function () {
+    it('refuses a setting outside the allowlist, before anything is written', function (string $line) {
+        $this->application = createFail2banApp('Shop', 'shop.test');
+        fakeAppFail2ban();
+
+        $this->withHeaders(appFail2banHeaders())
+            ->postJson(appFail2banUrl(), [
+                'jail_config_content' => "[{name}]\nenabled = true\nfilter = {filter}\n{$line}\n",
+                'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n",
+            ])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('jail_config_content');
+
+        // Refused at validation: no config file was ever written.
+        Process::assertNotRan(fn ($p) => in_array('tee', (array) $p->command, true));
+    })->with([
+        'action' => ['action = example'],
+        'banaction' => ['banaction = example'],
+        'upper case' => ['BANACTION = example'],
+        'colon separator' => ['action: example'],
+    ]);
+
+    it('accepts the panel\'s own default jail, and multi-line values of allowed settings', function () {
+        $manager = app(ApplicationFail2banManager::class);
+
+        expect($manager->disallowedJailKeys($manager->defaultJailContent()))->toBe([])
+            ->and($manager->disallowedJailKeys("[{name}]\nignoreip = 127.0.0.1\n           10.0.0.0/8\n# action = commented out\n; banaction = also a comment\n"))->toBe([])
+            // fail2ban reads setting names case-insensitively.
+            ->and($manager->disallowedJailKeys("[{name}]\nMAXRETRY = 5\nEnabled = true\n"))->toBe([])
+            // An indented line continues the value above it, even with an `=`.
+            ->and($manager->disallowedJailKeys("[{name}]\nlogpath = /home/a/logs/access.log\n          /home/a/logs/x=y.log\n"))->toBe([]);
+    });
+
+    it('refuses a disallowed setting on every write path, not only the form', function () {
+        $app = createFail2banApp('guarded', 'guarded.test');
+
+        app(ApplicationFail2banManager::class)
+            ->enableForApp($app, "[{name}]\nenabled = true\naction = example\n", "[Definition]\nfailregex = ^<HOST>\n");
+    })->throws(ValidationException::class);
+
+    it('reports older saved jails that use one, without rewriting them', function () {
+        fakeAppFail2ban();
+        $app = createFail2banApp('older', 'older.test');
+        $app->forceFill(['fail2ban_jail_name' => 'panel-site-older', 'fail2ban_jail_content' => "[{name}]\nenabled = true\naction = example\n"])->save();
+
+        $this->artisan('fail2ban:resync')
+            ->expectsOutputToContain('sets action, which site jails may no longer set')
+            ->assertSuccessful();
+
+        expect($app->fresh()->fail2ban_jail_content)->toContain('action = example');
+    });
+});
+
+/*
+ * Only a failed login counts, as in v7: WordPress answers a wrong password with 200 and a right
+ * one with 302, and counting both banned an admin who signed in three times in ten minutes.
+ */
+it('counts a failed WordPress login and not a successful one', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'wordpress');
+
+    $filter = $this->withHeaders(appFail2banHeaders())->getJson(appFail2banUrl())->assertOk()->json('filter_template');
+
+    $regexes = collect(explode("\n", $filter))
+        ->map(fn (string $line) => trim((string) preg_replace('/^failregex\s*=/', '', trim($line))))
+        ->filter(fn (string $line) => str_starts_with($line, '^<HOST>'))
+        ->map(fn (string $line) => '/'.str_replace(['<HOST>', '/'], ['(?<host>\S+)', '\/'], $line).'/');
+
+    $matches = fn (string $line) => $regexes->contains(fn (string $regex) => preg_match($regex, $line) === 1);
+
+    expect($matches('167.233.229.184 - - [02/Oct/2026:15:32:47 +0000] "POST /wp-login.php HTTP/2.0" 200 6388 "-" "curl/8.5.0"'))->toBeTrue()
+        ->and($matches('167.233.229.184 - - [02/Oct/2026:15:32:49 +0000] "POST /wp-login.php HTTP/2.0" 302 0 "-" "curl/8.5.0"'))->toBeFalse()
+        ->and($matches('203.0.113.9 - - [02/Oct/2026:15:32:47 +0000] "POST /xmlrpc.php HTTP/1.1" 200 400 "-" "x"'))->toBeTrue()
+        ->and($matches('203.0.113.9 - - [02/Oct/2026:15:32:47 +0000] "GET /wp-login.php HTTP/1.1" 200 400 "-" "x"'))->toBeFalse();
+});
+
+it('moves a site still on the previous default to the failed-login rule on fail2ban:resync', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test', 'wordpress', [
+        'fail2ban_jail_name' => 'panel-site-shop',
+        'fail2ban_jail_content' => "[{name}]\nenabled  = true\nfilter   = {filter}\nlogpath  = {logpath}\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST> .* \"(POST|PUT|DELETE) .*wp-login.php\n"
+            ."            ^<HOST> .* \"(POST|PUT|DELETE) .*xmlrpc.php\nignoreregex =\n",
+    ]);
+
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->artisan('fail2ban:resync')->assertSuccessful();
+
+    expect($this->application->fresh()->fail2ban_filter_content)->toBe(app(ApplicationFail2banManager::class)->defaultFilterContent());
+});
+
+/** The shared ban action and the script it runs. */
+function banTool(string $path): bool
+{
+    return $path === config('server.fail2ban_apps.ban_script')
+        || $path === rtrim((string) config('server.fail2ban_apps.action_d'), '/').'/panel-site-ban.conf';
+}
+
+function prepareOwnedV7Jail(string $slug = 'shop'): void
+{
+    test()->application = createFail2banApp($slug, $slug.'.test', 'php', [
+        'fail2ban_jail_name' => $slug,
+        'fail2ban_jail_content' => "[{$slug}]\nenabled = true\nfilter = {$slug}\nlogpath = {logpath}\nmaxretry = 3\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST>\n",
+    ]);
+    expect(test()->application->slug)->toBe($slug);
+    $manager = app(ApplicationFail2banManager::class);
+    $configs = $manager->renderConfigs(test()->application,
+        test()->application->fail2ban_jail_content, test()->application->fail2ban_filter_content);
+    file_put_contents(test()->jailD."/{$slug}.conf", $configs['jail']);
+    file_put_contents(test()->filterD."/{$slug}.conf", $configs['filter']);
+}
+
+it('saves an owned v7 jail under its actual name without a second jail or site-only action', function () {
+    prepareOwnedV7Jail();
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+    $this->withHeaders(appFail2banHeaders())->postJson(appFail2banUrl(), [
+        'jail_config_content' => str_replace('maxretry = 3', 'maxretry = 5', $this->application->fail2ban_jail_content),
+        'filter_config_content' => $this->application->fail2ban_filter_content,
+    ])->assertOk();
+
+    expect($writes[$this->jailD.'/shop.conf'])->toContain('[shop]', 'maxretry = 5')->not->toContain('panel-site-ban')
+        ->and($writes)->not->toHaveKey($this->jailD.'/panel-site-shop.conf')
+        ->and($this->application->fresh()->fail2ban_jail_name)->toBe('shop');
+});
+
+it('refuses foreign or duplicate v7 files before writes or removal', function (string $kind) {
+    prepareOwnedV7Jail();
+    match ($kind) {
+        'foreign' => file_put_contents($this->filterD.'/shop.conf', "[Definition]\nfailregex = foreign\n"),
+        'shared' => file_put_contents($this->jailD.'/foreign.conf', "[another]\nfilter = shop\n"),
+        // fail2ban reads INI the way Python's ConfigParser does: `:` is a
+        // separator and anything after the closing `]` is ignored.
+        'shared, colon' => file_put_contents($this->jailD.'/foreign.conf', "[another]\nfilter : shop\n"),
+        'shared, comment' => file_put_contents($this->jailD.'/foreign.conf', "[another]\nfilter = shop ; theirs\n"),
+        'duplicate, header comment' => file_put_contents($this->jailD.'/foreign.conf', "[shop] # theirs\nenabled = true\n"),
+        'duplicate, spaced' => file_put_contents($this->jailD.'/foreign.local', "[ shop ]\nenabled = true\n"),
+        'duplicate, same file' => file_put_contents($this->jailD.'/shop.conf', file_get_contents($this->jailD.'/shop.conf')."\n[shop]\nmaxretry = 9\n"),
+        default => file_put_contents($this->jailD.'/foreign.conf', "[shop]\nenabled = true\n"),
+    };
+    $writes = [];
+    $runs = new ArrayObject;
+    fakeAppFail2ban(writes: $writes, runs: $runs);
+    $before = file_get_contents($this->jailD.'/shop.conf');
+    $this->withHeaders(appFail2banHeaders())->postJson(appFail2banUrl(), [
+        'jail_config_content' => $this->application->fail2ban_jail_content,
+        'filter_config_content' => $this->application->fail2ban_filter_content,
+    ])->assertStatus(422);
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertStatus(422);
+    expect($writes)->toBe([])
+        ->and(file_get_contents($this->jailD.'/shop.conf'))->toBe($before)
+        ->and(collect($runs)->contains(fn ($args) => in_array($args[0], ['rm', 'tee'], true)))->toBeFalse();
+})->with(['foreign', 'duplicate', 'shared', 'shared, colon', 'shared, comment', 'duplicate, header comment', 'duplicate, spaced', 'duplicate, same file']);
+
+it('treats a v7 site whose own name starts with panel-site- as v7, not as the panel\'s', function () {
+    prepareOwnedV7Jail('panel-site-shop');
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->withHeaders(appFail2banHeaders())->postJson(appFail2banUrl(), [
+        'jail_config_content' => str_replace('maxretry = 3', 'maxretry = 5', $this->application->fail2ban_jail_content),
+        'filter_config_content' => $this->application->fail2ban_filter_content,
+    ])->assertOk();
+
+    expect($writes[$this->jailD.'/panel-site-shop.conf'])->toContain('maxretry = 5')->not->toContain('panel-site-ban')
+        ->and($writes)->not->toHaveKey($this->jailD.'/panel-site-panel-site-shop.conf')
+        ->and($this->application->fresh()->fail2ban_jail_name)->toBe('panel-site-shop');
+});
+
+it('checks ownership of a v7 site whose own name starts with panel-site-', function () {
+    prepareOwnedV7Jail('panel-site-shop');
+    file_put_contents($this->jailD.'/foreign.conf', "[panel-site-shop]\nenabled = true\n");
+    $writes = [];
+    fakeAppFail2ban(writes: $writes);
+
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertStatus(422);
+
+    expect($writes)->toBe([])
+        ->and(file_exists($this->jailD.'/panel-site-shop.conf'))->toBeTrue();
+});
+
+it('refuses package-owned v7 files even when their content matches the record', function () {
+    prepareOwnedV7Jail();
+    $writes = [];
+    fakeAppFail2ban(writes: $writes, packageOwned: [$this->filterD.'/shop.conf']);
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertStatus(422);
+    expect($writes)->toBe([])->and(file_exists($this->filterD.'/shop.conf'))->toBeTrue();
+});
+
+it('refuses unsafe or unknown ownership without deleting the recorded v7 jail', function (string $stat, bool $unknownPackage) {
+    prepareOwnedV7Jail();
+    fakeAppFail2ban(ownershipStat: $stat === '' ? null : $stat, packageUnavailable: $unknownPackage);
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertStatus(422);
+    expect(file_exists($this->jailD.'/shop.conf'))->toBeTrue()
+        ->and($this->application->fresh()->fail2ban_jail_name)->toBe('shop');
+})->with([
+    'site-owned file' => ['1000:1:regular file', false],
+    'hard-linked file' => ['0:2:regular file', false],
+    'symlink' => ['0:1:symbolic link', false],
+    'package probe unavailable' => ['', true],
+]);
+
+it('keeps the database and restores owned v7 files when disable reload fails', function () {
+    prepareOwnedV7Jail();
+    $jail = file_get_contents($this->jailD.'/shop.conf');
+    $filter = file_get_contents($this->filterD.'/shop.conf');
+    fakeAppFail2ban(reloadOk: false);
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertStatus(500);
+    expect(file_get_contents($this->jailD.'/shop.conf'))->toBe($jail)
+        ->and(file_get_contents($this->filterD.'/shop.conf'))->toBe($filter)
+        ->and($this->application->fresh()->fail2ban_jail_name)->toBe('shop');
+});
+
+describe('the user may change a jail without a copy (2026-10-29)', function () {
+    /** The site's jail and filter on disk, as the fake reads them. */
+    function existingShopJail(): string
+    {
+        @mkdir(test()->jailD, 0777, true);
+        @mkdir(test()->filterD, 0777, true);
+        file_put_contents(test()->jailD.'/panel-site-shop.conf', "[panel-site-shop]\nenabled = true\nmaxretry = 3\n");
+        file_put_contents(test()->filterD.'/panel-site-shop.conf', "[Definition]\nfailregex = ^old <HOST>\n");
+
+        return test()->jailD.'/panel-site-shop.conf';
+    }
+
+    it('writes no copy, and puts the old jail back from memory when the reload fails', function () {
+        $this->application = createFail2banApp('Shop', 'shop.test');
+        $jailPath = existingShopJail();
+        $runs = new ArrayObject;
+        $writes = [];
+        fakeAppFail2ban(writes: $writes, reloadOk: false, existing: true, runs: $runs);
+
+        $this->withHeaders(appFail2banHeaders())
+            ->postJson(appFail2banUrl(), [
+                'jail_config_content' => "[{name}]\nenabled = true\nfilter = {filter}\nlogpath = {logpath}\n",
+                'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n",
+                'safety_copy' => false,
+            ])->assertStatus(500);
+
+        $commands = collect($runs->getArrayCopy());
+        expect($commands->first(fn (array $c) => ($c[0] ?? '') === 'cp' && str_ends_with((string) end($c), '.panel-bak')))->toBeNull()
+            ->and($writes[$jailPath])->toBe("[panel-site-shop]\nenabled = true\nmaxretry = 3\n")
+            ->and($commands->filter(fn (array $c) => ($c[1] ?? '') === 'reload'))->toHaveCount(2);
+    });
+
+    it('turns a jail on without a copy, and says so in the log', function () {
+        $this->application = createFail2banApp('Shop', 'shop.test');
+        existingShopJail();
+        $runs = new ArrayObject;
+        fakeAppFail2ban(existing: true, runs: $runs);
+
+        $this->withHeaders(appFail2banHeaders())
+            ->postJson(appFail2banUrl(), [
+                'jail_config_content' => "[{name}]\nenabled = true\n",
+                'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n",
+                'safety_copy' => false,
+            ])->assertOk();
+
+        expect(collect($runs->getArrayCopy())->first(fn (array $c) => str_ends_with((string) end($c), '.panel-bak')))->toBeNull();
+        $log = ActivityLog::where('action', 'fail2ban_enabled')->latest('id')->first();
+        expect(ActivityLogResource::make($log)->resolve()['description'])->toEndWith('(without a safety copy)');
+    });
+
+    it('turns a jail off without a copy', function () {
+        $this->application = createFail2banApp('Shop', 'shop.test');
+        $this->application->forceFill(['fail2ban_jail_content' => "[{name}]\nenabled = true\n"])->save();
+        existingShopJail();
+        $runs = new ArrayObject;
+        fakeAppFail2ban(existing: true, runs: $runs);
+
+        $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl(), ['safety_copy' => false])->assertOk();
+
+        expect(collect($runs->getArrayCopy())->first(fn (array $c) => str_ends_with((string) end($c), '.panel-bak')))->toBeNull();
+    });
+
+    it('refuses a value that is not true or false', function () {
+        $this->application = createFail2banApp('Shop', 'shop.test');
+        fakeAppFail2ban();
+
+        $this->withHeaders(appFail2banHeaders())
+            ->postJson(appFail2banUrl(), ['jail_config_content' => "[{name}]\n", 'filter_config_content' => "[Definition]\n", 'safety_copy' => 'maybe'])
+            ->assertJsonValidationErrors('safety_copy');
+    });
+});
+
+/*
+ * With fail2ban not installed, saving a site's jail was a 500: the config test stages a copy of
+ * /etc/fail2ban, which is not there.
+ */
+function fakeNoFail2ban(array &$ran): void
+{
+    Process::fake(function ($process) use (&$ran) {
+        $args = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+        $ran[] = implode(' ', $args);
+
+        // `fail2ban-client ping` with no fail2ban on the box.
+        if (str_ends_with($args[0] ?? '', 'fail2ban-client')) {
+            return Process::result(exitCode: 127, errorOutput: 'fail2ban-client: command not found');
+        }
+
+        return Process::result();
+    });
+}
+
+it('refuses to save a jail when fail2ban is not installed, as the server screen does', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $ran = [];
+    fakeNoFail2ban($ran);
+
+    $this->withHeaders(appFail2banHeaders())
+        ->postJson(appFail2banUrl(), [
+            'jail_config_content' => "[panel-site-shop]\nenabled = true\n",
+            'filter_config_content' => "[Definition]\nfailregex = ^<HOST>\n",
+        ])
+        ->assertStatus(422)
+        ->assertJsonPath('message', __('errors/fail2ban.not_installed'));
+
+    // Nothing was staged or written.
+    expect(collect($ran)->contains(fn (string $c) => str_starts_with($c, 'cp ') || str_starts_with($c, 'tee ')))->toBeFalse()
+        ->and($this->application->fresh()->fail2ban_jail_content)->toBeNull();
+});
+
+it('still turns a site\'s jail off when fail2ban is gone, without a daemon to reload', function () {
+    $this->application = createFail2banApp('Shop', 'shop.test');
+    $this->application->forceFill([
+        'fail2ban_jail_name' => 'panel-site-shop',
+        'fail2ban_jail_content' => "[panel-site-shop]\nenabled = true\n",
+        'fail2ban_filter_content' => "[Definition]\nfailregex = ^<HOST>\n",
+    ])->save();
+    $ran = [];
+    fakeNoFail2ban($ran);
+
+    $this->withHeaders(appFail2banHeaders())->deleteJson(appFail2banUrl())->assertOk();
+
+    // The files go — reinstalling fail2ban would bring the jail back on — but nothing is reloaded.
+    expect(collect($ran)->contains(fn (string $c) => str_starts_with($c, 'rm -f') && str_contains($c, 'panel-site-shop')))->toBeTrue()
+        ->and(collect($ran)->contains(fn (string $c) => str_contains($c, 'fail2ban-client reload')))->toBeFalse()
+        ->and($this->application->fresh()->fail2ban_jail_content)->toBeNull();
+});

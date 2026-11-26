@@ -1,0 +1,588 @@
+<?php
+
+use App\Jobs\DeployApplication;
+use App\Models\Application;
+use App\Models\GitAccount;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\ActivityLogger;
+use App\Services\Server\Applications\ApplicationProvisioner;
+use App\Services\Server\Applications\DeploymentRecorder;
+use App\Services\Server\Applications\GitDeployer;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+    $this->su = SystemUser::create(['username' => 'deploy', 'home_path' => '/home/deploy', 'shell' => '/bin/bash', 'sudo' => false]);
+
+    ServerCapability::create([
+        'stack' => 'lemp', 'web_server' => 'nginx',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    $this->account = GitAccount::create([
+        'provider' => 'github', 'label' => 'Work', 'identifier' => 'octocat',
+        'token' => 'ghp_super_secret_value',
+    ]);
+});
+
+function deployHeaders(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+function gitApp(array $overrides = []): Application
+{
+    return Application::create(array_merge([
+        'system_user_id' => test()->su->id,
+        'name' => 'Shop',
+        'domain' => 'shop.example.com',
+        'site_type' => 'git',
+        'serving_profile' => 'php',
+        'php_version' => '8.4',
+        'web_root' => '/',
+        'status' => 'active',
+        'git_account_id' => test()->account->id,
+        'repository' => 'octocat/hello',
+        'branch' => 'main',
+    ], $overrides));
+}
+
+function runDeploy(Application $application): void
+{
+    (new DeployApplication($application->id))->handle(
+        app(GitDeployer::class),
+        app(ApplicationProvisioner::class),
+        app(ActivityLogger::class),
+        app(DeploymentRecorder::class),
+    );
+}
+
+/**
+ * Fake git, reporting a commit for rev-parse and "not a repo" for the detect.
+ *
+ * The curl arm is required: deploy ends with a `verify` step that reads the HTTP status off
+ * curl's stdout, and an exit-0 with no output parses as HTTP 0, so the deploy would fail at
+ * `verify` before the commit and directory size are recorded.
+ */
+function fakeGit(): void
+{
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 1),
+        in_array('rev-parse', $process->command, true) => Process::result(output: "abc123def456\n"),
+        $process->command[0] === 'curl' => Process::result(output: '200'),
+        default => Process::result(exitCode: 0),
+    });
+}
+
+it('clones a private repository without the token ever touching the command line', function () {
+    fakeGit();
+    $app = gitApp();
+
+    runDeploy($app);
+
+    // The secret is never an argument.
+    Process::assertNotRan(fn ($p) => str_contains(implode(' ', $p->command), 'ghp_super_secret_value'));
+
+    // It reaches git through a credential file written over stdin, by the site user into a
+    // directory only they can enter.
+    Process::assertRan(fn ($p) => array_slice($p->command, 0, 5) === ['runuser', '-u', 'deploy', '--', 'mkdir']
+        && $p->command[5] === '-m' && $p->command[6] === '0700');
+    Process::assertRan(fn ($p) => array_slice($p->command, 0, 5) === ['runuser', '-u', 'deploy', '--', 'sh']
+        && str_contains($p->command[6], 'umask 077')
+        && str_contains((string) $p->input, 'ghp_super_secret_value')
+        && str_contains((string) $p->input, 'x-access-token'));
+
+    // The remote itself is clean: nothing sensitive lands in .git/config.
+    // (`git init` + `remote add`, not `clone`; see GitDeployer::deploy().)
+    Process::assertRan(fn ($p) => in_array('add', $p->command, true)
+        && in_array('https://github.com/octocat/hello.git', $p->command, true));
+
+    expect($app->fresh()->last_commit)->toBe('abc123def456');
+    expect($app->fresh()->status->value)->toBe('active');
+});
+
+it('hands the checkout to the site user even when the fetch fails (bug #101)', function () {
+    // `git init` runs as root; a hand-over only after a successful fetch left a failed first
+    // deploy with a root-owned .git the site user could neither repair nor delete.
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 1),
+        in_array('fetch', $process->command, true) => Process::result(errorOutput: 'fatal: repository not found', exitCode: 128),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp();
+    runDeploy($app);
+
+    Process::assertRan(fn ($p) => $p->command[0] === 'chown' && $p->command[1] === '-R'
+        && str_ends_with((string) end($p->command), '/public_html'));
+});
+
+it('hands it over once, not twice, when the deploy gets that far', function () {
+    fakeGit();
+    runDeploy(gitApp());
+
+    // The normal hand-over already happened; the safety net stays out of it.
+    Process::assertRanTimes(fn ($p) => $p->command[0] === 'chown' && $p->command[1] === '-R', 1);
+});
+
+it('deletes the credential file even when the fetch fails', function () {
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 1),
+        in_array('fetch', $process->command, true) => Process::result(errorOutput: 'fatal: auth failed', exitCode: 128),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp();
+    runDeploy($app);
+
+    // A failed deploy must not leave a token sitting on disk.
+    Process::assertRan(fn ($p) => array_slice($p->command, 0, 6) === ['runuser', '-u', 'deploy', '--', 'rm', '-rf']
+        && str_contains((string) $p->command[6], 'git-'));
+});
+
+it('keeps a live site live when a redeploy fails', function () {
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 0), // already cloned
+        in_array('fetch', $process->command, true) => Process::result(errorOutput: 'network down', exitCode: 1),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp(['status' => 'active']);
+    runDeploy($app);
+
+    $app->refresh();
+    // The old code is still on disk and served; reporting the site as failed would be a lie.
+    expect($app->status->value)->toBe('active');
+    expect($app->failed_step)->toBe('fetch');
+    expect($app->reference)->not->toBeEmpty();
+});
+
+it('says why the fetch failed, in words', function (string $stderr, ?string $reason) {
+    // A failed fetch needs a readable `failed_reason`, or a typo in the repository or branch reads
+    // as a bare "failed at fetch". The stderr samples are git 2.43's.
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 0),
+        in_array('fetch', $process->command, true) => Process::result(errorOutput: $stderr, exitCode: 128),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp();
+    runDeploy($app);
+
+    $app->refresh();
+    expect($app->failed_step)->toBe('fetch')
+        ->and($app->failed_reason)->toBe($reason);
+
+    $this->getJson("/api/applications/{$app->id}", deployHeaders())
+        ->assertOk()
+        ->assertJsonPath('application.failed_reason', $reason)
+        ->assertJsonPath('application.failed_reason_title', $reason === null ? null : __("application.failure_reason.{$reason}"));
+})->with([
+    'branch missing' => ["fatal: couldn't find remote ref release-9\n", 'git_branch_missing'],
+    'repository missing or private, no account' => ["fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", 'git_repository_unreachable'],
+    'token refused' => ["remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/octocat/hello.git/'\n", 'git_repository_unreachable'],
+    'repository not found with a valid token' => ["remote: Repository not found.\nfatal: repository 'https://github.com/octocat/hello.git/' not found\n", 'git_repository_unreachable'],
+    'host unreachable' => ["fatal: unable to access 'https://github.com/octocat/hello.git/': Could not resolve host: github.com\n", 'download_unreachable'],
+    // Anything else stays unclassified: a guessed reason is worse than none.
+    'something else' => ["error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly\n", null],
+]);
+
+it('has the fetch reasons translated in every locale', function () {
+    foreach (['en', 'es', 'de', 'fr', 'pt', 'ja', 'ru', 'hi'] as $locale) {
+        foreach (['git_repository_unreachable', 'git_branch_missing'] as $reason) {
+            expect(__("application.failure_reason.{$reason}", [], $locale))->not->toBe("application.failure_reason.{$reason}");
+        }
+    }
+});
+
+it('fetches and hard-resets an already-cloned repository', function () {
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 0),
+        in_array('rev-parse', $process->command, true) => Process::result(output: "newsha\n"),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp();
+    runDeploy($app);
+
+    Process::assertRan(fn ($p) => in_array('fetch', $p->command, true));
+    Process::assertRan(fn ($p) => in_array('reset', $p->command, true) && in_array('--hard', $p->command, true));
+    Process::assertNotRan(fn ($p) => in_array('clone', $p->command, true));
+
+    expect($app->fresh()->steps)->toContain('fetch', 'checkout');
+});
+
+it('points the remote at the new url before fetching, not after', function () {
+    // `remote add origin` is a no-op on an existing checkout, so a changed remote is moved by
+    // `set-url`, which must run before the fetch. After `reset --hard` the deploy fetched from the
+    // old remote and reported success while serving the previous repository.
+    $order = collect();
+
+    Process::fake(function ($process) use ($order) {
+        $order->push(implode(' ', (array) $process->command));
+
+        return match (true) {
+            $process->command[0] === 'test' => Process::result(exitCode: 0),
+            in_array('rev-parse', $process->command, true) => Process::result(output: "newsha\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    runDeploy(gitApp());
+
+    $setUrl = $order->search(fn (string $c) => str_contains($c, 'remote set-url'));
+    $fetch = $order->search(fn (string $c) => str_contains($c, ' fetch '));
+
+    expect($setUrl)->not->toBeFalse()
+        ->and($fetch)->not->toBeFalse()
+        ->and($setUrl)->toBeLessThan($fetch);
+});
+
+it('adds origin only when the checkout does not have it (bug #71)', function (string $remotes, bool $adds) {
+    // Run every time and left to fail, `remote add` logged "remote origin already exists" as an
+    // error on every later deploy.
+    $ran = collect();
+
+    Process::fake(function ($process) use ($ran, $remotes) {
+        $ran->push(implode(' ', (array) $process->command));
+
+        return match (true) {
+            $process->command[0] === 'test' => Process::result(exitCode: 0),
+            end($process->command) === 'remote' => Process::result(output: $remotes),
+            in_array('rev-parse', $process->command, true) => Process::result(output: "newsha\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    runDeploy(gitApp());
+
+    expect($ran->contains(fn (string $c) => str_contains($c, 'remote add origin')))->toBe($adds)
+        // Moved to the right URL either way.
+        ->and($ran->contains(fn (string $c) => str_contains($c, 'remote set-url origin')))->toBeTrue();
+})->with([
+    'a fresh checkout' => ['', true],
+    'every deploy after the first' => ["origin\n", false],
+]);
+
+it('needs no credential at all for a public repository', function () {
+    fakeGit();
+    $app = gitApp([
+        'git_account_id' => null,
+        'repository' => null,
+        'repository_url' => 'https://github.com/laravel/laravel.git',
+    ]);
+
+    runDeploy($app);
+
+    // Nothing to write, nothing to leak, nothing to clean up.
+    Process::assertNotRan(fn ($p) => $p->command[0] === 'tee' || in_array('umask 077 && cat > "$1"', $p->command, true));
+    Process::assertRan(fn ($p) => in_array('https://github.com/laravel/laravel.git', $p->command, true));
+});
+
+it('runs the build command as the site user, not as the panel', function () {
+    fakeGit();
+    $app = gitApp(['build_command' => 'composer install --no-dev']);
+
+    runDeploy($app);
+
+    // The build command is whatever the user typed; dropping privileges stops `application:manage`
+    // from becoming root-level RCE.
+    Process::assertRan(fn ($p) => $p->command[0] === 'runuser'
+        && $p->command[2] === 'deploy'
+        && str_contains(end($p->command), 'composer install --no-dev'));
+
+    // Recorded as `script`; `build_command` is the fallback for applications configured before the
+    // editable deploy script.
+    expect($app->fresh()->steps)->toContain('script');
+});
+
+it('builds with the Node version the site pinned, not the default', function () {
+    fakeGit();
+    $app = gitApp(['build_command' => 'npm ci && npm run build', 'node_version' => '18.20.0']);
+
+    runDeploy($app);
+
+    // A site pinned to 18 on a box defaulting to 22 must not silently build with 22.
+    Process::assertRan(fn ($p) => $p->command[0] === 'runuser'
+        && str_contains(end($p->command), "export PATH='/opt/fnm/node-versions/v18.20.0/installation/bin':\"\$PATH\";")
+        && str_contains(end($p->command), 'npm ci && npm run build'));
+});
+
+it('leaves PATH alone when the site pinned no version', function () {
+    fakeGit();
+    $app = gitApp(['build_command' => 'composer install', 'node_version' => null]);
+
+    runDeploy($app);
+
+    // A PHP site has no business having its PATH rewritten.
+    Process::assertRan(fn ($p) => $p->command[0] === 'runuser'
+        && ! str_contains(end($p->command), 'export PATH='));
+});
+
+it('pairs the token with the right username per provider', function () {
+    fakeGit();
+    $this->account->update(['provider' => 'gitlab', 'identifier' => 'dev']);
+    $app = gitApp();
+
+    runDeploy($app);
+
+    // The wrong username fails auth even with a valid token.
+    Process::assertRan(fn ($p) => in_array('umask 077 && cat > "$1"', $p->command, true) && str_contains((string) $p->input, 'oauth2'));
+});
+
+it('queues a deploy and refuses one for a non-git application', function () {
+    Queue::fake();
+    $app = gitApp();
+
+    $this->withHeaders(deployHeaders())
+        ->postJson("/api/applications/{$app->id}/deploy")
+        ->assertStatus(202);
+
+    Queue::assertPushed(DeployApplication::class);
+
+    $static = Application::forceCreate([
+        'system_user_id' => $this->su->id, 'name' => 'S',
+        'slug' => 's', 'domain' => 's.example.com',
+        'site_type' => 'static', 'serving_profile' => 'static', 'status' => 'active',
+    ]);
+
+    // 404, not 422: a static site has no Deployment screen (`app_deployment` route), so the
+    // refusal happens before the controller.
+    $this->withHeaders(deployHeaders())
+        ->postJson("/api/applications/{$static->id}/deploy")
+        ->assertStatus(404);
+});
+
+it('never returns the git token or the raw git error', function () {
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 1),
+        in_array('fetch', $process->command, true) => Process::result(
+            errorOutput: 'fatal: could not read Password for https://x-access-token:ghp_super_secret_value@github.com',
+            exitCode: 128,
+        ),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp();
+    runDeploy($app);
+
+    $body = json_encode($this->withHeaders(deployHeaders())->getJson("/api/applications/{$app->id}")->json());
+
+    expect($body)->not->toContain('ghp_super_secret_value');
+    expect($body)->not->toContain('could not read Password');
+});
+
+it('denies deploying with view-only access', function () {
+    Queue::fake();
+    $user = User::factory()->create();
+    grantPermission($user, 'application', view: true, manage: false);
+    $token = $user->createToken('t')->plainTextToken;
+    $app = gitApp();
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson("/api/applications/{$app->id}/deploy")
+        ->assertForbidden();
+
+    Queue::assertNothingPushed();
+});
+
+it('stamps the directory size with the moment it was measured', function () {
+    // The size and its date are one fact: the UI renders an undated size as current.
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 1),
+        in_array('rev-parse', $process->command, true) => Process::result(output: "abc123def456\n"),
+        $process->command[0] === 'curl' => Process::result(output: '200'),
+        $process->command[0] === 'du' => Process::result(output: "4096\t/home/site/public\n"),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp(['directory_size_bytes' => null, 'directory_size_updated_at' => null]);
+
+    runDeploy($app);
+
+    $app->refresh();
+
+    expect($app->directory_size_bytes)->toBe(4096 * 1024)
+        ->and($app->directory_size_updated_at)->not->toBeNull();
+});
+
+describe('the post-deploy health check', function () {
+    /**
+     * A curl that answers non-2xx until the site has caught up, as a first deploy does (the
+     * document root did not exist until the checkout seconds ago).
+     */
+    function fakeGitWarmingUp(int $failFirst, string $then = '200'): void
+    {
+        $attempts = 0;
+
+        Process::fake(function ($process) use (&$attempts, $failFirst, $then) {
+            if ($process->command[0] === 'curl') {
+                $attempts++;
+
+                return $attempts <= $failFirst
+                    ? Process::result(output: '502')
+                    : Process::result(output: $then);
+            }
+
+            return match (true) {
+                $process->command[0] === 'test' => Process::result(exitCode: 1),
+                in_array('rev-parse', $process->command, true) => Process::result(output: "abc123def456\n"),
+                default => Process::result(exitCode: 0),
+            };
+        });
+    }
+
+    it('waits for a site that is still coming up instead of failing the deploy', function () {
+        // A single probe with no retry failed every first deploy at `verify`; the re-run passed.
+        fakeGitWarmingUp(failFirst: 2);
+        $app = gitApp();
+
+        runDeploy($app);
+
+        expect($app->fresh()->failed_step)->toBeNull()
+            ->and($app->fresh()->status->value)->toBe('active');
+    });
+
+    it('still fails when the site answers but is genuinely broken', function () {
+        // A 500 that survives every retry is the deploy's fault; reporting success would be worse
+        // than a false failure.
+        fakeGitWarmingUp(failFirst: 99);
+        $app = gitApp();
+
+        runDeploy($app);
+
+        expect($app->fresh()->failed_step)->toBe('verify');
+    });
+
+    it('does not fail a deploy over a site it could never reach', function () {
+        // A brand-new domain whose DNS has not propagated: curl exits non-zero without connecting,
+        // which says nothing about the code that was just deployed.
+        Process::fake(fn ($process) => match (true) {
+            $process->command[0] === 'curl' => Process::result(
+                errorOutput: 'curl: (6) Could not resolve host',
+                exitCode: 6,
+            ),
+            $process->command[0] === 'test' => Process::result(exitCode: 1),
+            in_array('rev-parse', $process->command, true) => Process::result(output: "abc123def456\n"),
+            default => Process::result(exitCode: 0),
+        });
+
+        $app = gitApp();
+
+        runDeploy($app);
+
+        expect($app->fresh()->failed_step)->toBeNull()
+            ->and($app->fresh()->status->value)->toBe('active');
+    });
+
+    it('records the check in the steps either way', function () {
+        // Whether the site answered is what someone reading a deploy wants to know.
+        fakeGitWarmingUp(failFirst: 0);
+        $app = gitApp();
+
+        runDeploy($app);
+
+        expect($app->fresh()->steps)->toContain('verify');
+    });
+
+    it('counts any answer below 500 as a working site', function (string $code) {
+        // An API with no route at `/` answers 404 and must still deploy; only a 5xx is a broken site.
+        fakeGitWarmingUp(failFirst: 0, then: $code);
+        $app = gitApp();
+
+        runDeploy($app);
+
+        expect($app->fresh()->failed_step)->toBeNull()
+            ->and($app->fresh()->status->value)->toBe('active');
+    })->with(['404', '401', '302', '200']);
+
+    it('still fails a deploy whose site answers 500', function () {
+        fakeGitWarmingUp(failFirst: 0, then: '500');
+        $app = gitApp();
+
+        runDeploy($app);
+
+        expect($app->fresh()->failed_step)->toBe('verify')
+            // A code with a sentence, not "curl … returned HTTP 500".
+            ->and($app->fresh()->failed_reason)->toBe('verify_http')
+            ->and(__('application.failure_reason.verify_http'))->not->toBe('application.failure_reason.verify_http');
+    });
+});
+
+it('gives the checked-out branch an upstream so a bare git pull works', function () {
+    // init + fetch + reset leaves the branch with no upstream, so a deploy script of `git pull`
+    // failed: "There is no tracking information for the current branch".
+    $order = collect();
+
+    Process::fake(function ($process) use ($order) {
+        $order->push(implode(' ', (array) $process->command));
+
+        return match (true) {
+            $process->command[0] === 'test' => Process::result(exitCode: 0),
+            in_array('rev-parse', $process->command, true) => Process::result(output: "newsha\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    runDeploy(gitApp(['branch' => 'develop']));
+
+    $reset = $order->search(fn (string $c) => str_contains($c, 'reset --hard FETCH_HEAD'));
+    $upstream = $order->search(fn (string $c) => str_ends_with($c, 'branch --set-upstream-to=origin/develop'));
+
+    expect($reset)->not->toBeFalse()
+        ->and($upstream)->not->toBeFalse()
+        ->and($upstream)->toBeGreaterThan($reset);
+});
+
+it('points the vhost at the port the app now listens on, on the same deploy (FS-C41)', function () {
+    // A port changed in the settings reached the systemd unit but not the proxy: visitors got 502.
+    $ran = new ArrayObject;
+    Process::fake(function ($process) use ($ran) {
+        $ran[] = ['command' => $process->command, 'input' => (string) $process->input];
+
+        return match (true) {
+            $process->command[0] === 'test' => Process::result(exitCode: 1),
+            in_array('rev-parse', $process->command, true) => Process::result(output: "abc123def456\n"),
+            $process->command[0] === 'curl' => Process::result(output: '200'),
+            default => Process::result(exitCode: 0),
+        };
+    });
+
+    $app = gitApp(['serving_profile' => 'node', 'php_version' => null, 'node_version' => '20.11.0', 'app_port' => 3015, 'start_command' => 'node server.js']);
+    runDeploy($app);
+
+    $lines = collect($ran);
+    $vhost = $lines->first(fn ($r) => ($r['command'][0] ?? '') === 'tee' && str_contains($r['command'][1] ?? '', 'sites-available'));
+
+    expect($vhost)->not->toBeNull()
+        ->and($vhost['input'])->toContain('127.0.0.1:3015');
+
+    $test = $lines->search(fn ($r) => $r['command'] === ['nginx', '-t']);
+    $reload = $lines->search(fn ($r) => in_array('reload', $r['command'], true) && in_array('nginx', $r['command'], true));
+
+    expect($test)->not->toBeFalse()
+        ->and($reload)->not->toBeFalse()
+        ->and($test)->toBeLessThan($reload);
+});
+
+it('does not reload into a vhost the web server rejects', function () {
+    Process::fake(fn ($process) => match (true) {
+        $process->command[0] === 'test' => Process::result(exitCode: 1),
+        in_array('rev-parse', $process->command, true) => Process::result(output: "abc123def456\n"),
+        $process->command === ['nginx', '-t'] => Process::result(errorOutput: 'bad', exitCode: 1),
+        default => Process::result(exitCode: 0),
+    });
+
+    $app = gitApp(['serving_profile' => 'node', 'php_version' => null, 'node_version' => '20.11.0', 'app_port' => 3015, 'start_command' => 'node server.js']);
+    runDeploy($app);
+
+    expect($app->fresh()->failed_step)->toBe('test_config');
+    Process::assertNotRan(fn ($p) => in_array('reload', $p->command, true) && in_array('nginx', $p->command, true));
+});

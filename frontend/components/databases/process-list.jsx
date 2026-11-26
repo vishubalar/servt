@@ -1,0 +1,310 @@
+"use client";
+
+import { HeadIcon } from "@/components/ui/head-icon";
+import { useEffect, useState } from "react";
+import { useRefresh } from "@/hooks/use-refresh";
+import { toast } from "sonner";
+import { useTranslations } from "next-intl";
+import { Activity, ChevronDown, ChevronUp, Clock, Square, Timer, SearchX } from "lucide-react";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { cn } from "@/lib/utils";
+import { getProcesses, killProcess } from "@/lib/api/databases";
+import { dbProcessesResponseSchema } from "@/lib/schemas/database";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { LocalSearchInput } from "@/components/data-table/local-search-input";
+import { useConfirmAction } from "@/hooks/use-confirm-action";
+import { activeQueries, isIdle } from "@/lib/databases/health";
+
+const POLL_MS = 5000;
+
+const SLOW_SECONDS = 10;
+const STUCK_SECONDS = 60;
+
+const VISIBLE_COUNT = 3;
+
+function tone(seconds) {
+  if ((seconds ?? 0) >= STUCK_SECONDS) return "destructive";
+  if ((seconds ?? 0) >= SLOW_SECONDS) return "warning";
+  return "neutral";
+}
+
+const CARD_EDGE = {
+  destructive: "border-destructive/50",
+  warning: "border-warning/50",
+  neutral: "",
+};
+
+const TIME_STYLE = {
+  destructive: "bg-destructive/10 text-destructive",
+  warning: "bg-warning/15 text-warning",
+  neutral: "bg-muted text-muted-foreground",
+};
+
+function duration(seconds, t) {
+  const total = Math.max(0, Math.round(seconds ?? 0));
+  if (total < 60) return t("durationSeconds", { seconds: total });
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return t("durationMinutes", { minutes, seconds: total % 60 });
+  return t("durationHours", { hours: Math.floor(minutes / 60), minutes: minutes % 60 });
+}
+
+export function ProcessList({ engine, processes: initial = [], canManage, fill = false }) {
+  const t = useTranslations("databases.monitor");
+  const { refreshAndWait } = useRefresh();
+  const [polled, setPolled] = useState(null);
+  const stop = useConfirmAction();
+  // The panel's own monitoring connection; stopping it breaks this screen.
+  const [expanded, setExpanded] = useState(false);
+  const [openQueries, setOpenQueries] = useState(() => new Set());
+  const [query, setQuery] = useState("");
+  const [slowOnly, setSlowOnly] = useState(false);
+
+  const all = polled ?? initial;
+  const idle = all.filter(isIdle);
+  const running = activeQueries(all);
+
+  const term = query.trim().toLowerCase();
+  const active = running.filter((p) => {
+    if (slowOnly && (p.time ?? 0) < SLOW_SECONDS) return false;
+    if (!term) return true;
+    return [p.query, p.db, p.user, p.host, p.state]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(term));
+  });
+
+  const filterable = running.length > VISIBLE_COUNT;
+  const filtered = term !== "" || slowOnly;
+
+  const shown = expanded || fill
+    ? active
+    : active.filter((p, i) => i < VISIBLE_COUNT || tone(p.time) === "destructive");
+  const hidden = active.length - shown.length;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const id = setInterval(async () => {
+      try {
+        const { data } = await getProcesses(engine, { signal: controller.signal });
+        const parsed = dbProcessesResponseSchema.safeParse(data);
+        if (parsed.success) setPolled(parsed.data.processes);
+      } catch {
+        // retry on the next poll
+      }
+    }, POLL_MS);
+
+    return () => {
+      controller.abort();
+      clearInterval(id);
+    };
+  }, [engine]);
+
+  async function kill() {
+    await stop.run(() => killProcess(stop.target.id, engine), {
+      fallback: t("killFailed"),
+      onDone: async () => {
+        await refreshAndWait();
+        setPolled(null);
+        toast.success(t("killed"));
+      },
+    });
+  }
+
+  return (
+    <>
+      <Card className={cn("gap-0 overflow-hidden py-0", fill && "h-full")}>
+        <div className="flex shrink-0 flex-col gap-2 border-b px-5 py-3.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <HeadIcon icon={Activity} />
+            <h2 className="text-[15px] font-semibold tracking-tight">
+              {t("processes")}
+            </h2>
+          </div>
+
+          {running.length > 0 || idle.length > 0 ? (
+            <span className="min-w-0 text-sm tabular-nums text-muted-foreground">
+              {t("runningCount", { count: running.length })}
+              {idle.length > 0 ? ` · ${t("idleCount", { count: idle.length })}` : ""}
+            </span>
+          ) : null}
+        </div>
+
+        {filterable ? (
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-5 py-3">
+            <LocalSearchInput
+              value={query}
+              onChange={setQuery}
+              placeholder={t("searchQueries")}
+              className="min-w-48 flex-1 sm:max-w-none"
+            />
+            <Button
+              variant={slowOnly ? "secondary" : "outline"}
+              size="sm"
+              className="shrink-0"
+              onClick={() => setSlowOnly((prev) => !prev)}
+              aria-pressed={slowOnly}
+            >
+              <Timer className="size-4" />
+              {t("slowOnly", { seconds: SLOW_SECONDS })}
+            </Button>
+          </div>
+        ) : null}
+
+        <CardContent className={cn("px-5 py-0", fill && "flex min-h-0 flex-1 flex-col")}>
+          {active.length === 0 ? (
+            <div className={cn("space-y-2 py-5 text-center", fill && "flex flex-1 flex-col justify-center")}>
+              <EmptyState
+                compact
+                icon={filtered ? SearchX : Activity}
+                badge={filtered ? "search" : null}
+                title={filtered ? t("noMatches") : t("noProcesses")}
+              />
+              {filtered ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setQuery("");
+                    setSlowOnly(false);
+                  }}
+                >
+                  {t("clearFilters")}
+                </Button>
+              ) : null}
+            </div>
+          ) : (
+            <div
+              className={cn(
+                "space-y-3 py-4",
+                expanded && "max-h-[32rem] overflow-y-auto",
+                fill && "-mx-5 max-h-[32rem] min-h-0 flex-1 overflow-y-auto px-5 xl:max-h-none",
+              )}
+            >
+              {shown.map((process) => {
+                const level = tone(process.time);
+                const open = openQueries.has(process.id);
+                const stopReason = !canManage
+                  ? DENIED
+                  : process.is_panel
+                    ? t("cannotStopOwn")
+                    : null;
+                return (
+                  <div
+                    key={process.id}
+                    className={cn("space-y-3 rounded-xl border bg-card p-3", CARD_EDGE[level])}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="inline-flex min-w-0 items-center gap-1.5 rounded-md bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                        <Activity className="size-3.5 shrink-0" aria-hidden />
+                        <span className="truncate">{process.state || process.command || "—"}</span>
+                      </span>
+                      <span
+                        className={cn(
+                          "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-sm font-semibold tabular-nums",
+                          TIME_STYLE[level],
+                        )}
+                      >
+                        <Clock className="size-3.5" />
+                        {duration(process.time, t)}
+                      </span>
+                    </div>
+                    {level === "destructive" ? (
+                      <Badge variant="destructive">{t("longRunning")}</Badge>
+                    ) : null}
+
+                    <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[13px]">
+                      <dt className="text-muted-foreground">{t("meta.database")}</dt>
+                      <dd className="truncate font-mono">{process.db || "—"}</dd>
+                      <dt className="text-muted-foreground">{t("meta.user")}</dt>
+                      <dd className="truncate font-mono">
+                        {process.user ?? "—"}
+                        {process.host ? `@${process.host}` : ""}
+                      </dd>
+                    </dl>
+
+                    {process.query ? (
+                      <div className="space-y-1">
+                        <pre
+                          className={cn(
+                            "whitespace-pre-wrap break-words rounded-md bg-muted px-2.5 py-2 font-mono text-xs leading-relaxed text-foreground dark:bg-muted/60",
+                            !open && "line-clamp-2",
+                          )}
+                        >
+                          {process.query}
+                        </pre>
+                        <button
+                          type="button"
+                          className="text-xs font-medium text-primary hover:underline"
+                          aria-expanded={open}
+                          onClick={() =>
+                            setOpenQueries((current) => {
+                              const next = new Set(current);
+                              if (next.has(process.id)) next.delete(process.id);
+                              else next.add(process.id);
+                              return next;
+                            })
+                          }
+                        >
+                          {open ? t("queryShowLess") : t("queryShowFull")}
+                        </button>
+                      </div>
+                    ) : null}
+
+                    <ReasonTooltip reason={stopReason}>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        className="w-full"
+                        disabled={Boolean(stopReason)}
+                        onClick={() => stop.open(process)}
+                      >
+                        <Square className="size-3.5" />
+                        {t("stopQuery")}
+                      </Button>
+                    </ReasonTooltip>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {hidden > 0 || expanded ? (
+            <div className="-mx-5 border-t px-5 py-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="w-full text-muted-foreground hover:bg-transparent hover:text-foreground aria-expanded:bg-transparent aria-expanded:text-muted-foreground aria-expanded:hover:text-foreground dark:hover:bg-transparent"
+                onClick={() => setExpanded((prev) => !prev)}
+                aria-expanded={expanded}
+              >
+                {expanded ? (
+                  <ChevronUp className="size-4" />
+                ) : (
+                  <ChevronDown className="size-4" />
+                )}
+                {expanded ? t("showLess", { count: active.length }) : t("showAll", { count: hidden })}
+              </Button>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      <ConfirmDialog
+        open={stop.isOpen}
+        onOpenChange={stop.setOpen}
+        icon={Square}
+        tone="destructive"
+        title={t("killTitle")}
+        description={t("killDescription")}
+        cancelLabel={t("cancel")}
+        confirmLabel={stop.pending ? t("killing") : t("stopQuery")}
+        pending={stop.pending}
+        error={stop.error}
+        onConfirm={kill}
+      />
+    </>
+  );
+}

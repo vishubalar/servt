@@ -1,0 +1,173 @@
+<?php
+
+/*
+ * Copy for the Storage destinations integration — S3-compatible remote
+ * targets that backups are uploaded to. The keys in this file render the
+ * connect form, the row labels and the outcome of the test-connection probe.
+ */
+
+return [
+    'drivers' => [
+        's3' => 'Compatible S3',
+        'ftp' => 'FTP',
+        'sftp' => 'SFTP',
+        'google_drive' => 'Google Drive',
+        'google_drive_oauth' => 'Google Drive (votre propre compte)',
+        'local' => 'Ce serveur (dossier local)',
+    ],
+
+    'fields' => [
+        'name' => 'Nom affiché',
+        'endpoint' => 'URL du point de terminaison',
+        'region' => 'Région',
+        'bucket' => 'Bucket',
+        'prefix' => 'Préfixe de clé (facultatif)',
+        'access_key' => 'Clé d’accès',
+        'secret_key' => 'Clé secrète',
+        'host' => 'Hôte',
+        'port' => 'Port',
+        'username' => 'Nom d’utilisateur',
+        'password' => 'Mot de passe',
+        'root' => 'Répertoire distant',
+        'ssl' => 'Utiliser TLS (FTPS)',
+        'passive' => 'Mode passif',
+        'private_key' => 'Clé privée',
+        'passphrase' => 'Phrase secrète de la clé',
+        'host_fingerprint' => 'Empreinte de la clé d’hôte',
+        'service_account_json' => 'Clé de compte de service (JSON)',
+        'folder_id' => 'ID du dossier Drive partagé',
+        'drive_name' => 'Drive partagé',
+        'client_email' => 'Adresse du compte de service',
+    ],
+
+    'placeholders' => [
+        'endpoint' => 'https://s3.amazonaws.com',
+        'region' => 'us-east-1',
+        'prefix' => 'backups/production/',
+        'host' => 'backup.exemple.fr',
+        'root' => 'backups/',
+    ],
+
+    'help' => [
+        'name' => 'Un libellé court pour distinguer les destinations dans la liste des intégrations.',
+        'endpoint' => 'Laissez la valeur par défaut pour AWS. Renseignez-la pour Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces ou tout service compatible S3.',
+        'region' => 'Région où se trouve le bucket (requise uniquement pour AWS).',
+        'prefix' => 'Préfixe de chemin facultatif dans le bucket (sans barre oblique initiale).',
+        'access_key' => 'En écriture seule — jamais renvoyée par l’API.',
+        'host' => 'Nom d’hôte ou adresse IP du serveur qui conservera les sauvegardes.',
+        'port' => 'Laisser vide pour utiliser la valeur par défaut.',
+        'root' => 'Répertoire du serveur où écrire. Laisser vide pour rester là où la connexion aboutit.',
+        'ssl' => 'Fortement recommandé. Sans cela, le mot de passe et toute la sauvegarde circulent en clair.',
+        'passive' => 'À laisser activé sauf si le serveur exige le contraire.',
+        'private_key' => 'Collez la clé privée entière. Utilisée à la place d’un mot de passe.',
+        'passphrase' => 'Uniquement si la clé privée est elle-même chiffrée.',
+        'host_fingerprint' => 'Enregistrée lors de la première connexion, puis imposée. À comparer avec la clé présente sur le serveur.',
+        'plain_ftp_warning' => 'TLS est désactivé. Le mot de passe et chaque sauvegarde seront envoyés en clair.',
+        'service_account_json' => 'Collez le fichier de clé JSON complet du compte de service.',
+        'folder_id' => 'La partie de l’URL du dossier après /folders/, pas le lien entier.',
+        'drive_shared_only' => 'Seul un Drive partagé Google Workspace fonctionne. Un compte de service n’a pas de stockage propre : les envois vers un Drive personnel sont refusés même si le compte est vide.',
+        'drive_share_with' => 'Partagez le dossier du Drive partagé avec l’adresse du compte de service avant de tester.',
+    ],
+
+    'status' => [
+        'connected' => 'Connecté',
+        'never_tested' => 'Pas encore testé',
+        'failed' => 'Dernier test échoué',
+    ],
+
+    'test' => [
+        'success' => 'Connexion réussie.',
+        'failure' => 'Impossible de se connecter à la destination.',
+        'invalid_credentials' => 'La destination a rejeté les identifiants.',
+        'unreachable' => 'Le point de terminaison de la destination est injoignable.',
+        'bucket_not_found' => 'Aucun bucket ne porte ce nom. Vérifiez le nom du bucket : il est sensible à la casse.',
+        'wrong_region' => 'Le bucket se trouve dans une autre région. Indiquez la région dans laquelle le bucket a été créé.',
+        'tls_failed' => 'Impossible d\'établir une connexion sécurisée (TLS) avec le point de terminaison. Le certificat du serveur est absent, non approuvé ou défectueux : vérifiez l\'URL du point de terminaison et le certificat du serveur.',
+        'ftp_no_tls' => 'Ce serveur FTP ne prend pas en charge le chiffrement (FTPS) : la connexion chiffrée a donc été refusée. Activez TLS sur le serveur, ou désactivez « Utiliser TLS (FTPS) » si une connexion non chiffrée est acceptable.',
+        'mismatch' => 'La destination a relu des octets différents de ceux écrits.',
+        'forbidden_host' => 'Cette adresse de point de terminaison n’est pas autorisée.',
+        'invalid_endpoint' => 'Saisissez une URL de point de terminaison https:// valide pour le bucket.',
+        'invalid_host' => 'Saisissez un nom d’hôte ou une adresse IP valide.',
+        'host_key_mismatch' => 'Le serveur a présenté une clé d’hôte différente de celle enregistrée. La connexion a été interrompue.',
+        'tls_certificate_changed' => 'Le serveur FTPS a présenté un certificat différent de celui enregistré ; rien n\'a donc été envoyé. Si le certificat du serveur a été renouvelé, choisissez « Faire confiance au nouveau certificat » sur cette destination.',
+        'tls_certificate_unreadable' => 'Le certificat du serveur FTPS n\'a pas pu être lu, il n\'a donc pas pu être comparé à celui enregistré. Rien n\'a été envoyé.',
+        'invalid_private_key' => 'La clé privée n’a pas pu être lue. Vérifiez qu’elle a été collée en entier.',
+        'root_missing' => "Le dossier de destination n'existe pas sur le serveur. Créez-le ou corrigez le chemin du dossier.",
+        'drive_personal' => 'Ce dossier est sur un Drive personnel. Un compte de service n’y a aucun stockage, les sauvegardes seraient refusées — utilisez un dossier d’un Drive partagé.',
+        'drive_not_shared' => 'Le dossier existe, mais ce compte de service n’y a pas accès.',
+        'drive_folder_missing' => 'Aucun dossier trouvé avec cet identifiant.',
+        'drive_not_a_folder' => 'Cet identifiant désigne un fichier, pas un dossier.',
+        'drive_bad_key' => 'La clé du compte de service n’a pas pu être lue. Collez le fichier JSON entier.',
+        'drive_quota' => 'Google a refusé l’envoi faute de quota de stockage, ce qui est le cas sur un Drive personnel.',
+        'drive_incomplete' => 'Ajoutez la clé du compte de service et l’identifiant du dossier avant de tester.',
+        'local_path_invalid' => 'Le chemin du dossier n\'est pas valide.',
+        'local_path_not_allowed' => 'Ce dossier n\'est pas autorisé pour les sauvegardes.',
+        'local_path_link' => 'Le dossier, ou un dossier de son chemin, est un lien.',
+        'local_missing' => 'Le dossier de sauvegarde n\'existe plus. S\'il est sur un disque supplémentaire, vérifiez qu\'il est monté.',
+        'local_foreign' => 'Le dossier de sauvegarde n\'appartient plus au panneau.',
+        'local_not_writable' => 'Impossible d\'écrire dans le dossier de sauvegarde.',
+        'local_no_space' => 'Il n\'y a pas assez d\'espace disque libre pour cette sauvegarde.',
+        'local_success' => 'Le dossier est prêt. :free libres sur :total.',
+    ],
+
+    'delete' => [
+        'in_use' => 'Impossible de supprimer :name — cette destination est encore utilisée par :applications. Supprimez ou redirigez ces cibles de sauvegarde d’abord.',
+        'in_use_by_databases' => "Impossible de supprimer :name — la planification de sauvegarde de la base de données :databases l'utilise encore. Supprimez cette planification ou déplacez-la d'abord vers un autre stockage.",
+        'holds_backups' => 'Impossible de supprimer :name — cette destination contient encore des sauvegardes (:count). Supprimez d’abord ces sauvegardes, afin que leurs archives soient aussi retirées du stockage.',
+        'and_more' => ':count de plus',
+    ],
+
+    'validation' => [
+        'sftp_auth_required' => 'Indiquez soit un mot de passe, soit une clé privée.',
+        'sftp_key_is_public' => 'Il s\'agit d\'une clé publique. Collez la clé privée — le fichier sans .pub.',
+        'sftp_key_needs_passphrase' => 'Cette clé est protégée par une phrase secrète. Saisissez-la également.',
+        'sftp_key_wrong_passphrase' => 'La phrase secrète ne déverrouille pas cette clé.',
+        'sftp_key_invalid' => 'Ce n\'est pas une clé privée que le panneau peut lire. Collez la clé entière, y compris les lignes BEGIN et END.',
+    ],
+
+    'upload' => [
+        'stalled' => "L'envoi a cessé de transmettre des données et a été abandonné. La connexion est restée ouverte mais rien n'a été transféré, ce qui signifie généralement que le fournisseur de stockage l'a interrompue. La sauvegarde réessaiera lors de sa prochaine exécution.",
+    ],
+
+    'oauth' => [
+        'not_connected' => 'Pas encore connecté. Cliquez sur Connecter pour autoriser l’accès à votre compte Google.',
+        'revoked' => 'Google a révoqué cet accès. Le plus souvent, l’application OAuth est restée en « Testing » — Google expire ces jetons au bout d’une semaine environ — ou l’accès a été retiré sur myaccount.google.com. Reconnectez-vous.',
+        'user_quota' => 'Votre Google Drive est plein. Libérez de l’espace ou sauvegardez ailleurs.',
+        'folder_missing' => 'Le panneau n’atteint pas le dossier de sauvegarde. Il a peut-être été supprimé, ou il appartient à un compte Google ou à un client OAuth différent de celui connecté actuellement — le panneau ne voit que les dossiers qu’il a créés lui-même. Reconnectez-vous et il en créera un nouveau.',
+        'denied' => 'L’accès a été refusé sur l’écran Google. Rien n’a été modifié.',
+        'code_expired' => 'Cette approbation a déjà été utilisée, ou elle a expiré. Cliquez sur Connecter pour recommencer.',
+        'bad_client' => 'Google ne reconnaît pas cet identifiant client. Vérifiez qu’il a été copié en entier, terminaison .apps.googleusercontent.com comprise.',
+        'wrong_client_type' => 'Ce client est du mauvais type. Dans Google Cloud Console, créez un client OAuth de type « Web application », puis collez son identifiant et son secret.',
+        'redirect_mismatch' => 'Google a refusé l’adresse de redirection. Copiez l’adresse affichée sous le bouton Connecter dans votre client OAuth, sous « Authorized redirect URIs », exactement telle qu’elle apparaît.',
+        'panel_url_missing' => 'Ce panneau ignore sa propre adresse web et ne peut donc pas indiquer à Google où vous renvoyer. Définissez FRONTEND_URL dans la configuration du panneau.',
+        'state_invalid' => 'Cette connexion ne vient pas de ce panneau. Cliquez sur Connecter et approuvez à nouveau.',
+        'state_expired' => 'Ce lien de connexion a déjà été utilisé, ou il est resté trop longtemps. Cliquez sur Connecter pour recommencer.',
+        'destination_missing' => 'Cette destination a été supprimée pendant votre approbation. Rien n’a été enregistré.',
+        'start_failed' => 'Impossible de démarrer la connexion Google. Réessayez dans un instant.',
+        'poll_failed' => 'Impossible de terminer la connexion Google. Réessayez dans un instant.',
+        'token_failed' => 'Impossible de terminer la connexion Google. Réessayez dans un instant.',
+        'no_refresh_token' => 'Google a autorisé l’accès mais n’a pas envoyé de jeton durable, ce qui arrive lorsque ce compte a déjà autorisé cette application. Retirez-la sur myaccount.google.com, section Accès tiers, puis reconnectez-vous.',
+        'api_disabled' => 'L’API Google Drive n’est pas activée dans votre projet Google Cloud. Ouvrez API et services → Bibliothèque, cherchez « Google Drive API » et cliquez sur Activer. La connexion fonctionne sans elle, d’où l’apparition tardive de ce message.',
+        'insufficient_scope' => 'La connexion a été approuvée mais n’autorise pas la création de fichiers. Vérifiez que l’écran de consentement OAuth comporte la portée Google Drive drive.file, puis reconnectez-vous.',
+        'folder_failed' => 'Connecté, mais le dossier de sauvegarde n’a pas pu être créé dans votre Drive. La raison figure dans les journaux du panneau, sous « storage ». Reconnectez-vous une fois le problème résolu.',
+        'wrong_provider' => 'Cette destination n’utilise pas la connexion Google.',
+    ],
+
+    // "This server" destinations (#14): the folder checks and the warning.
+    'local' => [
+        'path_invalid' => 'Saisissez le chemin complet d\'un dossier, par exemple /var/backups/panel.',
+        'path_not_allowed' => 'Les sauvegardes ne peuvent être conservées que dans un dossier sous :roots.',
+        'path_link' => 'Le dossier, ou un dossier de son chemin, est un lien. Choisissez un vrai dossier.',
+        'path_taken' => 'Une autre destination utilise déjà ce dossier.',
+        'parent_missing' => 'Le dossier :parent n\'existe pas. S\'il s\'agit d\'un disque supplémentaire, vérifiez qu\'il est monté.',
+        'folder_foreign' => 'Ce dossier appartient à un autre compte et n\'est pas vide. Choisissez un dossier vide ou nouveau.',
+        'not_folder' => 'Ce chemin est un fichier, pas un dossier.',
+        'unreadable' => 'Le dossier n\'a pas pu être vérifié. Réessayez ; si l\'erreur persiste, consultez les journaux du serveur.',
+        'prepare_failed' => 'Le dossier n\'a pas pu être créé ni rendu privé. Vérifiez qu\'il reste de l\'espace disque.',
+        'folder_created' => 'Dossier créé : :path',
+        'folder_existing' => 'Dossier trouvé et prêt : :path',
+        'warning' => 'Les sauvegardes sur ce serveur sont perdues si le serveur ou son disque tombe en panne. Utilisez-le avec une destination hors du serveur.',
+    ],
+    // Answered instead of a second destination for the same credential (2026-10-28).
+    'already_added' => 'Ce stockage est déjà ajouté sous le nom « :name ».',
+];

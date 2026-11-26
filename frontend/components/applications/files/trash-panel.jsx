@@ -1,0 +1,223 @@
+"use client";
+
+import { useState } from "react";
+import { usePendingKeys } from "@/hooks/use-pending-keys";
+import Link from "@/components/ui/app-link";
+import { useFormatter, useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { ArrowLeft, File as FileIcon, RotateCcw, Trash2, TriangleAlert, Undo2 } from "lucide-react";
+import { emptyTrash, restoreTrashed } from "@/lib/api/files";
+import { basename, dirname } from "@/lib/files/path-helpers";
+import { apiMessage } from "@/lib/api/error-message";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { DENIED, ReasonTooltip } from "@/components/ui/reason-tooltip";
+import { EmptyState } from "@/components/data-table/empty-state";
+import { LoadFailed } from "@/components/data-table/load-failed";
+import { RefreshButton } from "@/components/data-table/refresh-button";
+import { useRefresh } from "@/hooks/use-refresh";
+import { formatFileSize } from "@/lib/format/bytes";
+import { parseApiWallClock } from "@/lib/format/api-date";
+import { FileSize } from "@/components/applications/files/file-size";
+
+export function TrashPanel({
+  appId,
+  trash,
+  totalSize,
+  retentionDays,
+  failed,
+  status = null,
+  failure = null,
+  message = null,
+  canManage,
+  backHref,
+}) {
+  const t = useTranslations("applications.files.trash");
+  const format = useFormatter();
+  const deletedLabel = (stamp, fallback) => {
+    const when = parseApiWallClock(stamp);
+    return when ? format.dateTime(when, { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" }) : (stamp ?? fallback);
+  };
+  const { pending: refreshing, refresh, refreshThen } = useRefresh();
+  const [pending, setPending] = useState(null);
+  const restoring = usePendingKeys();
+  // Removed as soon as the API confirms, or Restore can be pressed again before the refresh.
+  const [restored, setRestored] = useState(() => new Set());
+  const [confirming, setConfirming] = useState(null);
+
+  const manageReason = canManage ? null : DENIED;
+
+  const batches = new Map();
+  for (const entry of trash.filter((e) => !restored.has(`${e.batch}:${e.path}`))) {
+    if (!batches.has(entry.batch)) batches.set(entry.batch, []);
+    batches.get(entry.batch).push(entry);
+  }
+
+  async function restore(entry) {
+    const key = `${entry.batch}:${entry.path}`;
+    if (restoring.isPending(key)) return;
+    restoring.start(key);
+    try {
+      await restoreTrashed(appId, entry.batch, entry.path);
+      setRestored((prev) => new Set(prev).add(key));
+      toast.success(t("restored", { name: entry.path }));
+      refresh();
+    } catch (error) {
+      toast.error(apiMessage(error, t("restoreFailed")));
+    } finally {
+      restoring.finish(key);
+    }
+  }
+
+  async function empty(batch) {
+    setPending(batch ?? "all");
+    try {
+      await emptyTrash(appId, batch);
+      const done = batch ? t("batchEmptied") : t("emptied");
+      refreshThen(() => {
+        toast.success(done);
+        setConfirming(null);
+      });
+    } catch (error) {
+      toast.error(apiMessage(error, t("emptyFailed")));
+    } finally {
+      setPending(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-48 space-y-1">
+            <CardTitle icon={Trash2}>{t("title")}</CardTitle>
+            <CardDescription>{t("subtitle")}</CardDescription>
+            {trash.length > 0 && (totalSize != null || retentionDays) ? (
+              <p className="text-sm text-muted-foreground">
+                {totalSize != null ? (
+                  <span className="font-medium text-foreground">
+                    {t("holding", { size: formatFileSize(totalSize, format) })}
+                  </span>
+                ) : null}
+                {totalSize != null && retentionDays ? " · " : null}
+                {retentionDays ? t("retention", { days: retentionDays }) : null}
+              </p>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton className="size-8" />
+            <Button variant="outline" size="sm" asChild>
+              <Link href={backHref} prefetch={false}>
+                <ArrowLeft className="size-3.5" />
+                {t("backToFiles")}
+              </Link>
+            </Button>
+            {trash.length > 0 ? (
+              <ReasonTooltip reason={manageReason}>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={!canManage}
+                  onClick={() => setConfirming({ batch: null })}
+                >
+                  <Trash2 className="size-3.5" />
+                  {t("emptyAll")}
+                </Button>
+              </ReasonTooltip>
+            ) : null}
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent>
+
+      {failed ? (
+        <LoadFailed description={t("loadFailed")} status={status} failure={failure} message={message} />
+      ) : trash.length === 0 ? (
+        <EmptyState icon={Undo2} title={t("empty.title")} description={t("empty.description")} />
+      ) : (
+        <div className="space-y-3">
+          {[...batches].map(([batch, entries]) => (
+            <div key={batch} className="rounded-xl border">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/40 px-4 py-2.5">
+                <div className="flex min-w-48 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                  <span className="text-xs text-muted-foreground">{t("deletedAt")}</span>
+                  <span className="text-sm font-medium tabular-nums">
+                    {deletedLabel(entries[0].deleted_at, batch)}
+                  </span>
+                  <Badge variant="secondary" className="font-normal">
+                    {t("itemCount", { count: entries.length })}
+                  </Badge>
+                </div>
+                <ReasonTooltip reason={manageReason}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    disabled={!canManage || pending === batch}
+                    onClick={() => setConfirming({ batch, count: entries.length })}
+                  >
+                    <Trash2 className="size-3.5" />
+                    {t("emptyBatch")}
+                  </Button>
+                </ReasonTooltip>
+              </div>
+
+              <ul className="divide-y">
+                {entries.map((entry) => {
+                  const busy = restoring.isPending(`${entry.batch}:${entry.path}`);
+                  return (
+                    <li
+                      key={`${entry.batch}:${entry.path}`}
+                      className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+                    >
+                      <div className="flex min-w-48 items-start gap-2.5">
+                        <FileIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                        <div className="min-w-0">
+                          <p className="flex flex-wrap items-baseline gap-x-2">
+                            <span className="font-medium break-all">{basename(entry.path)}</span>
+                            <FileSize bytes={entry.size} className="text-xs tabular-nums text-muted-foreground" />
+                          </p>
+                          <p className="font-mono text-xs break-all text-muted-foreground">
+                            {dirname(entry.path) || t("siteRoot")}
+                          </p>
+                        </div>
+                      </div>
+                      <ReasonTooltip reason={manageReason}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!canManage || busy}
+                          onClick={() => restore(entry)}
+                        >
+                          <RotateCcw className="size-3.5" />
+                          {busy ? t("restoring") : t("restore")}
+                        </Button>
+                      </ReasonTooltip>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+      </CardContent>
+
+      <ConfirmDialog
+        open={confirming !== null}
+        onOpenChange={(next) => !next && pending === null && !refreshing && setConfirming(null)}
+        icon={TriangleAlert}
+        tone="destructive"
+        title={confirming?.batch ? t("confirmBatch.title", { count: confirming.count }) : t("confirmAll.title")}
+        description={confirming?.batch ? t("confirmBatch.description") : t("confirmAll.description")}
+        cancelLabel={t("cancel")}
+        confirmLabel={pending !== null || refreshing ? t("emptying") : t("confirmSubmit")}
+        pending={pending !== null || refreshing}
+        onConfirm={() => empty(confirming?.batch ?? null)}
+      />
+    </Card>
+  );
+}

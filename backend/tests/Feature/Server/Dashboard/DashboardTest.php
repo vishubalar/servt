@@ -1,0 +1,236 @@
+<?php
+
+use App\Models\ServerMetric;
+use App\Models\User;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    // /proc fixtures + a fixture os-release; interval 0 so no sleep + no delta.
+    $this->proc = sys_get_temp_dir().'/sv-oss-proc-'.uniqid();
+    File::ensureDirectoryExists($this->proc.'/net');
+    File::put($this->proc.'/loadavg', "0.50 1.20 2.00 1/234 5678\n");
+    File::put($this->proc.'/meminfo', "MemTotal:        8000000 kB\nMemAvailable:    4000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n");
+    File::put($this->proc.'/stat', "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 50 0 50 400 0 0 0 0 0 0\n");
+    File::put($this->proc.'/net/dev', "Inter-|   Receive\n face |bytes\n    lo: 999 0 0 0 0 0 0 0 999 0\n  eth0: 1000 0 0 0 0 0 0 0 2000 0\n");
+    File::put($this->proc.'/uptime', "12345.67 40000.00\n");
+    File::put($this->proc.'/cpuinfo', "processor\t: 0\nmodel name\t: Test CPU @ 3GHz\nprocessor\t: 1\nmodel name\t: Test CPU @ 3GHz\n");
+    File::put($this->proc.'/os-release', "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nID=ubuntu\n");
+
+    config([
+        'server.proc_dir' => $this->proc,
+        'server.os_release' => $this->proc.'/os-release',
+        'server.metrics.sample_interval' => 0,
+        'server.reboot_required_file' => $this->proc.'/reboot-required',
+    ]);
+});
+
+afterEach(fn () => File::deleteDirectory($this->proc));
+
+function fakeDashboard(): void
+{
+    Process::fake(function ($process) {
+        $cmd = $process->command;
+
+        return match (true) {
+            ($cmd[0] ?? '') === 'df' => Process::result(output: "fs 1B-blocks Used Avail Cap Mount\n/dev/vda1 100000000000 60000000000 40000000000 60% /\n"),
+            $cmd === ['hostname', '--fqdn'] => Process::result(output: 'server.example'),
+            $cmd === ['hostname', '-I'] => Process::result(output: '1.2.3.4 10.0.0.5'),
+            $cmd === ['uname', '-r'] => Process::result(output: '6.8.0-generic'),
+            $cmd === ['uname', '-m'] => Process::result(output: 'x86_64'),
+            ($cmd[0] ?? '') === 'timedatectl' => Process::result(output: 'Etc/UTC'),
+            ($cmd[0] ?? '') === 'node' => Process::result(output: 'v20.11.0'),
+            ($cmd[0] ?? '') === 'nginx' => Process::result(errorOutput: 'nginx version: nginx/1.24.0'),
+            ($cmd[0] ?? '') === 'redis-server' => Process::result(output: 'Redis server v=7.2.4 sha=0'),
+            ($cmd[0] ?? '') === 'mysql' => Process::result(output: 'mysql  Ver 8.0.36 for Linux'),
+            $cmd === ['ps', '-eo', 'pid=,ppid=,unit=,comm='] => Process::result(output: "    1     0 init.scope systemd\n 1234     1 nginx.service nginx\n 5678     1 mysql.service mysqld\n 4242  4000 session-4.scope sleep\n"),
+            ($cmd[0] ?? '') === 'ps' => Process::result(output: "  PID USER  %CPU %MEM COMMAND\n 9999 panel 99.0  0.1 /usr/bin/ps -eo pid,user:20,%cpu,%mem,args --sort=-%cpu\n 1234 root   5.0  2.1 /usr/sbin/nginx -g daemon off;\n 5678 mysql  3.0 10.5 /usr/sbin/mysqld --defaults-file=/etc/mysql/my.cnf --password=topsecret --api-key abc123\n"),
+            default => Process::result(exitCode: 0),
+        };
+    });
+}
+
+it('returns server facts', function () {
+    fakeDashboard();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/facts')->assertOk()
+        ->assertJsonPath('facts.os', 'Ubuntu 24.04 LTS')
+        ->assertJsonPath('facts.hostname', 'server.example')
+        ->assertJsonPath('facts.ip', '1.2.3.4')
+        ->assertJsonPath('facts.cpu.cores', 2)
+        ->assertJsonPath('facts.timezone', 'Etc/UTC')
+        ->assertJsonPath('facts.reboot_required', false)
+        // PHP_VERSION, not the faked subprocess: the probe used to shell out
+        // to `php` and resolve it from PATH, which the web process does not
+        // share with the CLI. Asking PHP itself cannot depend on PATH.
+        ->assertJsonPath('facts.runtimes.php', PHP_VERSION)
+        ->assertJsonPath('facts.runtimes.node', '20.11.0');
+});
+
+it('returns a live metric breakdown (total/used/free/percent) from /proc', function () {
+    fakeDashboard();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/metrics/live')->assertOk()
+        // memory: 8000000 kB total, 4000000 kB available → 50%, values in bytes
+        ->assertJsonPath('metrics.memory.total', 8192000000)
+        ->assertJsonPath('metrics.memory.used', 4096000000)
+        ->assertJsonPath('metrics.memory.free', 4096000000)
+        ->assertJsonPath('metrics.memory.percent', 50)
+        ->assertJsonPath('metrics.swap.percent', 25)
+        // disk from df -B1: total/used/free bytes + percent
+        ->assertJsonPath('metrics.disk.total', 100000000000)
+        ->assertJsonPath('metrics.disk.used', 60000000000)
+        ->assertJsonPath('metrics.disk.free', 40000000000)
+        ->assertJsonPath('metrics.disk.percent', 60)
+        ->assertJsonPath('metrics.cpu.cores', 2)
+        ->assertJsonPath('metrics.load.15', 2)
+        ->assertJsonStructure(['metrics' => [
+            'cpu' => ['percent', 'cores'],
+            'memory' => ['total', 'used', 'free', 'percent', 'used_human'],
+            'disk' => ['total', 'used', 'free', 'percent'],
+            'network' => ['in', 'out', 'in_human', 'out_human'],
+        ]]);
+});
+
+it('returns the server process table', function () {
+    fakeDashboard();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/processes')->assertOk()
+        ->assertJsonPath('processes.0.pid', 1234)
+        ->assertJsonPath('processes.0.user', 'root')
+        ->assertJsonPath('processes.0.command', '/usr/sbin/nginx -g daemon off;')
+        ->assertJsonPath(
+            'processes.1.command',
+            '/usr/sbin/mysqld --defaults-file=/etc/mysql/my.cnf --password=[REDACTED] --api-key [REDACTED]',
+        )
+        ->assertJsonMissing(['pid' => 9999]);
+
+    Process::assertRan(fn ($process) => $process->command === [
+        'ps', '-eo', 'pid,user:20,%cpu,%mem,args', '--sort=-%cpu',
+    ]);
+});
+
+it('says which processes Stop would refuse, and why (bug #7)', function () {
+    config(['server.protected_services' => ['nginx', 'php8.4-fpm']]);
+    fakeDashboard();
+
+    // The same rules as the Stop endpoint, so the screen can grey the button
+    // out instead of failing after the click.
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/processes')->assertOk()
+        ->assertJsonPath('processes.0.pid', 1234)
+        ->assertJsonPath('processes.0.stoppable', false)
+        ->assertJsonPath('processes.0.reason', __('errors/process.protected'))
+        ->assertJsonPath('processes.1.pid', 5678)
+        ->assertJsonPath('processes.1.stoppable', false)
+        ->assertJsonPath('processes.1.reason', __('errors/process.database'));
+});
+
+it('offers Stop on an ordinary process', function () {
+    Process::fake(function ($process) {
+        return match ($process->command) {
+            ['ps', '-eo', 'pid=,ppid=,unit=,comm='] => Process::result(output: " 4242  4000 session-4.scope sleep\n"),
+            default => Process::result(output: "  PID USER %CPU %MEM COMMAND\n 4242 deploy 1.0 0.1 sleep 600\n"),
+        };
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/processes')->assertOk()
+        ->assertJsonPath('processes.0.stoppable', true)
+        ->assertJsonPath('processes.0.reason', null);
+});
+
+it('does not offer Stop on a process that exited between the two reads', function () {
+    Process::fake(function ($process) {
+        return match ($process->command) {
+            ['ps', '-eo', 'pid=,ppid=,unit=,comm='] => Process::result(output: " 1     0 init.scope systemd\n"),
+            default => Process::result(output: "  PID USER %CPU %MEM COMMAND\n 4242 deploy 1.0 0.1 sleep 600\n"),
+        };
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/processes')->assertOk()
+        ->assertJsonPath('processes.0.stoppable', false)
+        ->assertJsonPath('processes.0.reason', __('errors/process.not_found'));
+});
+
+it('counts every process, not the rows it returns', function () {
+    // The list is a top-N by CPU. Before this the only number the panel had
+    // was the row count, which is the limit — so the count could not move when
+    // a process was stopped, and the screen looked frozen.
+    config(['server.metrics.processes_limit' => 1]);
+    fakeDashboard();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/processes')->assertOk();
+
+    expect($response->json('processes'))->toHaveCount(1)
+        ->and($response->json('meta.total'))->toBe(2)
+        ->and($response->json('meta.limit'))->toBe(1);
+});
+
+it('leaves its own ps out of the count as well as the list', function () {
+    // The probe is filtered from the rows, so counting it would report a
+    // process the user cannot find anywhere on the screen.
+    fakeDashboard();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/processes')->assertOk()
+        ->assertJsonPath('meta.total', 2);
+});
+
+it('samples metrics into the table and prunes old rows', function () {
+    Carbon::setTestNow(Carbon::parse('2026-07-27 12:00:00'));
+    fakeDashboard();
+
+    // An old row (2 days ago) that must be pruned.
+    ServerMetric::create(['cpu_percent' => 1, 'memory_percent' => 1, 'swap_percent' => 0, 'disk_percent' => 1,
+        'load_1' => 0, 'load_5' => 0, 'load_15' => 0, 'net_in' => 0, 'net_out' => 0,
+        'sampled_at' => Carbon::parse('2026-07-25 12:00:00')]);
+
+    $this->artisan('server:sample-metrics')->assertExitCode(0);
+
+    expect(ServerMetric::query()->count())->toBe(1); // old pruned, new one added
+    $row = ServerMetric::query()->first();
+    expect((float) $row->memory_percent)->toBe(50.0);
+    expect($row->sampled_at->toDateTimeString())->toBe('2026-07-27 12:00:00');
+
+    Carbon::setTestNow();
+});
+
+it('returns 24h history for the charts', function () {
+    Carbon::setTestNow(Carbon::parse('2026-07-27 12:00:00'));
+    ServerMetric::create(['cpu_percent' => 10, 'memory_percent' => 40, 'swap_percent' => 0, 'disk_percent' => 55,
+        'load_1' => 0.3, 'load_5' => 0.4, 'load_15' => 0.5, 'net_in' => 1000, 'net_out' => 2000,
+        'sampled_at' => Carbon::parse('2026-07-27 11:00:00')]);
+    ServerMetric::create(['cpu_percent' => 1, 'memory_percent' => 1, 'swap_percent' => 0, 'disk_percent' => 1,
+        'load_1' => 0, 'load_5' => 0, 'load_15' => 0, 'net_in' => 0, 'net_out' => 0,
+        'sampled_at' => Carbon::parse('2026-07-25 11:00:00')]); // older than 24h → excluded
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/server/metrics/history')->assertOk()
+        ->assertJsonCount(1, 'metrics')
+        ->assertJsonPath('metrics.0.cpu', 10)
+        ->assertJsonPath('metrics.0.load_15', 0.5)
+        ->assertJsonPath('metrics.0.net_out', 2000);
+
+    Carbon::setTestNow();
+});
+
+it('denies a user without the dashboard permission', function () {
+    fakeDashboard();
+    $stranger = User::factory()->create();
+    $token = $stranger->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/server/facts')->assertForbidden();
+});

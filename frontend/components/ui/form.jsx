@@ -1,0 +1,188 @@
+import * as React from "react"
+import { Slot } from "radix-ui"
+import {
+  Controller,
+  FormProvider,
+  useFormContext,
+  useFormState,
+} from "react-hook-form"
+import { useTranslations } from "next-intl"
+
+import { cn } from "@/lib/utils"
+import { Label } from "@/components/ui/label"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+
+const Form = FormProvider
+
+const FormFieldContext = React.createContext({})
+
+function FormField({ ...props }) {
+  return (
+    <FormFieldContext.Provider value={{ name: props.name }}>
+      <Controller {...props} />
+    </FormFieldContext.Provider>
+  )
+}
+
+function useFormField() {
+  const fieldContext = React.useContext(FormFieldContext)
+  const itemContext = React.useContext(FormItemContext)
+  const { getFieldState } = useFormContext()
+  const formState = useFormState({ name: fieldContext.name })
+  const fieldState = getFieldState(fieldContext.name, formState)
+
+  if (!fieldContext) {
+    throw new Error("useFormField should be used within <FormField>")
+  }
+
+  const { id } = itemContext
+
+  return {
+    id,
+    name: fieldContext.name,
+    formItemId: `${id}-form-item`,
+    formDescriptionId: `${id}-form-item-description`,
+    formMessageId: `${id}-form-item-message`,
+    ...fieldState,
+  }
+}
+
+// Refs can't be written during render, so derive from the FormLabel child.
+const FormItemContext = React.createContext({ label: null })
+
+function formLabelText(children) {
+  for (const child of React.Children.toArray(children)) {
+    if (!React.isValidElement(child)) continue
+    if (child.type === FormLabel && typeof child.props.children === "string") {
+      return child.props.children
+    }
+    if (child.type === React.Fragment) {
+      const nested = formLabelText(child.props.children)
+      if (nested) return nested
+    }
+  }
+  return null
+}
+
+function FormItem({ className, children, ...props }) {
+  const id = React.useId()
+  const label = formLabelText(children)
+
+  return (
+    <FormItemContext.Provider value={{ id, label }}>
+      <div data-slot="form-item" className={cn("grid content-start gap-2", className)} {...props}>
+        {children}
+      </div>
+    </FormItemContext.Provider>
+  )
+}
+
+// No tab stop: Radix Dialog would auto-focus it and open the tooltip (radix-ui#1949).
+function RequiredMark() {
+  const t = useTranslations("common")
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="ml-0.5 text-destructive">
+          <span aria-hidden="true">*</span>
+          <span className="sr-only">{t("required")}</span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{t("required")}</TooltipContent>
+    </Tooltip>
+  )
+}
+
+function FormLabel({ className, required, hint, children, ...props }) {
+  const { error, formItemId } = useFormField()
+
+  return (
+    <Label
+      data-slot="form-label"
+      data-error={!!error}
+      className={cn("data-[error=true]:text-destructive", className)}
+      htmlFor={formItemId}
+      hint={hint}
+      {...props}
+    >
+      {children}
+      {required ? <RequiredMark /> : null}
+    </Label>
+  )
+}
+
+function FormControl({ ...props }) {
+  const { error, formItemId, formDescriptionId, formMessageId } = useFormField()
+
+  return (
+    <Slot.Root
+      data-slot="form-control"
+      id={formItemId}
+      aria-describedby={
+        !error ? `${formDescriptionId}` : `${formDescriptionId} ${formMessageId}`
+      }
+      aria-invalid={!!error}
+      {...props}
+    />
+  )
+}
+
+function FormDescription({ className, ...props }) {
+  const { formDescriptionId } = useFormField()
+
+  return (
+    <p
+      data-slot="form-description"
+      id={formDescriptionId}
+      className={cn("text-muted-foreground text-xs leading-relaxed font-normal", className)}
+      {...props}
+    />
+  )
+}
+
+function FormMessage({ className, field, ...props }) {
+  const { error, formMessageId } = useFormField()
+  const tv = useTranslations("validation")
+  const tc = useTranslations("common")
+  const { label: detectedLabel } = React.useContext(FormItemContext)
+
+  const raw = props.children ?? (error ? String(error?.message ?? "") : null)
+  const label = field ?? detectedLabel ?? null
+  const body =
+    typeof raw === "string" && raw
+      ? raw === "requiredField"
+        ? label
+          ? tc("requiredFieldNamed", { field: label })
+          : tc("requiredField")
+        : tv.has(raw)
+          ? tv(raw)
+          : raw
+      : raw
+
+  if (!body) {
+    return null
+  }
+
+  return (
+    <p
+      data-slot="form-message"
+      id={formMessageId}
+      className={cn("text-destructive text-sm", className)}
+      {...props}
+    >
+      {body}
+    </p>
+  )
+}
+
+export {
+  Form,
+  FormItem,
+  FormLabel,
+  FormControl,
+  FormDescription,
+  FormMessage,
+  FormField,
+  RequiredMark,
+  useFormField,
+}

@@ -1,0 +1,1550 @@
+<?php
+
+use App\Enums\StorageProvider;
+use App\Exceptions\Server\Storage\FtpsCertificateException;
+use App\Models\ActivityLog;
+use App\Models\Application;
+use App\Models\Backup;
+use App\Models\BackupTarget;
+use App\Models\Database;
+use App\Models\StorageDestination;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Backups\Storage\DestinationDisk;
+use App\Services\Server\Backups\Storage\Drivers\FtpDriver;
+use App\Services\Server\Backups\Storage\FtpsCertificate;
+use App\Services\Server\Backups\Storage\SftpHostKey;
+use App\Services\Server\Backups\Storage\StorageConnectionProber;
+use App\Services\Server\Backups\Storage\StorageDriverFactory;
+use Aws\Handler\Guzzle\GuzzleHandler;
+use Database\Seeders\PermissionSeeder;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Psr7\Response;
+use Illuminate\Support\Facades\Storage;
+use League\Flysystem\Ftp\UnableToAuthenticate as FtpUnableToAuthenticate;
+use League\Flysystem\Ftp\UnableToResolveConnectionRoot;
+use League\Flysystem\PhpseclibV3\UnableToEstablishAuthenticityOfHost;
+use League\Flysystem\UnableToWriteFile;
+use phpseclib3\Crypt\EC;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    // Tests must never reach a real endpoint: the container resolves the prober to the fake disk.
+    $this->fakeDisk = Storage::fake();
+
+    $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+        // Untyped on purpose: a `: Filesystem` return type would make this test exercise PHP's
+        // covariance check instead of the prober.
+        fn (array $config) => test()->fakeDisk,
+    ));
+});
+
+/**
+ * A prober wired with the real driver factory and a host-key reader that never opens a socket.
+ *
+ * The factory is real on purpose: a faked one would assert against its own stub.
+ */
+function makeProber(?callable $diskBuilder = null, ?string $fingerprint = null): StorageConnectionProber
+{
+    return new StorageConnectionProber(
+        drivers: app(StorageDriverFactory::class),
+        hostKeys: new SftpHostKey(fn (string $host, int $port) => new class($fingerprint)
+        {
+            public function __construct(private ?string $fingerprint) {}
+
+            public function getServerPublicHostKey(): string|false
+            {
+                // The shape phpseclib returns: `<algo> <base64 key> [comment]`.
+                return $this->fingerprint === null ? false : 'ssh-ed25519 '.base64_encode($this->fingerprint);
+            }
+        }),
+        diskBuilder: $diskBuilder,
+    );
+}
+
+function storageAdminAuthHeader(): array
+{
+    return ['Authorization' => 'Bearer '.test()->token];
+}
+
+/** A saved S3 destination with the bare minimum fields plus optional overrides. */
+function makeDestination(array $overrides = []): StorageDestination
+{
+    $config = array_merge([
+        'endpoint' => 'https://s3.amazonaws.com',
+        'region' => 'us-east-1',
+        'bucket' => 'backups-prod',
+        'access_key' => 'AKIA_secret_value',
+        'secret_key' => 'shhhh_secret_value',
+    ], $overrides['config'] ?? []);
+
+    unset($overrides['config']);
+
+    return StorageDestination::create(array_merge([
+        'name' => 'Work S3',
+        'provider' => StorageProvider::S3,
+        'prefix' => 'app1/',
+        'config' => $config,
+    ], $overrides));
+}
+
+/** The create payload for an S3 destination. */
+function s3Payload(array $overrides = []): array
+{
+    return array_merge([
+        'name' => 'New S3',
+        'provider' => 's3',
+        'prefix' => 'app1/',
+        'config' => array_merge([
+            'endpoint' => 'https://s3.amazonaws.com',
+            'region' => 'us-east-1',
+            'bucket' => 'backups-prod',
+            'access_key' => 'AKIA_secret_value',
+            'secret_key' => 'shhhh_secret_value',
+        ], $overrides['config'] ?? []),
+    ], array_diff_key($overrides, ['config' => null]));
+}
+
+it('lists destinations sorted by name without case bias and never returns secrets', function () {
+    makeDestination(['name' => 'Case Zebra']);
+    makeDestination(['name' => 'case apple']);
+    makeDestination(['name' => 'CASE Banana']);
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->getJson('/api/integrations/storage/destinations');
+
+    $response->assertOk();
+    expect($response->json('storage_destinations'))->toHaveCount(3);
+    expect(collect($response->json('storage_destinations'))->pluck('name')->all())
+        ->toBe(['case apple', 'CASE Banana', 'Case Zebra']);
+
+    // Defence in depth — scan the whole envelope for the secret values.
+    $json = $response->getContent();
+    expect($json)->not->toContain('AKIA_secret_value')
+        ->and($json)->not->toContain('shhhh_secret_value');
+});
+
+it('shows one destination and never returns secrets', function () {
+    $dest = makeDestination();
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->getJson("/api/integrations/storage/destinations/{$dest->id}");
+
+    $response->assertOk();
+    expect($response->json('storage_destination.provider'))->toBe('s3');
+    expect($response->json('storage_destination.provider_title'))->toBe('S3-compatible');
+    expect($response->json('storage_destination.has_credentials'))->toBeTrue();
+    // Addressing detail is fine to echo; credentials are not.
+    expect($response->json('storage_destination.config.bucket'))->toBe('backups-prod');
+    expect($response->json('storage_destination.config'))->not->toHaveKey('access_key')
+        ->and($response->json('storage_destination.config'))->not->toHaveKey('secret_key')
+        ->and($response->getContent())->not->toContain('AKIA_secret_value')
+        ->and($response->getContent())->not->toContain('shhhh_secret_value');
+});
+
+it('creates a destination and stores the credentials encrypted', function () {
+    $response = $this->withHeaders(storageAdminAuthHeader())
+        ->postJson('/api/integrations/storage/destinations', s3Payload());
+
+    $response->assertCreated();
+    $response->assertJsonPath('storage_destination.name', 'New S3');
+    $response->assertJsonPath('storage_destination.provider', 's3');
+    $response->assertJsonPath('storage_destination.has_credentials', true);
+    expect($response->json('storage_destination.config'))->not->toHaveKey('access_key')
+        ->and($response->json('storage_destination.config'))->not->toHaveKey('secret_key');
+
+    $dest = StorageDestination::first();
+    // The encrypted cast makes the model access return plaintext; the *raw*
+    // (stored) value must not contain it.
+    expect($dest->configValue('access_key'))->toBe('AKIA_secret_value')
+        ->and($dest->configValue('secret_key'))->toBe('shhhh_secret_value')
+        ->and($dest->getRawOriginal('config'))->not->toContain('AKIA_secret_value')
+        ->and($dest->getRawOriginal('config'))->not->toContain('shhhh_secret_value');
+});
+
+it('defaults the region to us-east-1 when omitted', function () {
+    $response = $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+        'name' => 'Regionless',
+        'provider' => 's3',
+        'config' => ['bucket' => 'b', 'access_key' => 'a', 'secret_key' => 's'],
+    ]);
+
+    $response->assertCreated();
+    expect(StorageDestination::first()->configValue('region'))->toBe('us-east-1');
+});
+
+it('requires a provider and refuses an unknown one', function () {
+    // No silent 's3' default: guessing the provider is the bug the column
+    // exists to end.
+    $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+        'name' => 'Providerless',
+        'config' => ['bucket' => 'b', 'access_key' => 'a', 'secret_key' => 's'],
+    ])->assertUnprocessable()->assertJsonValidationErrors('provider');
+
+    $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+        'name' => 'Nonsense',
+        'provider' => 'dropbox',
+        'config' => ['bucket' => 'b'],
+    ])->assertUnprocessable()->assertJsonValidationErrors('provider');
+
+    expect(StorageDestination::count())->toBe(0);
+});
+
+it('rejects a duplicate name', function () {
+    makeDestination(['name' => 'Work S3']);
+
+    $this->withHeaders(storageAdminAuthHeader())
+        // A different credential: the same one is answered with the existing
+        // destination instead (IntegrationDuplicateTest).
+        ->postJson('/api/integrations/storage/destinations', s3Payload(['name' => 'Work S3', 'config' => ['secret_key' => 'a-different-secret']]))
+        ->assertUnprocessable()->assertJsonValidationErrors('name');
+});
+
+it('rejects an invalid endpoint hostname', function () {
+    foreach (['http://s3.example.com', 'https://127.0.0.1', 'https://169.254.169.254', 'https://localhost'] as $endpoint) {
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson('/api/integrations/storage/destinations', s3Payload([
+                'name' => 'Bad endpoint '.$endpoint,
+                'config' => ['endpoint' => $endpoint],
+            ]))
+            ->assertUnprocessable()->assertJsonValidationErrors('config.endpoint');
+    }
+
+    expect(StorageDestination::count())->toBe(0);
+});
+
+it('rejects an invalid bucket name', function () {
+    $this->withHeaders(storageAdminAuthHeader())
+        ->postJson('/api/integrations/storage/destinations', s3Payload([
+            'name' => 'Bad bucket',
+            'config' => ['bucket' => 'with spaces and slashes/'],
+        ]))
+        ->assertUnprocessable()->assertJsonValidationErrors('config.bucket');
+
+    expect(StorageDestination::count())->toBe(0);
+});
+
+it('rejects a single-line violation on the name', function () {
+    $this->withHeaders(storageAdminAuthHeader())
+        ->postJson('/api/integrations/storage/destinations', s3Payload(['name' => "Line1\nLine2"]))
+        ->assertUnprocessable()->assertJsonValidationErrors('name');
+});
+
+it('updates a destination and keeps the credentials when not sent', function () {
+    $dest = makeDestination(['name' => 'Old name']);
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->patchJson("/api/integrations/storage/destinations/{$dest->id}", [
+        'name' => 'New name',
+    ]);
+
+    $response->assertOk();
+    $response->assertJsonPath('storage_destination.name', 'New name');
+
+    // Rename only — credentials should still match what we created with.
+    $dest->refresh();
+    expect($dest->name)->toBe('New name')
+        ->and($dest->configValue('access_key'))->toBe('AKIA_secret_value')
+        ->and($dest->configValue('secret_key'))->toBe('shhhh_secret_value');
+});
+
+it('keeps the other config keys when only one is patched', function () {
+    $dest = makeDestination();
+
+    // A merge, not a replace: sending one key must not clear the others (a destination that
+    // loses its secret key on a bucket change fails at the next backup).
+    $this->withHeaders(storageAdminAuthHeader())
+        ->patchJson("/api/integrations/storage/destinations/{$dest->id}", [
+            'config' => ['bucket' => 'a-different-bucket'],
+        ])->assertOk();
+
+    $dest->refresh();
+    expect($dest->configValue('bucket'))->toBe('a-different-bucket')
+        ->and($dest->configValue('access_key'))->toBe('AKIA_secret_value')
+        ->and($dest->configValue('secret_key'))->toBe('shhhh_secret_value')
+        ->and($dest->configValue('region'))->toBe('us-east-1');
+});
+
+it('rotates the credentials when new values are sent', function () {
+    $dest = makeDestination();
+
+    $this->withHeaders(storageAdminAuthHeader())->patchJson("/api/integrations/storage/destinations/{$dest->id}", [
+        'config' => ['access_key' => 'AKIA_rotated', 'secret_key' => 'shhhh_rotated'],
+    ])->assertOk();
+
+    $dest->refresh();
+    expect($dest->configValue('access_key'))->toBe('AKIA_rotated')
+        ->and($dest->configValue('secret_key'))->toBe('shhhh_rotated')
+        ->and($dest->getRawOriginal('config'))->not->toContain('AKIA_rotated');
+});
+
+it('refuses to change the provider of an existing destination', function () {
+    $dest = makeDestination();
+
+    // The config shape belongs to the provider: switching would reinterpret a bucket and secret
+    // key as a hostname and password. Refused rather than silently ignored.
+    $this->withHeaders(storageAdminAuthHeader())
+        ->patchJson("/api/integrations/storage/destinations/{$dest->id}", ['provider' => 'ftp'])
+        ->assertUnprocessable()->assertJsonValidationErrors('provider');
+
+    expect($dest->refresh()->provider)->toBe(StorageProvider::S3);
+});
+
+it('rejects an update with a duplicate name', function () {
+    makeDestination(['name' => 'A']);
+    $b = makeDestination(['name' => 'B']);
+
+    $this->withHeaders(storageAdminAuthHeader())->patchJson("/api/integrations/storage/destinations/{$b->id}", [
+        'name' => 'A',
+    ])->assertUnprocessable()->assertJsonValidationErrors('name');
+});
+
+it('deletes a destination', function () {
+    $dest = makeDestination();
+
+    $this->withHeaders(storageAdminAuthHeader())->deleteJson("/api/integrations/storage/destinations/{$dest->id}")
+        ->assertNoContent();
+
+    expect(StorageDestination::find($dest->id))->toBeNull();
+});
+
+describe('FTP destinations', function () {
+    it('creates one and reports the host without the password', function () {
+        $response = $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+            'name' => 'NAS',
+            'provider' => 'ftp',
+            'prefix' => 'sites/',
+            'config' => [
+                'host' => 'backup.example.com',
+                'username' => 'backups',
+                'password' => 'ftp_secret_value',
+                'root' => 'archive',
+            ],
+        ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('storage_destination.provider', 'ftp')
+            ->assertJsonPath('storage_destination.config.host', 'backup.example.com')
+            ->assertJsonPath('storage_destination.config.port', 21)
+            // Defaults applied by the driver, not stored as user input.
+            ->assertJsonPath('storage_destination.config.ssl', true)
+            ->assertJsonPath('storage_destination.config.passive', true)
+            ->assertJsonPath('storage_destination.has_credentials', true);
+
+        expect($response->json('storage_destination.config'))->not->toHaveKey('password')
+            ->and($response->getContent())->not->toContain('ftp_secret_value');
+    });
+
+    it('builds a config that keeps TLS on by default and surfaces adapter errors', function () {
+        $dest = StorageDestination::create([
+            'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p'],
+        ]);
+
+        $config = app(DestinationDisk::class)->config($dest);
+
+        expect($config['driver'])->toBe('ftp')
+            ->and($config['ssl'])->toBeTrue()
+            ->and($config['passive'])->toBeTrue()
+            ->and($config['port'])->toBe(21)
+            // Same reason as S3: without it a failed write returns false and
+            // a backup that never happened reports success.
+            ->and($config['throw'])->toBeTrue();
+    });
+
+    it('honours an explicit TLS opt-out without silently re-enabling it', function () {
+        $dest = StorageDestination::create([
+            'name' => 'Legacy', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'old.example.com', 'username' => 'u', 'password' => 'p', 'ssl' => false],
+        ]);
+
+        // The default is on; a deliberate false must survive (`?: true` would coerce it to true).
+        expect(app(DestinationDisk::class)->config($dest)['ssl'])->toBeFalse();
+    });
+
+    it('classifies a rejected login as invalid credentials, not as unreachable', function () {
+        $dest = StorageDestination::create([
+            'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p'],
+        ]);
+
+        // A server that does offer TLS: the password really is wrong.
+        ftpServerOffersTls(true);
+
+        $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => new class
+            {
+                public function put(string $key, mixed $contents, array $options = []): bool
+                {
+                    throw new FtpUnableToAuthenticate;
+                }
+            },
+        ));
+
+        // The old shared classifier matched AWS SDK exception names, so this failure read as
+        // "unreachable" instead of a wrong password.
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.error_class', 'invalid_credentials');
+    });
+});
+
+/**
+ * What `AUTH TLS` gets from the FTP server, without a network: true is `234`,
+ * false a refusal, null "could not ask". Records whether it was asked.
+ */
+function ftpServerOffersTls(?bool $answer): ArrayObject
+{
+    $asked = new ArrayObject;
+    $driver = Mockery::mock(FtpDriver::class)->makePartial();
+    $driver->shouldReceive('supportsTls')->andReturnUsing(function () use ($answer, $asked) {
+        $asked[] = true;
+
+        return $answer;
+    });
+    app()->instance(FtpDriver::class, $driver);
+
+    return $asked;
+}
+
+describe('an FTP server without encryption (bug #39)', function () {
+    beforeEach(function () {
+        $this->refusingLogin = fn () => $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => new class
+            {
+                public function put(string $key, mixed $contents, array $options = []): bool
+                {
+                    throw new FtpUnableToAuthenticate;
+                }
+            },
+        ));
+    });
+
+    it('says the server has no TLS instead of blaming the password', function () {
+        // vsftpd without TLS refuses `AUTH TLS` with 530, the same code as a wrong password; the
+        // encrypted login must not be reported as "rejected the credentials".
+        $dest = StorageDestination::create([
+            'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p'],
+        ]);
+        ftpServerOffersTls(false);
+        ($this->refusingLogin)();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.error_class', 'ftp_no_tls')
+            ->assertJsonPath('test.message', __('storage.test.ftp_no_tls'));
+    });
+
+    it('does not ask when TLS is already off, or when the server could not be asked', function () {
+        $plain = StorageDestination::create([
+            'name' => 'Plain', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p', 'ssl' => false],
+        ]);
+        $asked = ftpServerOffersTls(false);
+        ($this->refusingLogin)();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$plain->id}/test")
+            ->assertJsonPath('test.error_class', 'invalid_credentials');
+        expect(count($asked))->toBe(0);
+
+        $tls = StorageDestination::create([
+            'name' => 'Unknown', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p'],
+        ]);
+        ftpServerOffersTls(null);
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$tls->id}/test")
+            ->assertJsonPath('test.error_class', 'invalid_credentials');
+    });
+});
+
+describe('SFTP destinations', function () {
+    it('requires either a password or a private key', function () {
+        $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+            'name' => 'Keyless',
+            'provider' => 'sftp',
+            'config' => ['host' => 'backup.example.com', 'username' => 'backups'],
+        ])->assertUnprocessable()->assertJsonValidationErrors('config.password');
+
+        expect(StorageDestination::count())->toBe(0);
+    });
+
+    it('accepts a private key instead of a password and reports the auth method', function () {
+        $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+            'name' => 'Keyed',
+            'provider' => 'sftp',
+            'config' => [
+                'host' => 'backup.example.com',
+                'username' => 'backups',
+                // A real key: an invented one is refused at save.
+                'private_key' => $key = EC::createKey('Ed25519')->toString('OpenSSH'),
+            ],
+        ])->assertCreated()
+            ->assertJsonPath('storage_destination.config.auth_method', 'private_key')
+            ->assertJsonPath('storage_destination.config.port', 22)
+            ->assertJsonPath('storage_destination.has_credentials', true);
+
+        expect(StorageDestination::first()->getRawOriginal('config'))->not->toContain(substr($key, 40, 30));
+    });
+
+    it('passes the key and not an empty password when authenticating by key', function () {
+        $dest = StorageDestination::create([
+            'name' => 'Keyed', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+            'config' => ['host' => 'h', 'username' => 'u', 'private_key' => 'KEY'],
+        ]);
+
+        $config = app(DestinationDisk::class)->config($dest);
+
+        // An empty `password` is not the same as no password: phpseclib would
+        // try to authenticate with it and fail before ever reaching the key.
+        expect($config)->toHaveKey('privateKey')
+            ->and($config)->not->toHaveKey('password');
+    });
+
+    it('records the host fingerprint on first use and then pins it', function () {
+        $dest = StorageDestination::create([
+            'name' => 'Box', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p'],
+        ]);
+
+        $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => test()->fakeDisk,
+            fingerprint: 'the-host-key-bytes',
+        ));
+
+        expect($dest->configValue('host_fingerprint'))->toBeNull();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.success', true);
+
+        $recorded = $dest->refresh()->configValue('host_fingerprint');
+        expect($recorded)->toStartWith('sha256:');
+
+        // It is handed to the adapter, so a host that starts answering with a different key is
+        // refused, not trusted.
+        expect(app(DestinationDisk::class)->config($dest)['hostFingerprint'])->toBe($recorded);
+    });
+
+    it('never re-pins an already-known host', function () {
+        $dest = StorageDestination::create([
+            'name' => 'Box', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+            'config' => [
+                'host' => 'backup.example.com', 'username' => 'u', 'password' => 'p',
+                'host_fingerprint' => 'sha256:originalfingerprint',
+            ],
+        ]);
+
+        $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => test()->fakeDisk,
+            fingerprint: 'a-different-host-key',
+        ));
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")->assertOk();
+
+        // If this overwrote, the pin would re-pin itself to whoever answered
+        // and the whole check would be decorative.
+        expect($dest->refresh()->configValue('host_fingerprint'))->toBe('sha256:originalfingerprint');
+    });
+
+    it('reports a changed host key as its own category, not as unreachable', function () {
+        $dest = StorageDestination::create([
+            'name' => 'Box', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+            'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'host_fingerprint' => 'sha256:x'],
+        ]);
+
+        $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => new class
+            {
+                // The probe's first network call: it makes the folder before writing, and a changed key
+                // refuses it just the same.
+                public function makeDirectory(string $path): bool
+                {
+                    throw UnableToEstablishAuthenticityOfHost::becauseTheAuthenticityCantBeEstablished('h');
+                }
+
+                public function put(string $key, mixed $contents, array $options = []): bool
+                {
+                    throw UnableToEstablishAuthenticityOfHost::becauseTheAuthenticityCantBeEstablished('h');
+                }
+            },
+        ));
+
+        // The host IS reachable: "could not connect" would send the operator to the firewall while
+        // a possible interception went unmentioned.
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.error_class', 'host_key_mismatch');
+    });
+
+    it('still sees a changed host key when the adapter wraps it, which is the only way it ever arrives', function () {
+        /*
+         * The test above throws the host-key exception bare; the real adapter never does. Flysystem
+         * returns `UnableToWriteFile` with `UnableToEstablishAuthenticityOfHost` in `getPrevious()`,
+         * so a driver checking only the outer exception reported a rejected key as `unreachable`.
+         */
+        $dest = StorageDestination::create([
+            'name' => 'Box', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+            'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'host_fingerprint' => 'sha256:x'],
+        ]);
+
+        $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => new class
+            {
+                // Lets the probe reach the write, which is the wrapped path
+                // this test is about.
+                public function makeDirectory(string $path): bool
+                {
+                    return true;
+                }
+
+                public function put(string $key, mixed $contents, array $options = []): bool
+                {
+                    throw UnableToWriteFile::atLocation(
+                        '.probe/sentinel.bin',
+                        "The authenticity of host 'h' can't be established.",
+                        UnableToEstablishAuthenticityOfHost::becauseTheAuthenticityCantBeEstablished('h'),
+                    );
+                }
+            },
+        ));
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.error_class', 'host_key_mismatch');
+    });
+});
+
+describe('the remote host guard', function () {
+    it('refuses loopback, the metadata range and pasted URLs', function () {
+        $blocked = [
+            'localhost', '127.0.0.1', '169.254.169.254', '0.0.0.0', '::1',
+            'https://backup.example.com', 'backup.example.com/path', 'user@backup.example.com',
+        ];
+
+        foreach ($blocked as $host) {
+            $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+                'name' => 'Blocked '.$host,
+                'provider' => 'ftp',
+                'config' => ['host' => $host, 'username' => 'u', 'password' => 'p'],
+            ])->assertUnprocessable()->assertJsonValidationErrors('config.host');
+        }
+
+        expect(StorageDestination::count())->toBe(0);
+    });
+
+    it('allows a private LAN address, because a NAS on the same network is the normal case', function () {
+        $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+            'name' => 'LAN NAS',
+            'provider' => 'ftp',
+            'config' => ['host' => '192.168.1.50', 'username' => 'u', 'password' => 'p'],
+        ])->assertCreated();
+    });
+
+    it('refuses a remote root that climbs out of the directory it was given', function () {
+        $this->withHeaders(storageAdminAuthHeader())->postJson('/api/integrations/storage/destinations', [
+            'name' => 'Climber',
+            'provider' => 'ftp',
+            'config' => ['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p', 'root' => 'backups/../../etc'],
+        ])->assertUnprocessable()->assertJsonValidationErrors('config.root');
+    });
+});
+
+it('composes the remote root from the connection root and the prefix', function () {
+    $dest = StorageDestination::create([
+        'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => 'shop.example.com',
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => 'archive'],
+    ]);
+
+    // Stacked wrong, a backup lands one level up or in the account's home —
+    // a real, valid, silently incorrect location.
+    expect(app(DestinationDisk::class)->config($dest)['root'])->toBe('archive/shop.example.com');
+
+    $noPrefix = StorageDestination::create([
+        'name' => 'Bare', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p'],
+    ]);
+
+    // Empty, not "/" — a literal root means the filesystem root and fails for
+    // every unprivileged account.
+    expect(app(DestinationDisk::class)->config($noPrefix)['root'])->toBe('');
+});
+
+it('keeps an absolute remote root absolute, instead of resolving it against the login directory', function () {
+    /*
+     * `/backups` is the form every FTP and SFTP client accepts, so users type it. Stripping the
+     * slash makes it relative to wherever the login lands: SFTP creates the missing directory and
+     * probes green into `~/backups`, FTP refuses and blames the network. The silent success is the
+     * dangerous one.
+     */
+    $absolute = StorageDestination::create([
+        'name' => 'Absolute', 'provider' => StorageProvider::Sftp, 'prefix' => 'shop.example.com',
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => '/srv/backups'],
+    ]);
+
+    expect(app(DestinationDisk::class)->config($absolute)['root'])->toBe('/srv/backups/shop.example.com');
+
+    $relative = StorageDestination::create([
+        'name' => 'Relative', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => 'srv/backups'],
+    ]);
+
+    // A relative root stays relative — the point is to carry across what the
+    // user wrote, not to normalise one form into the other.
+    expect(app(DestinationDisk::class)->config($relative)['root'])->toBe('srv/backups');
+
+    $slashOnly = StorageDestination::create([
+        'name' => 'Slash', 'provider' => StorageProvider::Sftp, 'prefix' => null,
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => '/'],
+    ]);
+
+    // Still '' — a bare slash in a form is indistinguishable from "not set",
+    // and reading it literally breaks every unprivileged account.
+    expect(app(DestinationDisk::class)->config($slashOnly)['root'])->toBe('');
+});
+
+it('says the folder is missing rather than blaming the network', function () {
+    /*
+     * The host answered and the login worked; only the directory is missing. Reported as
+     * `unreachable` it sends the operator to check DNS and firewalls.
+     */
+    $dest = StorageDestination::create([
+        'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => 'not-created-yet'],
+    ]);
+
+    $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+        fn (array $config) => new class
+        {
+            public function put(string $key, mixed $contents, array $options = []): bool
+            {
+                // The shape the live FTP adapter produces: the real cause is
+                // wrapped, exactly as with the SFTP host key.
+                throw UnableToWriteFile::atLocation(
+                    '.probe/sentinel.bin',
+                    'creating parent directory failed',
+                    UnableToResolveConnectionRoot::itDoesNotExist('not-created-yet'),
+                );
+            }
+        },
+    ));
+
+    $this->withHeaders(storageAdminAuthHeader())
+        ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+        ->assertOk()
+        ->assertJsonPath('test.error_class', 'root_missing');
+});
+
+it('keeps an absolute remote root absolute', function () {
+    $dest = StorageDestination::create([
+        'name' => 'Absolute', 'provider' => StorageProvider::Ftp, 'prefix' => 'shop.example.com',
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => '/backups'],
+    ]);
+
+    // `/backups` keeps its leading slash (see above): stripped, SFTP silently writes into
+    // `~/backups` and FTP blames the network.
+    expect(app(DestinationDisk::class)->config($dest)['root'])->toBe('/backups/shop.example.com');
+
+    $bare = StorageDestination::create([
+        'name' => 'Slash only', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+        'config' => ['host' => 'h', 'username' => 'u', 'password' => 'p', 'root' => '/'],
+    ]);
+
+    // A bare slash is indistinguishable from "not set" in a form, and reading
+    // it literally breaks every unprivileged account.
+    expect(app(DestinationDisk::class)->config($bare)['root'])->toBe('');
+});
+
+describe('the in-use guard', function () {
+    beforeEach(function () {
+        $systemUser = SystemUser::create(['username' => 'siteowner', 'home_path' => '/home/siteowner']);
+
+        $this->makeApplication = function (string $name) use ($systemUser): Application {
+            return Application::create([
+                'system_user_id' => $systemUser->id,
+                'name' => $name,
+                'domain' => strtolower($name).'.example.test',
+                'site_type' => 'php',
+                'serving_profile' => 'php',
+                'status' => 'active',
+            ]);
+        };
+    });
+
+    it('refuses to delete a destination a backup target still points at, naming the sites', function () {
+        $dest = makeDestination();
+
+        foreach (['Shop', 'Blog'] as $name) {
+            BackupTarget::create([
+                'application_id' => ($this->makeApplication)($name)->id,
+                'storage_destination_id' => $dest->id,
+                'type' => 'full',
+                'retention_count' => 7,
+                'frequency' => 'daily',
+                'enabled' => true,
+            ]);
+        }
+
+        $response = $this->withHeaders(storageAdminAuthHeader())
+            ->deleteJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertStatus(422);
+
+        // The database's restrictOnDelete would have refused this too — as a
+        // 500 naming nothing. The point of the guard is the message.
+        $message = $response->json('errors.storage_destination.0');
+        expect($message)->toContain('Work S3')
+            ->and($message)->toContain('Blog')
+            ->and($message)->toContain('Shop');
+
+        expect(StorageDestination::find($dest->id))->not->toBeNull();
+    });
+
+    it('refuses to delete a destination a database\'s own backup schedule points at, naming the database', function () {
+        $dest = makeDestination();
+        $db = Database::create(['name' => 'ledger', 'engine' => 'mysql']);
+
+        // No backup taken yet: only the schedule holds the destination.
+        BackupTarget::create([
+            'database_id' => $db->id,
+            'storage_destination_id' => $dest->id,
+            'type' => 'database',
+            'retention_count' => 3,
+            'frequency' => 'daily',
+            'enabled' => true,
+        ]);
+
+        $message = $this->withHeaders(storageAdminAuthHeader())
+            ->deleteJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertStatus(422)
+            ->json('errors.storage_destination.0');
+
+        expect($message)->toBe(__('storage.delete.in_use_by_databases', ['name' => 'Work S3', 'databases' => 'ledger']));
+        expect(StorageDestination::find($dest->id))->not->toBeNull();
+    });
+
+    it('collapses a long list of applications into a count', function () {
+        $dest = makeDestination();
+
+        foreach (range(1, 8) as $i) {
+            BackupTarget::create([
+                'application_id' => ($this->makeApplication)("Site{$i}")->id,
+                'storage_destination_id' => $dest->id,
+                'type' => 'full',
+                'retention_count' => 7,
+                'frequency' => 'daily',
+                'enabled' => true,
+            ]);
+        }
+
+        $message = $this->withHeaders(storageAdminAuthHeader())
+            ->deleteJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertStatus(422)
+            ->json('errors.storage_destination.0');
+
+        // Five named, the rest counted — a destination shared by forty sites
+        // must not produce a multi-kilobyte error string.
+        expect($message)->toContain('Site5')
+            ->and($message)->not->toContain('Site6')
+            ->and($message)->toContain('3 more');
+    });
+
+    /*
+     * The target can be repointed while its old backups stay where they were written. The
+     * database would refuse this too (restrictOnDelete), but as a 500 naming nothing.
+     */
+    it('refuses to delete a destination that still holds backups, even with no target pointing at it', function () {
+        $old = makeDestination();
+        $new = makeDestination(['name' => 'New S3']);
+
+        $target = BackupTarget::create([
+            'application_id' => ($this->makeApplication)('Shop')->id,
+            'storage_destination_id' => $new->id,
+            'type' => 'full',
+            'retention_count' => 7,
+            'frequency' => 'daily',
+            'enabled' => true,
+        ]);
+
+        // forceCreate: the destination is deliberately not fillable (the model
+        // stamps the target's current one), and here it must be the old one.
+        foreach (range(1, 2) as $_) {
+            Backup::forceCreate([
+                'backup_target_id' => $target->id,
+                'application_id' => $target->application_id,
+                'storage_destination_id' => $old->id,
+                'type' => 'full',
+                'status' => 'verified',
+                'manifest' => ['key' => 'shop/old.tar.gz'],
+            ]);
+        }
+
+        $message = $this->withHeaders(storageAdminAuthHeader())
+            ->deleteJson("/api/integrations/storage/destinations/{$old->id}")
+            ->assertStatus(422)
+            ->json('errors.storage_destination.0');
+
+        expect($message)->toBe(__('storage.delete.holds_backups', ['name' => 'Work S3', 'count' => 2]))
+            ->and(StorageDestination::find($old->id))->not->toBeNull()
+            ->and(Backup::count())->toBe(2);
+    });
+
+    it('deletes once the last backup target is gone', function () {
+        $dest = makeDestination();
+
+        $target = BackupTarget::create([
+            'application_id' => ($this->makeApplication)('Shop')->id,
+            'storage_destination_id' => $dest->id,
+            'type' => 'full',
+            'retention_count' => 7,
+            'frequency' => 'daily',
+            'enabled' => true,
+        ]);
+
+        $target->delete();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->deleteJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertNoContent();
+
+        expect(StorageDestination::find($dest->id))->toBeNull();
+    });
+});
+
+describe('the persisted test result', function () {
+    it('starts as never tested', function () {
+        $dest = makeDestination();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->getJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertOk()
+            // Null, not false: "never asked" and "asked and it failed" are
+            // different answers and the UI shows different things for them.
+            ->assertJsonPath('storage_destination.last_test_success', null)
+            ->assertJsonPath('storage_destination.last_tested_at', null)
+            ->assertJsonPath('storage_destination.status', 'never_tested')
+            ->assertJsonPath('storage_destination.status_title', 'Not yet tested');
+    });
+
+    it('survives a reload after a successful probe', function () {
+        $dest = makeDestination();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk();
+
+        // A second request, as if the user navigated away and came back.
+        $response = $this->withHeaders(storageAdminAuthHeader())
+            ->getJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertOk()
+            ->assertJsonPath('storage_destination.last_test_success', true)
+            ->assertJsonPath('storage_destination.last_test_error', null)
+            ->assertJsonPath('storage_destination.status', 'connected');
+
+        expect($response->json('storage_destination.last_tested_at'))->not->toBeNull()
+            ->and($response->json('storage_destination.last_tested_at_human'))->not->toBeNull();
+    });
+
+    it('records a failure as its stable category, never the raw exception', function () {
+        $dest = makeDestination();
+
+        $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+            fn (array $config) => new class
+            {
+                public function put(string $key, mixed $contents, array $options = []): bool
+                {
+                    throw new RuntimeException('InvalidAccessKeyId: AKIA_secret_value is not valid');
+                }
+            },
+        ));
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk();
+
+        $response = $this->withHeaders(storageAdminAuthHeader())
+            ->getJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertOk()
+            ->assertJsonPath('storage_destination.last_test_success', false)
+            ->assertJsonPath('storage_destination.last_test_error', 'invalid_credentials')
+            ->assertJsonPath('storage_destination.status', 'failed');
+
+        // The SDK's text can carry a partial access key. Only the category
+        // is stored, so it can never resurface in a later response.
+        expect($response->getContent())->not->toContain('AKIA_secret_value');
+    });
+
+    it('forgets the result when the credentials are rotated', function () {
+        $dest = makeDestination();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk();
+
+        // A green tick describing keys that were replaced a moment ago is
+        // worse than no tick at all.
+        $this->withHeaders(storageAdminAuthHeader())
+            ->patchJson("/api/integrations/storage/destinations/{$dest->id}", [
+                'config' => ['access_key' => 'AKIA_rotated', 'secret_key' => 'rotated_secret'],
+            ])
+            ->assertOk()
+            ->assertJsonPath('storage_destination.status', 'never_tested')
+            ->assertJsonPath('storage_destination.last_test_success', null);
+    });
+
+    it('forgets the result when the host changes, not only the credentials', function () {
+        $dest = StorageDestination::create([
+            'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+            'config' => ['host' => 'old.example.com', 'username' => 'u', 'password' => 'p'],
+        ]);
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")->assertOk();
+
+        // The old invalidation list was five hardcoded S3 column names, right for one provider only.
+        // A host change slipping past it leaves a green badge for a destination no longer in use.
+        $this->withHeaders(storageAdminAuthHeader())
+            ->patchJson("/api/integrations/storage/destinations/{$dest->id}", [
+                'config' => ['host' => 'new.example.com'],
+            ])
+            ->assertOk()
+            ->assertJsonPath('storage_destination.status', 'never_tested');
+    });
+
+    it('keeps the result when only the display name changes', function () {
+        $dest = makeDestination();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk();
+
+        // A rename does not change what the panel talks to.
+        $this->withHeaders(storageAdminAuthHeader())
+            ->patchJson("/api/integrations/storage/destinations/{$dest->id}", ['name' => 'Renamed'])
+            ->assertOk()
+            ->assertJsonPath('storage_destination.status', 'connected');
+    });
+});
+
+it('has copy for every provider, status and failure category in every locale', function () {
+    foreach (config('app.available_locales') as $locale) {
+        app()->setLocale($locale);
+
+        foreach (StorageProvider::cases() as $provider) {
+            expect(__('storage.drivers.'.$provider->value))->not->toBe('storage.drivers.'.$provider->value);
+        }
+
+        foreach (['connected', 'never_tested', 'failed'] as $status) {
+            expect(__('storage.status.'.$status))->not->toBe('storage.status.'.$status);
+        }
+
+        // Every category a driver can return. A missing one shows the user a
+        // raw key at precisely the moment something has gone wrong.
+        foreach ([
+            'success', 'invalid_credentials', 'unreachable', 'mismatch',
+            'forbidden_host', 'invalid_endpoint', 'invalid_host',
+            'host_key_mismatch', 'invalid_private_key',
+            'bucket_not_found', 'wrong_region', 'tls_failed',
+        ] as $key) {
+            expect(__('storage.test.'.$key))->not->toBe('storage.test.'.$key);
+        }
+
+        foreach (['in_use', 'holds_backups', 'and_more'] as $key) {
+            expect(__('storage.delete.'.$key))->not->toBe('storage.delete.'.$key);
+        }
+
+        expect(__('storage.validation.sftp_auth_required'))->not->toBe('storage.validation.sftp_auth_required');
+        expect(__('storage.help.plain_ftp_warning'))->not->toBe('storage.help.plain_ftp_warning');
+    }
+
+    app()->setLocale('en');
+});
+
+it('probes a destination and reports success when write/read/delete all match', function () {
+    $dest = makeDestination();
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->postJson("/api/integrations/storage/destinations/{$dest->id}/test");
+
+    $response->assertOk();
+    expect($response->json('test.success'))->toBeTrue()
+        ->and($response->json('test.message'))->toBe('Connection succeeded.')
+        ->and($response->json('test.error_class'))->toBeNull()
+        ->and($response->json('test.latency_ms'))->toBeInt();
+});
+
+it('classifies a credentials failure as invalid_credentials without echoing the raw exception', function () {
+    $dest = makeDestination();
+
+    // Replace the faked disk with one whose get() throws as if the S3 SDK rejected the access
+    // key. The closure is left untyped on purpose: a `: Filesystem` return type would test PHP's
+    // type checks instead of the classifier.
+    $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+        fn (array $config) => new class
+        {
+            public function put(string $key, mixed $contents, array $options = []): bool
+            {
+                return true;
+            }
+
+            public function get(string $key): string
+            {
+                throw new RuntimeException('InvalidAccessKeyId: AKIA-leaked-into-stack.');
+            }
+
+            public function delete(string $path): bool
+            {
+                return true;
+            }
+        },
+    ));
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->postJson("/api/integrations/storage/destinations/{$dest->id}/test");
+
+    $response->assertOk();
+    expect($response->json('test.success'))->toBeFalse()
+        ->and($response->json('test.error_class'))->toBe('invalid_credentials');
+
+    // The classifier must NOT echo the raw exception text — it can contain
+    // signed URLs, AWS request ids, or partial credentials.
+    expect($response->getContent())->not->toContain('AKIA-leaked-into-stack');
+});
+
+it('classifies an unreachable host as unreachable', function () {
+    $dest = makeDestination();
+
+    $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+        fn (array $config) => new class
+        {
+            public function put(string $key, mixed $contents, array $options = []): bool
+            {
+                throw new RuntimeException('Could not resolve host s3.invalid.example (DNS timeout).');
+            }
+
+            public function get(string $key): string
+            {
+                return '';
+            }
+
+            public function delete(string $path): bool
+            {
+                return true;
+            }
+        },
+    ));
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->postJson("/api/integrations/storage/destinations/{$dest->id}/test");
+
+    $response->assertOk();
+    expect($response->json('test.error_class'))->toBe('unreachable');
+});
+
+it('treats a write/read mismatch as a failure (no silent pass)', function () {
+    $dest = makeDestination();
+
+    $this->app->bind(StorageConnectionProber::class, fn () => makeProber(
+        fn (array $config) => new class
+        {
+            public function put(string $key, mixed $contents, array $options = []): bool
+            {
+                return true;
+            }
+
+            // A CDN cache, a transparent proxy, or actual disk corruption can
+            // all surface here — none of which the panel should ever silently
+            // call "success".
+            public function get(string $key): string
+            {
+                return 'something-else';
+            }
+
+            public function delete(string $path): bool
+            {
+                return true;
+            }
+        },
+    ));
+
+    $response = $this->withHeaders(storageAdminAuthHeader())->postJson("/api/integrations/storage/destinations/{$dest->id}/test");
+
+    $response->assertOk();
+    expect($response->json('test.success'))->toBeFalse();
+});
+
+it('denies listing destinations without the storage permission', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/integrations/storage/destinations')
+        ->assertForbidden();
+});
+
+it('denies creating a destination with view-only access', function () {
+    $user = User::factory()->create();
+    grantPermission($user, 'storage', view: true, manage: false);
+    $token = $user->createToken('t')->plainTextToken;
+
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/integrations/storage/destinations', s3Payload(['name' => 'Should fail']));
+
+    $response->assertForbidden();
+    expect(StorageDestination::count())->toBe(0);
+});
+
+it('denies testing a destination with view-only access', function () {
+    $dest = makeDestination();
+
+    $user = User::factory()->create();
+    grantPermission($user, 'storage', view: true, manage: false);
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+        ->assertForbidden();
+});
+
+it('allows an authenticated user with the storage manage permission to do everything', function () {
+    $user = User::factory()->create();
+    grantPermission($user, 'storage', view: true, manage: true);
+    $token = $user->createToken('t')->plainTextToken;
+
+    // Listing
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/integrations/storage/destinations')
+        ->assertOk();
+
+    // Creating
+    $response = $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/integrations/storage/destinations', s3Payload(['name' => 'Permitted']));
+    $response->assertCreated();
+    $id = $response->json('storage_destination.id');
+
+    // Patching
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->patchJson("/api/integrations/storage/destinations/{$id}", ['name' => 'Renamed'])
+        ->assertOk()
+        ->assertJsonPath('storage_destination.name', 'Renamed');
+
+    // Deleting
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->deleteJson("/api/integrations/storage/destinations/{$id}")
+        ->assertNoContent();
+
+    expect(StorageDestination::count())->toBe(0);
+});
+
+it('returns a 404 for an unknown destination id', function () {
+    $this->withHeaders(storageAdminAuthHeader())
+        ->getJson('/api/integrations/storage/destinations/999999')
+        ->assertNotFound();
+});
+
+/*
+ * The tests above replace the prober's disk builder, so none executes the driver's config().
+ * These assert the config itself (`throw => false` once turned every real failure into a
+ * "bytes did not match" message).
+ */
+it('builds an S3 driver config that surfaces adapter errors instead of swallowing them', function () {
+    $dest = makeDestination();
+    $captured = null;
+
+    $prober = makeProber(function (array $config) use (&$captured) {
+        $captured = $config;
+
+        return test()->fakeDisk;
+    });
+
+    $prober->probe($dest);
+
+    // Without this the adapter returns null/false on failure, the probe falls
+    // into the read-back comparison, and classify() never runs.
+    expect($captured['throw'])->toBeTrue()
+        ->and($captured['driver'])->toBe('s3')
+        ->and($captured['bucket'])->toBe('backups-prod')
+        ->and($captured['root'])->toBe('app1/');
+});
+
+it('uses path-style addressing only when a custom endpoint is configured', function () {
+    $captured = [];
+
+    $prober = makeProber(function (array $config) use (&$captured) {
+        $captured[] = $config;
+
+        return test()->fakeDisk;
+    });
+
+    // Custom endpoint (self-hosted, Wasabi, B2) — these route through the path.
+    $prober->probe(makeDestination(['name' => 'Self-hosted', 'config' => ['endpoint' => 'https://s3.example.com']]));
+
+    // Empty endpoint *means* AWS, where path-style is deprecated and
+    // unsupported for buckets in regions launched after 2019.
+    $prober->probe(makeDestination(['name' => 'AWS', 'config' => ['endpoint' => '']]));
+
+    expect($captured[0]['use_path_style_endpoint'])->toBeTrue()
+        ->and($captured[1]['use_path_style_endpoint'])->toBeFalse()
+        ->and($captured[1]['endpoint'])->toBeNull();
+});
+
+/*
+ * Unlike the two above, this drives the real adapter. What matters is that the key survives
+ * Laravel's `?? false` read (FilesystemManager::createS3Driver) and reaches the wire as
+ * @http.stream; an injected http_handler is the only place that is observable without a bucket.
+ */
+it('sends GetObject as a streamed request so a large artefact never lands in memory', function () {
+    $destination = new StorageDestination([
+        'provider' => StorageProvider::S3,
+        'prefix' => '',
+        'config' => [
+            'access_key' => 'k',
+            'secret_key' => 's',
+            'region' => 'us-east-1',
+            'bucket' => 'backups-prod',
+            'endpoint' => null,
+        ],
+    ]);
+
+    $requestOptions = [];
+
+    $config = app(DestinationDisk::class)->config($destination);
+
+    // Passed straight through to the S3Client constructor, so the SDK resolves
+    // @http options against it instead of opening a socket.
+    $config['http_handler'] = function ($request, array $options) use (&$requestOptions) {
+        $requestOptions[] = $options;
+
+        return Create::promiseFor(new Response(200, [], 'artefact-bytes'));
+    };
+
+    Storage::build($config)->readStream('app1/restore.tar.gz');
+
+    // False here means Guzzle buffers the whole GetObject body in memory before readStream()
+    // returns, so DownloadArtifact would copy an already-loaded 5+ GB string and OOM the worker.
+    expect($requestOptions[0]['stream'] ?? false)->toBeTrue();
+});
+
+/*
+ * Every S3 failure used to read "The destination rejected the credentials": the classifier
+ * matched the class name `Aws\S3\Exception`, which the SDK throws for everything. These drive
+ * the real adapter and SDK through an injected http_handler and answer with what a provider
+ * really sends: an S3 error XML body, or the cURL errno Guzzle reports.
+ */
+describe('S3 failure classification', function () {
+    /**
+     * Probe a destination whose requests are answered by $answer.
+     *
+     * Goes through the SDK's real Guzzle handler: a bare http_handler skips the `http_errors`
+     * middleware, so a 404 would read as a successful upload.
+     */
+    function probeS3With(Response|Closure $answer): array
+    {
+        $destination = makeDestination();
+
+        $prober = makeProber(function (array $config) use ($answer) {
+            $mock = new MockHandler([$answer, $answer, $answer]);
+            $config['http_handler'] = new GuzzleHandler(new Client(['handler' => HandlerStack::create($mock)]));
+            // The SDK retries connection errors and 5xx; one answer per test.
+            $config['retries'] = 0;
+
+            return Storage::build($config);
+        });
+
+        return $prober->probe($destination);
+    }
+
+    function s3ErrorResponse(int $status, string $code): Response
+    {
+        return new Response($status, ['Content-Type' => 'application/xml'], '<?xml version="1.0" encoding="UTF-8"?>'
+            ."<Error><Code>{$code}</Code><Message>provider message</Message><RequestId>r1</RequestId></Error>");
+    }
+
+    /**
+     * What Guzzle's cURL handler raises: the errno sits in the handler
+     * context, where the classifier reads it.
+     */
+    function curlFailure(int $errno, bool $connect = true): Closure
+    {
+        return fn ($request) => Create::rejectionFor($connect
+            ? new ConnectException("cURL error {$errno}: failure", $request, null, ['errno' => $errno])
+            : new RequestException("cURL error {$errno}: failure", $request, null, null, ['errno' => $errno]));
+    }
+
+    // Plain values in the dataset, built inside the test: a closure there is
+    // handed over as-is, so it would be the handler's *return value*.
+    it('reports each failure as what it is', function (string $kind, int $value, string $detail, string $expected) {
+        $answer = $kind === 's3'
+            ? s3ErrorResponse($value, $detail)
+            : curlFailure($value, connect: $detail === 'connect');
+
+        $result = probeS3With($answer);
+
+        expect($result['success'])->toBeFalse()
+            ->and($result['error_class'])->toBe($expected)
+            ->and($result['message'])->toBe(__('storage.test.'.$expected));
+    })->with([
+        'wrong access key' => ['s3', 403, 'InvalidAccessKeyId', 'invalid_credentials'],
+        'wrong secret' => ['s3', 403, 'SignatureDoesNotMatch', 'invalid_credentials'],
+        'key without permission' => ['s3', 403, 'AccessDenied', 'invalid_credentials'],
+        'wrong bucket name' => ['s3', 404, 'NoSuchBucket', 'bucket_not_found'],
+        'wrong region (AWS)' => ['s3', 400, 'AuthorizationHeaderMalformed', 'wrong_region'],
+        'broken TLS handshake (cURL 35)' => ['curl', 35, 'connect', 'tls_failed'],
+        'untrusted certificate (cURL 60)' => ['curl', 60, 'request', 'tls_failed'],
+        'unknown host (cURL 6)' => ['curl', 6, 'connect', 'unreachable'],
+        'connection refused (cURL 7)' => ['curl', 7, 'connect', 'unreachable'],
+    ]);
+
+    // The old rule's whole failure: an S3 error that is not about keys must
+    // not be reported as one. A provider-side 500 is the plainest case.
+    it('does not call an unrelated S3 error a credentials problem', function () {
+        expect(probeS3With(s3ErrorResponse(500, 'InternalError'))['error_class'])
+            ->not->toBe('invalid_credentials');
+    });
+});
+
+/*
+ * Destinations hold backup credentials: creating, changing and deleting them must leave a
+ * trace in the activity log.
+ */
+it('records creating, updating and deleting a destination, without its credentials', function () {
+    $id = $this->withHeaders(storageAdminAuthHeader())
+        ->postJson('/api/integrations/storage/destinations', s3Payload())
+        ->assertCreated()
+        ->json('storage_destination.id');
+
+    $this->withHeaders(storageAdminAuthHeader())
+        ->patchJson("/api/integrations/storage/destinations/{$id}", ['name' => 'Renamed'])
+        ->assertOk();
+
+    $this->withHeaders(storageAdminAuthHeader())
+        ->deleteJson("/api/integrations/storage/destinations/{$id}")
+        ->assertSuccessful();
+
+    $rows = ActivityLog::where('type', 'storage_destination')->orderBy('id')->get();
+
+    expect($rows->pluck('action')->all())->toBe(['created', 'updated', 'deleted'])
+        ->and($rows->first()->properties)->toBe(['name' => 'New S3', 'provider' => 's3'])
+        ->and($rows->last()->properties)->toBe(['name' => 'Renamed'])
+        ->and(json_encode($rows->pluck('properties')))->not->toContain('secret_value');
+});
+
+it('refuses a folder that walks out of the bucket (bug #36)', function (string $prefix) {
+    $this->withHeaders(storageAdminAuthHeader())
+        ->postJson('/api/integrations/storage/destinations', s3Payload(['prefix' => $prefix]))
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('prefix');
+
+    $destination = makeDestination();
+
+    $this->withHeaders(storageAdminAuthHeader())
+        ->patchJson("/api/integrations/storage/destinations/{$destination->id}", ['prefix' => $prefix])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('prefix');
+})->with(['../x', 'a/../../b', '..', 'a/..']);
+
+it('still accepts a folder with dots in its names', function () {
+    $this->withHeaders(storageAdminAuthHeader())
+        ->postJson('/api/integrations/storage/destinations', s3Payload(['prefix' => 'site.v2/..backups/']))
+        ->assertJsonMissingValidationErrors('prefix');
+});
+
+/*
+| FTPS destinations pin the server certificate on first use, like an SFTP host key; without
+| the pin an impostor in between would receive the password and every backup.
+*/
+
+/** The FTPS server presents this certificate fingerprint (null = unreadable). */
+function ftpsPresents(?string $fingerprint): void
+{
+    app()->instance(FtpsCertificate::class, new FtpsCertificate(fn (): ?string => $fingerprint));
+}
+
+function ftpsDestination(array $config = []): StorageDestination
+{
+    return StorageDestination::create([
+        'name' => 'NAS', 'provider' => StorageProvider::Ftp, 'prefix' => null,
+        'config' => array_merge(['host' => 'backup.example.com', 'username' => 'u', 'password' => 'p'], $config),
+    ]);
+}
+
+describe('FTPS certificate pinning (FTP-01)', function () {
+    it('records the certificate the first time and shows it', function () {
+        ftpsPresents('sha256:aa11');
+        $dest = ftpsDestination();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.success', true);
+
+        expect($dest->fresh()->configValue('tls_fingerprint'))->toBe('sha256:aa11');
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->getJson("/api/integrations/storage/destinations/{$dest->id}")
+            ->assertJsonPath('storage_destination.config.tls_fingerprint', 'sha256:aa11');
+    });
+
+    it('refuses a different certificate, on the test and before any backup connects', function () {
+        $dest = ftpsDestination(['tls_fingerprint' => 'sha256:aa11']);
+        ftpsPresents('sha256:bb22');
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertOk()
+            ->assertJsonPath('test.success', false)
+            ->assertJsonPath('test.error_class', 'tls_certificate_changed');
+
+        // The disk every backup and restore uses is built only after this.
+        expect(fn () => app(DestinationDisk::class)->for($dest->fresh()))
+            ->toThrow(FtpsCertificateException::class);
+
+        // And the pin did not follow the impostor.
+        expect($dest->fresh()->configValue('tls_fingerprint'))->toBe('sha256:aa11');
+    });
+
+    it('refuses when the pinned server\'s certificate cannot be read', function () {
+        $dest = ftpsDestination(['tls_fingerprint' => 'sha256:aa11']);
+        ftpsPresents(null);
+
+        expect(fn () => app(DestinationDisk::class)->for($dest))
+            ->toThrow(FtpsCertificateException::class, 'storage.test.tls_certificate_unreadable');
+    });
+
+    it('trusts a renewed certificate when asked, and pins the new one', function () {
+        $dest = ftpsDestination(['tls_fingerprint' => 'sha256:aa11']);
+        ftpsPresents('sha256:bb22');
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->patchJson("/api/integrations/storage/destinations/{$dest->id}", ['config' => ['trust_new_certificate' => true]])
+            ->assertOk();
+
+        expect($dest->fresh()->configValue('tls_fingerprint'))->toBeNull()
+            ->and($dest->fresh()->configValue('trust_new_certificate'))->toBeNull();
+
+        $this->withHeaders(storageAdminAuthHeader())
+            ->postJson("/api/integrations/storage/destinations/{$dest->id}/test")
+            ->assertJsonPath('test.success', true);
+
+        expect($dest->fresh()->configValue('tls_fingerprint'))->toBe('sha256:bb22');
+    });
+
+    it('checks nothing for plain FTP, which has no certificate', function () {
+        $dest = ftpsDestination(['ssl' => false, 'tls_fingerprint' => 'sha256:aa11']);
+        ftpsPresents('sha256:bb22');
+
+        app(DestinationDisk::class)->for($dest);
+
+        expect(true)->toBeTrue();
+    });
+});

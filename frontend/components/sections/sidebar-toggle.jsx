@@ -1,0 +1,29 @@
+import { useTranslations } from "next-intl";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
+import { ShortcutHint } from "@/components/ui/shortcut-hint";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
+export function SidebarToggle() {
+  const t = useTranslations("common");
+  const { state } = useSidebar();
+  const label =
+    state === "collapsed" ? t("expandSidebar") : t("collapseSidebar");
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="mr-2 inline-flex">
+          <SidebarTrigger className="border bg-background shadow-xs hover:bg-accent" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right">
+        {label}
+        <ShortcutHint letter="B" className="border-background/25 bg-background/15 text-background" />
+      </TooltipContent>
+    </Tooltip>
+  );
+}

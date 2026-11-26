@@ -1,0 +1,89 @@
+import { useTranslations, useFormatter } from "next-intl";
+import { HardDrive } from "lucide-react";
+import { formatRate } from "@/lib/format/bytes";
+import { clockFormatter } from "@/lib/format/time";
+import { ChartPill, LiveChartCard } from "@/components/dashboard/live-chart-card";
+import { EChart, useChartTokens } from "@/components/ui/echart";
+import {
+  axisMax,
+  seriesDataTable,
+  timeSeriesOption,
+} from "@/lib/charts/time-series-option";
+
+const TOKENS = [
+  "chart-1",
+  "chart-2",
+  "chart-3",
+  "chart-4",
+  "chart-5",
+  "border",
+  "muted-foreground",
+  "popover",
+  "popover-foreground",
+];
+
+export function DiskIoChart({ series: chartSeries, metrics, timeZone, stale }) {
+  const t = useTranslations("serverDashboard");
+  const format = useFormatter();
+  const rate = (value) => formatRate(value, format);
+  const clock = clockFormatter(format, timeZone, { second: "2-digit" });
+  const ops = (value) => format.number(Number(value ?? 0));
+  const tokens = useChartTokens(TOKENS);
+
+  const series = [
+    { key: "disk_read", label: t("charts.disk.read"), token: "chart-3", kind: "area" },
+    { key: "disk_write", label: t("charts.disk.write"), token: "chart-5", kind: "area" },
+  ];
+
+  const option = timeSeriesOption({
+    legend: false,
+    data: chartSeries,
+    series,
+    tokens,
+    xLabel: clock,
+    value: rate,
+    axes: [
+      {
+        max: axisMax(chartSeries, ["disk_read", "disk_write"], { floor: 65536 }),
+        formatter: rate,
+      },
+    ],
+  });
+  const table = seriesDataTable({
+    caption: t("charts.disk.title"),
+    timeLabel: t("charts.time"),
+    data: chartSeries,
+    series,
+    xLabel: clock,
+    value: rate,
+  });
+
+  return (
+    <LiveChartCard
+      headingLevel="h2"
+      plotHeight="h-52"
+      icon={HardDrive}
+      title={t("charts.disk.title")}
+      ready={chartSeries.length >= 2}
+      stale={stale}
+      badges={
+        <>
+          <ChartPill
+            dotClassName="bg-chart-3"
+            label={t("charts.disk.read")}
+            value={rate(metrics?.disk_io?.read)}
+            note={t("charts.disk.iops", { ops: ops(metrics?.disk_io?.read_ops) })}
+          />
+          <ChartPill
+            dotClassName="bg-chart-5"
+            label={t("charts.disk.write")}
+            value={rate(metrics?.disk_io?.write)}
+            note={t("charts.disk.iops", { ops: ops(metrics?.disk_io?.write_ops) })}
+          />
+        </>
+      }
+    >
+      <EChart option={option} dataTable={table} height="h-52" />
+    </LiveChartCard>
+  );
+}

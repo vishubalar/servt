@@ -1,0 +1,738 @@
+<?php
+
+namespace App\Services\Server\Metrics;
+
+use App\Exceptions\Server\Process\ProcessKillException;
+use App\Services\Server\Applications\DnsVerifier;
+use App\Services\Server\Capabilities\ServerCapabilities;
+use App\Services\Server\Databases\DatabaseManager;
+use App\Services\Server\HostCpus;
+use App\Services\Server\ProcessKiller;
+use App\Services\Server\ServerOps;
+use App\Services\Server\ServerPublicIp;
+use App\Support\Bytes;
+use App\Support\CommandRedactor;
+use Illuminate\Support\Facades\Cache;
+
+/**
+ * Reads server facts + live metrics cheaply from `/proc` (+ df / small probes).
+ * Everything is world-readable, so this works without root (detect-don't-trust).
+ *
+ * CPU, network and disk I/O are cumulative counters, so each needs two readings to become a rate.
+ * `snapshot()` (the 5-min background collector) takes its own by waiting; `live()` (polled by the
+ * dashboard) measures against the previous poll's reading, so a request never sleeps and holds a
+ * php-fpm worker.
+ */
+class ServerMetrics
+{
+    /** Where the previous poll's counter readings are kept. */
+    private const COUNTER_CACHE_KEY = 'server-metrics:counters';
+
+    private const COUNTER_CACHE_TTL = 600;
+
+    public function __construct(
+        private ServerOps $serverOps,
+        private DnsVerifier $dns,
+        private ServerPublicIp $publicIp,
+        private ServerCapabilities $capabilities,
+        private DatabaseManager $databases,
+        private ProcessKiller $killer,
+    ) {}
+
+    /**
+     * Flat percent sample stored per 5-min tick (drives the CPU/Mem/Disk/Load
+     * history charts).
+     *
+     * @return array<string, int|float>
+     */
+    public function snapshot(): array
+    {
+        $memory = $this->memoryUsage();
+        $swap = $this->swapUsage();
+        $disk = $this->diskUsage();
+        [$load1, $load5, $load15] = $this->load();
+
+        // The collector runs in the background, so it can afford to measure
+        // its own window and produce a sample that stands on its own.
+        $rates = $this->ratesBySampling();
+
+        return [
+            'cpu_percent' => $rates['cpu_percent'],
+            'memory_percent' => $memory['percent'],
+            'swap_percent' => $swap['percent'],
+            // The history chart needs a number; an unread disk is a gap at 0.
+            'disk_percent' => $disk['percent'] ?? 0,
+            'load_1' => $load1,
+            'load_5' => $load5,
+            'load_15' => $load15,
+            'net_in' => $rates['net_in'],
+            'net_out' => $rates['net_out'],
+            'disk_read' => $rates['disk_read'],
+            'disk_write' => $rates['disk_write'],
+        ];
+    }
+
+    /**
+     * Live snapshot for the dashboard gauges — each resource as
+     * total / used / free / percent (+ human) so the UI can show a full
+     * breakdown, not just a percentage. Poll this for live gauges + the
+     * network stream chart.
+     *
+     * @return array<string, mixed>
+     */
+    public function live(): array
+    {
+        [$load1, $load5, $load15] = $this->load();
+
+        // Measured against the previous poll — this endpoint must not sleep.
+        $rates = $this->ratesFromPreviousRead();
+        $netIn = $rates['net_in'];
+        $netOut = $rates['net_out'];
+
+        return [
+            'cpu' => ['percent' => $rates['cpu_percent'], 'cores' => $this->cpuCores()],
+            'memory' => $this->withHuman($this->memoryUsage()),
+            'swap' => $this->withHuman($this->swapUsage()),
+            'disk' => $this->withHuman($this->diskUsage()),
+            'load' => ['1' => $load1, '5' => $load5, '15' => $load15],
+            'network' => [
+                'in' => $netIn,
+                'out' => $netOut,
+                'in_human' => Bytes::human($netIn).'/s',
+                'out_human' => Bytes::human($netOut).'/s',
+            ],
+            // Throughput and IOPS: on a database server "slow disk" usually means operations per
+            // second, and both come off the same counters.
+            'disk_io' => [
+                'read' => $rates['disk_read'],
+                'write' => $rates['disk_write'],
+                'read_human' => Bytes::human((int) $rates['disk_read']).'/s',
+                'write_human' => Bytes::human((int) $rates['disk_write']).'/s',
+                'read_ops' => $rates['disk_read_ops'],
+                'write_ops' => $rates['disk_write_ops'],
+            ],
+        ];
+    }
+
+    /**
+     * The facts that move between two loads of the dashboard.
+     *
+     * @return array{uptime: mixed, reboot_required: bool}
+     */
+    public function volatileFacts(): array
+    {
+        return [
+            'uptime' => $this->uptime(),
+            'reboot_required' => is_file((string) config('server.reboot_required_file', '/var/run/reboot-required')),
+        ];
+    }
+
+    /**
+     * Static-ish server facts for the dashboard info card.
+     *
+     * @return array<string, mixed>
+     */
+    public function facts(): array
+    {
+        $memory = $this->memoryUsage();
+        $disk = $this->diskUsage();
+
+        return [
+            'hostname' => $this->cmd(['hostname', '--fqdn']) ?: (string) gethostname(),
+            'os' => $this->osName(),
+            'kernel' => $this->cmd(['uname', '-r']),
+            'arch' => $this->cmd(['uname', '-m']),
+            'uptime' => $this->uptime(),
+            // The machine's own interface address. Behind NAT it is a 10.x/172.x and is *not*
+            // the address to point DNS at.
+            'ip' => $this->primaryIp(),
+            // The address the internet reaches this server on, or null when it cannot be known.
+            'public_ip' => $this->publicIp->detect(fn () => $this->dns->serverIp()),
+            'cpu' => ['model' => $this->cpuModel(), 'cores' => $this->cpuCores()],
+            'memory_total' => $memory['total'],
+            'memory_total_human' => Bytes::human((int) $memory['total']),
+            'disk_total' => $disk['total'],
+            'disk_total_human' => $disk['total'] === null ? null : Bytes::human((int) $disk['total']),
+            // Null when timedatectl does not answer, not a guessed UTC.
+            'timezone' => $this->cmd(['timedatectl', 'show', '--property=Timezone', '--value']) ?: null,
+            'reboot_required' => is_file((string) config('server.reboot_required_file', '/var/run/reboot-required')),
+            'runtimes' => $this->runtimes(),
+        ];
+    }
+
+    /**
+     * Top processes by CPU (server process table), and how many there are.
+     *
+     * `total` is every process the box is running, not the length of the returned top-N list,
+     * so it changes when a process is stopped. It is counted in the same pass over the rows `ps`
+     * already printed, not a second `ps` taken at a different moment.
+     *
+     * @return array{processes: array<int, array<string, mixed>>, total: int, limit: int}
+     */
+    public function processes(): array
+    {
+        $limit = (int) config('server.metrics.processes_limit', 25);
+
+        $output = $this->serverOps->run(
+            ['ps', '-eo', 'pid,user:20,%cpu,%mem,args', '--sort=-%cpu'],
+            ['feature' => 'dashboard', 'op' => 'processes'],
+        )->output();
+
+        $processes = [];
+        $total = 0;
+        $placement = null;
+
+        foreach (array_slice(preg_split('/\r?\n/', trim($output)) ?: [], 1) as $line) {
+            $parts = preg_split('/\s+/', trim($line), 5);
+            if (count($parts) < 5 || $this->isProcessProbe($parts[4])) {
+                continue;
+            }
+
+            // Counted before the limit is applied, and only for rows that
+            // would have been shown (the probe row is excluded).
+            $total++;
+
+            if (count($processes) >= $limit) {
+                continue;
+            }
+
+            $placement ??= $this->processPlacement();
+            $refusal = $this->refusalFor((int) $parts[0], $placement);
+
+            $processes[] = [
+                'pid' => (int) $parts[0],
+                'user' => $parts[1],
+                'cpu' => (float) $parts[2],
+                'memory' => (float) $parts[3],
+                // Keep the complete argv for diagnosis, but never let a
+                // credential-bearing option cross the API boundary.
+                'command' => CommandRedactor::line($parts[4]),
+                // So the screen does not offer Stop on processes the endpoint refuses.
+                'stoppable' => $refusal === null,
+                'reason' => $refusal === null ? null : ProcessKillException::refused($refusal)->reason(),
+            ];
+        }
+
+        return ['processes' => $processes, 'total' => $total, 'limit' => $limit];
+    }
+
+    /**
+     * Parent, unit and short name for every process, from one `ps` call —
+     * what ProcessKiller::refusal() needs, without a command per row.
+     *
+     * `comm` last because it is the only column that can hold a space. Read
+     * after the list, so a listed process that exited in between is absent
+     * here — see refusalFor().
+     *
+     * @return array<int, array{ppid: int, unit: ?string, command: string}>
+     */
+    private function processPlacement(): array
+    {
+        $output = $this->serverOps->run(
+            ['ps', '-eo', 'pid=,ppid=,unit=,comm='],
+            ['feature' => 'dashboard', 'op' => 'process_units'],
+        )->output();
+
+        $placement = [];
+
+        foreach (preg_split('/\r?\n/', trim($output)) ?: [] as $line) {
+            $parts = preg_split('/\s+/', trim($line), 4);
+
+            if (count($parts) < 4 || ! ctype_digit($parts[0])) {
+                continue;
+            }
+
+            $unit = preg_replace('/\.service$/', '', $parts[2]);
+
+            $placement[(int) $parts[0]] = [
+                'ppid' => (int) $parts[1],
+                'unit' => $unit === '-' || $unit === '' ? null : $unit,
+                'command' => $parts[3],
+            ];
+        }
+
+        return $placement;
+    }
+
+    /**
+     * The refusal Stop would give this process, asked of the same rules.
+     *
+     * A process missing from the placement list exited between the two `ps` calls, so Stop is not
+     * offered. An empty list means the second `ps` failed: the button stays offered and the
+     * endpoint, which checks again, has the last word.
+     *
+     * @param  array<int, array{ppid: int, unit: ?string, command: string}>  $placement
+     */
+    private function refusalFor(int $pid, array $placement): ?string
+    {
+        if ($placement === []) {
+            return null;
+        }
+
+        if (! isset($placement[$pid])) {
+            return 'gone';
+        }
+
+        $process = $placement[$pid];
+
+        return $this->killer->refusal($pid, $process['command'], $process['ppid'], $process['unit']);
+    }
+
+    /**
+     * The short-lived command gathering this list is not a workload and must
+     * not appear as something the user can inspect or stop. Match the complete
+     * argv so an unrelated ps command remains visible.
+     */
+    private function isProcessProbe(string $command): bool
+    {
+        $arguments = preg_split('/\s+/', trim($command)) ?: [];
+
+        if (basename((string) ($arguments[0] ?? '')) !== 'ps') {
+            return false;
+        }
+
+        return array_slice($arguments, 1) === [
+            '-eo',
+            'pid,user:20,%cpu,%mem,args',
+            '--sort=-%cpu',
+        ];
+    }
+
+    // ---- usage breakdowns (total / used / free / percent) ----
+
+    /**
+     * @return array{total: int, used: int, free: int, percent: float}
+     */
+    private function memoryUsage(): array
+    {
+        $m = $this->meminfo();
+        $total = ($m['MemTotal'] ?? 0) * 1024;
+        $available = ($m['MemAvailable'] ?? 0) * 1024;
+
+        return $this->usage($total, max(0, $total - $available), $available);
+    }
+
+    /**
+     * @return array{total: int, used: int, free: int, percent: float}
+     */
+    private function swapUsage(): array
+    {
+        $m = $this->meminfo();
+        $total = ($m['SwapTotal'] ?? 0) * 1024;
+        $free = ($m['SwapFree'] ?? 0) * 1024;
+
+        return $this->usage($total, max(0, $total - $free), $free);
+    }
+
+    /**
+     * Null fields when `df` did not answer, so a full disk and an unread one look different.
+     *
+     * @return array{total: ?int, used: ?int, free: ?int, percent: ?float}
+     */
+    private function diskUsage(): array
+    {
+        $result = $this->serverOps->run(
+            ['df', '-B1', '-P', (string) config('server.disk_path', '/')],
+            ['feature' => 'dashboard', 'op' => 'disk'],
+        );
+
+        $lines = array_values(array_filter(preg_split('/\r?\n/', trim($result->output())) ?: []));
+        $row = preg_split('/\s+/', trim((string) end($lines))) ?: [];
+
+        if ($result->failed() || ! ctype_digit((string) ($row[1] ?? '')) || (int) $row[1] === 0) {
+            return ['total' => null, 'used' => null, 'free' => null, 'percent' => null];
+        }
+
+        return $this->usage((int) $row[1], (int) ($row[2] ?? 0), (int) ($row[3] ?? 0));
+    }
+
+    /**
+     * @return array{total: int, used: int, free: int, percent: float}
+     */
+    private function usage(int $total, int $used, int $free): array
+    {
+        return [
+            'total' => $total,
+            'used' => $used,
+            'free' => $free,
+            'percent' => $total > 0 ? round($used / $total * 100, 2) : 0.0,
+        ];
+    }
+
+    /**
+     * @param  array{total: int, used: int, free: int, percent: float}  $usage
+     * @return array<string, int|float|string>
+     */
+    private function withHuman(array $usage): array
+    {
+        return [
+            ...$usage,
+            'total_human' => $usage['total'] === null ? null : Bytes::human($usage['total']),
+            'used_human' => $usage['used'] === null ? null : Bytes::human($usage['used']),
+            'free_human' => $usage['free'] === null ? null : Bytes::human($usage['free']),
+        ];
+    }
+
+    // ---- rate/instant metric helpers ----
+
+    /**
+     * @return array{0: float, 1: float, 2: float}
+     */
+    private function load(): array
+    {
+        $parts = preg_split('/\s+/', trim($this->proc('loadavg')));
+
+        return [(float) ($parts[0] ?? 0), (float) ($parts[1] ?? 0), (float) ($parts[2] ?? 0)];
+    }
+
+    /**
+     * Every cumulative counter this class turns into a rate, read together so
+     * a rate window can be shared (one sleep per poll, not per metric).
+     *
+     * @return array<string, int>
+     */
+    private function counters(): array
+    {
+        [$cpuTotal, $cpuIdle] = $this->cpuTimes();
+        [$netIn, $netOut] = $this->netTotals();
+        $disk = $this->diskTotals();
+
+        return [
+            'cpu_total' => $cpuTotal,
+            'cpu_idle' => $cpuIdle,
+            'net_in' => $netIn,
+            'net_out' => $netOut,
+            'disk_read' => $disk['read'],
+            'disk_write' => $disk['write'],
+            'disk_read_ops' => $disk['read_ops'],
+            'disk_write_ops' => $disk['write_ops'],
+        ];
+    }
+
+    /**
+     * Rates measured over a sleep — one self-contained sample, for the
+     * background collector where waiting a second costs nothing.
+     *
+     * @return array<string, int|float>
+     */
+    private function ratesBySampling(): array
+    {
+        $before = $this->counters();
+        $started = microtime(true);
+        $this->tick();
+        $after = $this->counters();
+
+        return $this->rates($before, $after, max(0.001, microtime(true) - $started));
+    }
+
+    /**
+     * Rates measured against the previous request's reading.
+     *
+     * The gap between two polls is already a measurement window, so the request never sleeps
+     * (sleeping would hold a php-fpm worker per open dashboard). The first poll has nothing to
+     * compare against and reports zero.
+     *
+     * @return array<string, int|float>
+     */
+    private function ratesFromPreviousRead(): array
+    {
+        $now = microtime(true);
+        $current = $this->counters();
+        $previous = Cache::get(self::COUNTER_CACHE_KEY);
+
+        Cache::put(self::COUNTER_CACHE_KEY, ['counters' => $current, 'at' => $now], self::COUNTER_CACHE_TTL);
+
+        if (! is_array($previous)) {
+            return $this->rates($current, $current, 1.0);
+        }
+
+        $elapsed = $now - (float) $previous['at'];
+        $window = (int) config('server.metrics.rate_window', 120);
+
+        // Too close together to measure, or so far apart that the average
+        // describes a window nobody is watching any more.
+        if ($elapsed < 0.2 || $elapsed > $window) {
+            return $this->rates($current, $current, 1.0);
+        }
+
+        return $this->rates($previous['counters'], $current, $elapsed);
+    }
+
+    /**
+     * @param  array<string, int>  $before
+     * @param  array<string, int>  $after
+     * @return array<string, int|float>
+     */
+    private function rates(array $before, array $after, float $seconds): array
+    {
+        $delta = fn (string $key) => max(0, ($after[$key] ?? 0) - ($before[$key] ?? 0));
+        $perSecond = fn (string $key) => (int) round($delta($key) / $seconds);
+
+        $cpuTotal = $delta('cpu_total');
+        $cpuIdle = $delta('cpu_idle');
+
+        return [
+            'cpu_percent' => $cpuTotal > 0 ? round(max(0, $cpuTotal - $cpuIdle) / $cpuTotal * 100, 2) : 0.0,
+            'net_in' => $perSecond('net_in'),
+            'net_out' => $perSecond('net_out'),
+            'disk_read' => $perSecond('disk_read'),
+            'disk_write' => $perSecond('disk_write'),
+            'disk_read_ops' => $perSecond('disk_read_ops'),
+            'disk_write_ops' => $perSecond('disk_write_ops'),
+        ];
+    }
+
+    /**
+     * @return array{0: int, 1: int}
+     */
+    private function cpuTimes(): array
+    {
+        foreach (preg_split('/\r?\n/', $this->proc('stat')) ?: [] as $line) {
+            if (str_starts_with($line, 'cpu ')) {
+                $values = array_map('intval', array_slice(preg_split('/\s+/', trim($line)), 1));
+
+                return [array_sum($values), ($values[3] ?? 0) + ($values[4] ?? 0)]; // total, idle+iowait
+            }
+        }
+
+        return [0, 0];
+    }
+
+    /**
+     * Cumulative disk counters, summed over whole physical disks only.
+     *
+     * /proc/diskstats lists partitions alongside their parent disk and loop devices alongside
+     * both, so summing every line double-counts. Only whole devices (present in /sys/block) of a
+     * real disk type are counted, which also skips device-mapper nodes on an LVM box.
+     *
+     * @return array{read: int, write: int, read_ops: int, write_ops: int}
+     */
+    private function diskTotals(): array
+    {
+        $totals = ['read' => 0, 'write' => 0, 'read_ops' => 0, 'write_ops' => 0];
+
+        foreach (preg_split('/\r?\n/', $this->proc('diskstats')) ?: [] as $line) {
+            $fields = preg_split('/\s+/', trim($line));
+
+            if ($fields === false || count($fields) < 10) {
+                continue;
+            }
+
+            if (! $this->isWholeDisk((string) $fields[2])) {
+                continue;
+            }
+
+            // Sectors in diskstats are always 512 bytes, regardless of the
+            // device's own sector size.
+            $totals['read_ops'] += (int) $fields[3];
+            $totals['read'] += (int) $fields[5] * 512;
+            $totals['write_ops'] += (int) $fields[7];
+            $totals['write'] += (int) $fields[9] * 512;
+        }
+
+        return $totals;
+    }
+
+    private function isWholeDisk(string $device): bool
+    {
+        $pattern = (string) config('server.metrics.disk_devices', '/^(sd|nvme|vd|xvd|hd|md)/');
+
+        if (preg_match($pattern, $device) !== 1) {
+            return false;
+        }
+
+        // /sys/block holds whole devices only — partitions live beneath them,
+        // so this is what separates sda from sda1.
+        return is_dir(rtrim((string) config('server.sys_block', '/sys/block'), '/')."/{$device}");
+    }
+
+    /**
+     * @return array{0: int, 1: int}
+     */
+    private function netTotals(): array
+    {
+        $rx = 0;
+        $tx = 0;
+        foreach (preg_split('/\r?\n/', $this->proc('net/dev')) ?: [] as $line) {
+            if (! str_contains($line, ':')) {
+                continue;
+            }
+            [$iface, $data] = explode(':', $line, 2);
+            if (in_array(trim($iface), ['lo', ''], true)) {
+                continue;
+            }
+            $fields = preg_split('/\s+/', trim($data));
+            $rx += (int) ($fields[0] ?? 0);
+            $tx += (int) ($fields[8] ?? 0);
+        }
+
+        return [$rx, $tx];
+    }
+
+    // ---- facts helpers ----
+
+    private function osName(): string
+    {
+        $path = (string) config('server.os_release', '/etc/os-release');
+        if (is_file($path) && preg_match('/^PRETTY_NAME="?([^"\n]+)"?/m', (string) @file_get_contents($path), $m)) {
+            return trim($m[1]);
+        }
+
+        return trim($this->cmd(['uname', '-s']));
+    }
+
+    /**
+     * @return array{seconds: int, human: string}
+     */
+    private function uptime(): array
+    {
+        $seconds = (int) (float) strtok(trim($this->proc('uptime')), ' ');
+
+        return ['seconds' => $seconds, 'human' => now()->subSeconds($seconds)->diffForHumans(null, true)];
+    }
+
+    private function cpuModel(): string
+    {
+        if (preg_match('/^model name\s*:\s*(.+)$/m', $this->proc('cpuinfo'), $m)) {
+            return trim($m[1]);
+        }
+
+        return 'Unknown';
+    }
+
+    /**
+     * Delegated, so the metrics screen and the CPU-limit validator cannot
+     * disagree about the size of the box.
+     */
+    private function cpuCores(): int
+    {
+        return app(HostCpus::class)->count();
+    }
+
+    private function primaryIp(): string
+    {
+        return (string) strtok(trim($this->cmd(['hostname', '-I'])), ' ');
+    }
+
+    /**
+     * Best-effort installed runtime versions (null when not present).
+     *
+     * @return array<string, string|null>
+     */
+    private function runtimes(): array
+    {
+        return [
+            // Read from the running process, not by shelling out to `php`: the web process's PATH
+            // may not contain the CLI's interpreter (e.g. OpenLiteSpeed runs with
+            // `PATH=/bin:/usr/bin`). It also saves a subprocess on a polled dashboard.
+            // This is the interpreter the *panel* runs, not a site's PHP version.
+            'php' => PHP_VERSION,
+            'node' => $this->version([(string) config('server.node_binary', 'node'), '-v']),
+            'redis' => $this->version(['redis-server', '--version']),
+            ...$this->databaseVersion(),
+            ...$this->webServerVersion(),
+        ];
+    }
+
+    /**
+     * The version of every database engine this box actually runs, keyed by
+     * its name — the same shape as {@see webServerVersion()}.
+     *
+     * Asks each engine (`SELECT VERSION()`) rather than a client binary: on a MariaDB server
+     * `mysql --version` reports the client's own protocol version and mislabels it "MySQL".
+     *
+     * @return array<string, string>
+     */
+    private function databaseVersion(): array
+    {
+        // Every engine that answered, not the first: unlike web servers, a box can run MariaDB and
+        // PostgreSQL at once. An engine that is not installed contributes no key rather than null.
+        return array_filter(
+            $this->databases->detectedVersions(),
+            fn (?string $version): bool => $version !== null,
+        );
+    }
+
+    /**
+     * The version of the web server this box actually runs, keyed by its name.
+     *
+     * Read from the recorded capability rather than probed: this is a dashboard read and must not
+     * trigger a box-wide probe as a side effect.
+     *
+     * @return array<string, string|null>
+     */
+    private function webServerVersion(): array
+    {
+        $name = $this->capabilities->recordedWebServer();
+
+        $command = match ($name) {
+            'nginx' => ['nginx', '-v'],
+            'apache' => ['apache2', '-v'],
+            // Prints the banner and exits; `lswsctrl` has no version verb.
+            'openlitespeed' => ['/usr/local/lsws/bin/openlitespeed', '-v'],
+            default => null,
+        };
+
+        // A server running something we have no driver for still gets a
+        // dashboard. Omitting the key is honest; inventing one is not.
+        return $command === null ? [] : [$name => $this->version($command)];
+    }
+
+    /**
+     * @param  array<int, string>  $command
+     */
+    private function version(array $command): ?string
+    {
+        $result = $this->serverOps->run($command, ['feature' => 'dashboard', 'op' => 'runtime']);
+        if ($result->failed()) {
+            return null;
+        }
+
+        $out = trim($result->output()."\n".($result->result?->errorOutput() ?? ''));
+        if ($out === '') {
+            return null;
+        }
+
+        return preg_match('/\d+\.\d+(\.\d+)?/', $out, $m) ? $m[0] : $out;
+    }
+
+    // ---- low-level ----
+
+    /**
+     * @return array<string, int>
+     */
+    private function meminfo(): array
+    {
+        $info = [];
+        foreach (preg_split('/\r?\n/', $this->proc('meminfo')) ?: [] as $line) {
+            if (preg_match('/^(\w+):\s+(\d+)/', $line, $m)) {
+                $info[$m[1]] = (int) $m[2]; // kB
+            }
+        }
+
+        return $info;
+    }
+
+    private function proc(string $file): string
+    {
+        $path = rtrim((string) config('server.proc_dir', '/proc'), '/').'/'.$file;
+
+        return is_file($path) ? (string) @file_get_contents($path) : '';
+    }
+
+    /**
+     * @param  array<int, string>  $command
+     */
+    private function cmd(array $command): string
+    {
+        return trim($this->serverOps->run($command, ['feature' => 'dashboard', 'op' => 'fact'])->output());
+    }
+
+    private function tick(): void
+    {
+        $interval = (int) config('server.metrics.sample_interval', 1);
+        if ($interval > 0) {
+            sleep($interval);
+        }
+    }
+}

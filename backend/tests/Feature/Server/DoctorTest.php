@@ -1,0 +1,845 @@
+<?php
+
+use App\Models\Application;
+use App\Models\ServerCapability;
+use App\Models\SystemUser;
+use App\Models\User;
+use App\Services\Server\Doctor\Checks\AccountLocksCheck;
+use App\Services\Server\Doctor\Checks\BinariesCheck;
+use App\Services\Server\Doctor\Checks\DatabaseCheck;
+use App\Services\Server\Doctor\Checks\FrontendBuildCheck;
+use App\Services\Server\Doctor\Checks\PhpIsolationCheck;
+use App\Services\Server\Doctor\Checks\PrivilegeCheck;
+use App\Services\Server\Doctor\Checks\QueueCheck;
+use App\Services\Server\Doctor\Checks\ServicesCheck;
+use App\Services\Server\Doctor\Checks\WebServerCheck;
+use App\Services\Server\Doctor\Checks\WritablePathsCheck;
+use App\Services\Server\Doctor\Doctor;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Str;
+
+/*
+ * A green suite cannot tell you the panel works: it fakes every process, so it passes identically
+ * on a server where the panel may not do anything. These tests cover the reporting; the checks
+ * themselves only mean something when run unfaked on a real box.
+ */
+
+beforeEach(function () {
+    // phpunit.xml disables sudo; the doctor checks escalation, so turn it on or every privilege
+    // result is "escalation is switched off".
+    config()->set('server.privilege.sudo', true);
+
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+});
+
+/**
+ * What `sudo -n -l` prints on a server whose grant is up to date.
+ *
+ * Built from the allowlist, not hardcoded: the check is that the two agree, and a fixture with
+ * its own idea of the grant would pass while the real server diverged.
+ */
+function sudoListing(?array $only = null): string
+{
+    $binaries = $only ?? (array) config('server.privilege.binaries', []);
+
+    $paths = implode(', ', array_map(fn (string $b) => '/usr/bin/'.$b, $binaries));
+
+    return "Matching Defaults entries for panel on host:\n    !requiretty\n\n"
+        ."User panel may run the following commands on host:\n    (root) NOPASSWD: {$paths}, /usr/sbin/php-fpm*\n";
+}
+
+/** A server where sudo works and the grant covers everything this build runs. */
+function fakeHealthySudo(): void
+{
+    Process::fake(function ($process) {
+        $command = implode(' ', (array) $process->command);
+
+        if (str_contains($command, 'sudo -n -l') && ! preg_match('/-l \S/', $command)) {
+            return Process::result(output: sudoListing());
+        }
+
+        return Process::result(output: 'active', exitCode: 0);
+    });
+}
+
+it('reports healthy only when nothing failed', function () {
+    fakeHealthySudo();
+    Http::fake(['*' => Http::response(['health' => ['status' => 'ok', 'version' => null]])]);
+
+    config()->set('server.doctor.checks', [PrivilegeCheck::class, DatabaseCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    expect($report['healthy'])->toBeTrue()
+        ->and($report['failed'])->toBe(0)
+        ->and($report['checks'])->toHaveCount(2);
+});
+
+it('catches a sudo grant that predates the panel it is running', function () {
+    // sudo works and every representative command is permitted, but the rule on disk is from an
+    // older install.sh: the state of every server right after a panel update. The check must
+    // compare the full allowlist, not sample a few binaries granted on day one.
+    $stale = array_values(array_diff(
+        (array) config('server.privilege.binaries', []),
+        ['certbot', 'openssl', 'touch'],
+    ));
+
+    Process::fake(function ($process) use ($stale) {
+        $command = implode(' ', (array) $process->command);
+
+        if (str_contains($command, 'sudo -n -l') && ! preg_match('/-l \S/', $command)) {
+            return Process::result(output: sudoListing($stale));
+        }
+
+        return Process::result(output: 'active', exitCode: 0);
+    });
+
+    config()->set('server.doctor.checks', [PrivilegeCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    expect($report['healthy'])->toBeFalse();
+
+    $detail = $report['checks'][0]['detail'];
+
+    expect($detail)->toContain('certbot')
+        ->and($detail)->toContain('openssl')
+        ->and($detail)->toContain('touch');
+})->skip(fn () => posix_geteuid() === 0, 'runs as root — nothing needs sudo');
+
+it('accepts php-fpm granted as a wildcard', function () {
+    // One binary per installed PHP version, granted as /usr/sbin/php-fpm* (matched by prefix like
+    // elevate()), so the list need not change when a version is added.
+    fakeHealthySudo();
+
+    config()->set('server.doctor.checks', [PrivilegeCheck::class]);
+
+    expect(app(Doctor::class)->run()['healthy'])->toBeTrue();
+})->skip(fn () => posix_geteuid() === 0, 'runs as root — nothing needs sudo');
+
+it('is unhealthy when a privileged command is denied', function () {
+    // sudo -n -l <binary> exits non-zero when there is no grant.
+    Process::fake(['*' => Process::result(errorOutput: 'sorry, user may not run', exitCode: 1)]);
+
+    config()->set('server.doctor.checks', [PrivilegeCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    expect($report['healthy'])->toBeFalse()
+        ->and($report['checks'][0]['status'])->toBe('fail')
+        ->and($report['checks'][0]['detail'])->toContain('not permitted')
+        // The advice must be translated prose, not a lang key.
+        ->and($report['checks'][0]['fix'])->not->toStartWith('doctor.');
+})->skip(fn () => posix_geteuid() === 0, 'runs as root — nothing needs sudo');
+
+it('distinguishes a missing unit from a stopped one', function () {
+    // Different problems, different fixes: one is a wrong name in .env, the
+    // other is a service that crashed.
+    Process::fake(function ($process) {
+        return $process->command[1] === 'cat'
+            ? Process::result(errorOutput: 'No files found.', exitCode: 1)
+            : Process::result(output: 'inactive', exitCode: 3);
+    });
+
+    config()->set('server.doctor.checks', [ServicesCheck::class]);
+
+    expect(app(Doctor::class)->run()['checks'][0]['detail'])->toContain('no such unit');
+});
+
+it('flags pending migrations, because code without its schema looks like a code bug', function () {
+    config()->set('server.doctor.checks', [DatabaseCheck::class]);
+
+    // The suite migrates before running, so the schema is current here.
+    expect(app(Doctor::class)->run()['checks'][0]['status'])->toBe('pass');
+});
+
+it('reports every check even when one of them fails hard', function () {
+    // Abandoning the run would cost the operator the other answers.
+    Process::fake(['*' => Process::result(errorOutput: 'sorry, user may not run', exitCode: 1)]);
+
+    config()->set('server.doctor.checks', [PrivilegeCheck::class, DatabaseCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    expect($report['checks'])->toHaveCount(2)
+        ->and($report['checks'][1]['status'])->toBe('pass');
+});
+
+it('warns rather than fails on a version mismatch', function () {
+    // A skew right after an update is worth showing and not worth blocking on.
+    Process::fake(['*' => Process::result(exitCode: 0)]);
+    config()->set('server.doctor.checks', [WritablePathsCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    expect($report['warnings'] + $report['passed'] + $report['failed'])->toBe(1);
+});
+
+it('exposes the report to admins', function () {
+    Process::fake(['*' => Process::result(output: 'active', exitCode: 0)]);
+    Http::fake(['*' => Http::response(['health' => ['status' => 'ok', 'version' => null]])]);
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/admin/doctor');
+
+    $response->assertOk()
+        ->assertJsonStructure(['doctor' => [
+            'healthy', 'passed', 'failed', 'warnings',
+            'checks' => [['key', 'title', 'status', 'detail', 'fix']],
+        ]]);
+});
+
+it('denies a non-admin', function () {
+    $user = User::factory()->create();
+    $token = $user->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/admin/doctor')
+        ->assertForbidden();
+});
+
+it('denies an unauthenticated request', function () {
+    $this->getJson('/api/admin/doctor')->assertUnauthorized();
+});
+
+it('has a title and fix for every check, in every locale', function () {
+    $keys = collect(config('server.doctor.checks'))
+        ->map(fn (string $class): string => app($class)->key());
+
+    foreach (config('app.available_locales') as $locale) {
+        app()->setLocale($locale);
+
+        foreach ($keys as $key) {
+            expect(__('doctor.checks.'.$key))->not->toBe('doctor.checks.'.$key);
+        }
+
+        // Advice the operator cannot read is advice that does not exist.
+        foreach (array_keys(__('doctor.fixes')) as $fix) {
+            expect(__('doctor.fixes.'.$fix))->not->toBe('doctor.fixes.'.$fix);
+        }
+    }
+});
+
+it('exits non-zero so the installer can act on it', function () {
+    Process::fake(['*' => Process::result(errorOutput: 'sorry, user may not run', exitCode: 1)]);
+    Http::fake(['*' => Http::response(null, 500)]);
+
+    $this->artisan('panel:doctor')->assertExitCode(1);
+})->skip(fn () => posix_geteuid() === 0, 'runs as root — privilege check passes trivially');
+
+describe('the checks added for "routes error after setup"', function () {
+    it('resolves binaries through sudo\'s secure_path, not the panel user\'s PATH', function () {
+        // useradd/userdel/usermod/chpasswd live in /usr/sbin, which is not on an unprivileged PATH,
+        // but sudo finds them via secure_path. Reporting them missing would be a false failure.
+        $captured = [];
+
+        Process::fake(function ($process) use (&$captured) {
+            $captured[] = $process->command;
+
+            return Process::result(output: '/usr/sbin/useradd', exitCode: 0);
+        });
+
+        config()->set('server.doctor.checks', [BinariesCheck::class]);
+        app(Doctor::class)->run();
+
+        expect($captured)->not->toBeEmpty()
+            ->and($captured[0][0])->toBe('sh');
+    });
+
+    it('treats a missing optional tool as a warning naming the feature it costs', function () {
+        // A panel without ufw cannot do firewall rules but works otherwise: not "broken".
+        Process::fake(function ($process) {
+            return str_contains(implode(' ', $process->command), 'ufw')
+                ? Process::result(exitCode: 1)
+                : Process::result(output: '/usr/bin/thing', exitCode: 0);
+        });
+
+        config()->set('server.doctor.checks', [BinariesCheck::class]);
+        $report = app(Doctor::class)->run();
+
+        expect($report['checks'][0]['status'])->toBe('warn')
+            ->and($report['checks'][0]['detail'])->toContain('firewall')
+            // Warnings must not make the installation unhealthy.
+            ->and($report['healthy'])->toBeTrue();
+    });
+
+    it('warns about a missing psql, naming PostgreSQL', function () {
+        // psql is on the optional list: a binary that is allowlisted in config but absent or
+        // ungranted on the server must still be caught.
+        Process::fake(function ($process) {
+            return str_contains(implode(' ', $process->command), 'psql')
+                ? Process::result(exitCode: 1)
+                : Process::result(output: '/usr/bin/thing', exitCode: 0);
+        });
+
+        config()->set('server.doctor.checks', [BinariesCheck::class]);
+        $report = app(Doctor::class)->run();
+
+        expect($report['checks'][0]['status'])->toBe('warn')
+            ->and($report['checks'][0]['detail'])->toContain('PostgreSQL')
+            // A panel without psql still runs every other feature.
+            ->and($report['healthy'])->toBeTrue();
+    });
+
+    it('fails when a required tool is missing', function () {
+        Process::fake(function ($process) {
+            return str_contains(implode(' ', $process->command), 'systemctl')
+                ? Process::result(exitCode: 1)
+                : Process::result(output: '/usr/bin/thing', exitCode: 0);
+        });
+
+        config()->set('server.doctor.checks', [BinariesCheck::class]);
+        $report = app(Doctor::class)->run();
+
+        expect($report['checks'][0]['status'])->toBe('fail')
+            ->and($report['healthy'])->toBeFalse();
+    });
+
+    it('fails the queue check when jobs sit unclaimed', function () {
+        // The services check proves the worker is *running*; this proves it is *working*. A worker
+        // with a stale config looks active while queued jobs never run.
+        DB::table('jobs')->insert([
+            'queue' => 'default',
+            'payload' => '{}',
+            'attempts' => 0,
+            'available_at' => time() - 3600,
+            'created_at' => time() - 3600,
+        ]);
+
+        // The suite runs QUEUE_CONNECTION=sync, where there is no backlog to
+        // inspect and the check correctly declines to guess.
+        config()->set('queue.default', 'database');
+        config()->set('server.doctor.checks', [QueueCheck::class]);
+        $report = app(Doctor::class)->run();
+
+        expect($report['checks'][0]['status'])->toBe('fail')
+            ->and($report['checks'][0]['detail'])->toContain('oldest for');
+    });
+
+    it('does not fail the queue check for a fresh backlog', function () {
+        // A busy panel has jobs waiting. Age is the signal, not depth.
+        DB::table('jobs')->insert([
+            'queue' => 'default',
+            'payload' => '{}',
+            'attempts' => 0,
+            'available_at' => time(),
+            'created_at' => time(),
+        ]);
+
+        // The suite runs QUEUE_CONNECTION=sync, where there is no backlog to
+        // inspect and the check correctly declines to guess.
+        config()->set('queue.default', 'database');
+        config()->set('server.doctor.checks', [QueueCheck::class]);
+
+        expect(app(Doctor::class)->run()['checks'][0]['status'])->toBe('pass');
+    });
+
+    it('fails when no web server the panel can drive is present', function () {
+        config()->set('server.web_servers', ['nginx' => ['/nonexistent-nginx']]);
+        config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+        expect(app(Doctor::class)->run()['checks'][0]['status'])->toBe('fail');
+    });
+
+    it('tests the OpenLiteSpeed configuration rather than asking whether it is running', function () {
+        // The check must run the config test, not ask `lswsctrl status` whether the service is up:
+        // a healthy process with a broken vhost was reported as "config valid".
+        $commands = [];
+
+        Process::fake(function ($process) use (&$commands) {
+            $commands[] = $process->command;
+            $command = implode(' ', (array) $process->command);
+
+            // The grant probe has to answer separately, or the check reports "not permitted"
+            // and hides whether the config test ran.
+            if (str_contains($command, '-n -l')) {
+                return Process::result(output: 'may run');
+            }
+
+            return Process::result(output: "[ERROR] [config:vhost:shop] invalid directive\n", exitCode: 2);
+        });
+
+        config()->set('server.web_servers', ['openlitespeed' => ['/etc']]);
+        config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+        $report = app(Doctor::class)->run();
+
+        $flat = collect($commands)->map(fn ($c) => implode(' ', (array) $c));
+
+        expect($flat->filter(fn ($c) => str_contains($c, 'lswsctrl status')))->toBeEmpty()
+            ->and($flat->filter(fn ($c) => str_contains($c, 'openlitespeed -t')))->not->toBeEmpty()
+            // And prepared, or the test it just ran could not have failed.
+            ->and($flat->filter(fn ($c) => str_contains($c, 'mkdir -p /tmp/lshttpd')))->not->toBeEmpty();
+
+        // The reason is on stdout for this web server, not stderr.
+        expect($report['checks'][0]['status'])->toBe('fail')
+            ->and($report['checks'][0]['detail'])->toContain('invalid directive');
+    });
+
+    it('warns rather than blaming the config when it is not allowed to test it', function () {
+        // A panel deployed without install.sh: sudo refuses, so `nginx -t` never runs and exits
+        // non-zero anyway. That must not be reported as an invalid web server configuration.
+        Process::fake(fn () => Process::result(
+            errorOutput: 'sudo: a password is required',
+            exitCode: 1,
+        ));
+
+        config()->set('server.web_servers', ['nginx' => ['/etc']]);
+        config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+        $report = app(Doctor::class)->run();
+
+        // Warn, not fail: the missing grant is PrivilegeCheck's finding to
+        // report, and one problem should light up one check.
+        expect($report['checks'][0]['status'])->toBe('warn')
+            ->and($report['healthy'])->toBeTrue()
+            ->and($report['checks'][0]['detail'])->toContain('not permitted');
+    });
+
+    it('still fails when the config test is permitted and the config is bad', function () {
+        Process::fake(function ($process) {
+            $command = implode(' ', (array) $process->command);
+
+            // sudo confirms the grant exists, so the non-zero exit below is
+            // nginx's own verdict and nothing else.
+            if (str_contains($command, 'sudo -n -l')) {
+                return Process::result(output: '(root) NOPASSWD: /usr/sbin/nginx');
+            }
+
+            return Process::result(
+                errorOutput: "nginx: [emerg] unknown directive \"lisen\" in /etc/nginx/sites-enabled/demo:4\nnginx: configuration file test failed",
+                exitCode: 1,
+            );
+        });
+
+        config()->set('server.web_servers', ['nginx' => ['/etc']]);
+        config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+        $report = app(Doctor::class)->run();
+
+        // The failure detail must come with the verdict, not just "invalid".
+        expect($report['checks'][0]['status'])->toBe('fail')
+            ->and($report['checks'][0]['detail'])->toContain('sites-enabled/demo:4');
+    });
+
+    it('has a fix for an untestable config in every locale', function () {
+        foreach (config('app.available_locales') as $locale) {
+            app()->setLocale($locale);
+
+            expect(__('doctor.fixes.web_server_untestable'))
+                ->not->toBe('doctor.fixes.web_server_untestable');
+        }
+    });
+});
+
+describe('the stale account-lock check', function () {
+    it('passes when there are no lock files', function () {
+        config()->set('server.doctor.checks', [AccountLocksCheck::class]);
+
+        // The suite runs on a box with no /etc/*.lock files.
+        expect(app(Doctor::class)->run()['checks'][0]['status'])->toBe('pass');
+    });
+
+    it('has a title and a fix in every locale', function () {
+        foreach (config('app.available_locales') as $locale) {
+            app()->setLocale($locale);
+
+            expect(__('doctor.checks.account_locks'))->not->toBe('doctor.checks.account_locks')
+                ->and(__('doctor.fixes.account_locks'))->not->toBe('doctor.fixes.account_locks');
+        }
+    });
+});
+
+describe('the interface build check', function () {
+    it('warns when the build is older than the source', function () {
+        // The services check proves the Next server is *running*, even on last week's build; only
+        // this check notices a failed build.
+        config()->set('server.doctor.checks', [FrontendBuildCheck::class]);
+
+        $report = app(Doctor::class)->run();
+
+        // Whatever this checkout's state, the answer must be one of the three
+        // and never absent.
+        expect($report['checks'][0]['status'])->toBeIn(['pass', 'warn', 'fail']);
+    });
+
+    it('does not fail an installation that has no frontend', function () {
+        // Backend-only is a legitimate arrangement; calling it broken because
+        // a directory it does not use is missing would be wrong.
+        expect(app(FrontendBuildCheck::class)->key())->toBe('frontend_build');
+    });
+
+    it('has a title and both fixes in every locale', function () {
+        foreach (config('app.available_locales') as $locale) {
+            app()->setLocale($locale);
+
+            expect(__('doctor.checks.frontend_build'))->not->toBe('doctor.checks.frontend_build')
+                ->and(__('doctor.fixes.frontend_build_missing'))->not->toBe('doctor.fixes.frontend_build_missing')
+                ->and(__('doctor.fixes.frontend_build_stale'))->not->toBe('doctor.fixes.frontend_build_stale');
+        }
+    });
+});
+
+it('checks the panel account rather than the operator running it as root', function () {
+    // Run from a root shell, root needs no sudo: the check must not answer "sudo not required"
+    // and skip everything while php-fpm and the queue worker fail as the panel account.
+    if (! function_exists('posix_geteuid') || posix_geteuid() !== 0) {
+        expect(true)->toBeTrue();
+
+        return;
+    }
+
+    $probes = [];
+    Process::fake(function ($process) use (&$probes) {
+        $probes[] = $process->command;
+
+        return Process::result(output: 'ok');
+    });
+
+    config()->set('server.doctor.checks', [PrivilegeCheck::class]);
+    config()->set('server.privilege.binaries', ['tee']);
+
+    app(Doctor::class)->run();
+
+    // Whatever it asked about, it must have asked as somebody other than root.
+    expect($probes)->not->toBeEmpty()
+        ->and(collect($probes)->every(fn (array $command): bool => $command[0] === 'runuser'))->toBeTrue();
+});
+
+describe('the PHP isolation check', function () {
+    it('warns rather than announcing every pool file missing when it cannot look', function () {
+        // A missing pool file means a site is silently served by the shared account: worth a fail.
+        // But `test -f` is refused for EVERY site at once on a server whose sudo grant predates
+        // the build, so reading that as "gone" would be a false alarm for all of them.
+        ServerCapability::query()->delete();
+        ServerCapability::query()->create([
+            'stack' => 'lemp', 'web_server' => 'nginx', 'capabilities' => [],
+            'source' => 'detected', 'verified_at' => now(),
+        ]);
+
+        $su = SystemUser::create(['username' => 'poolowner', 'home_path' => '/home/poolowner']);
+
+        Application::forceCreate([
+            'system_user_id' => $su->id, 'name' => 'Shop', 'slug' => 'shop',
+            'domain' => 'shop.example.com', 'site_type' => 'wordpress',
+            'serving_profile' => 'php', 'status' => 'active', 'web_root' => '/',
+            'php_version' => '8.4', 'isolated_at' => now(),
+        ]);
+
+        Process::fake(fn () => Process::result(
+            errorOutput: 'sudo: a password is required',
+            exitCode: 1,
+        ));
+
+        config()->set('server.doctor.checks', [PhpIsolationCheck::class]);
+
+        $report = app(Doctor::class)->run();
+
+        expect($report['checks'][0]['status'])->toBe('warn')
+            ->and($report['healthy'])->toBeTrue()
+            ->and($report['checks'][0]['detail'])->toContain('could not check');
+    });
+
+    it('has a fix for the unknown case in every locale', function () {
+        foreach (config('app.available_locales') as $locale) {
+            app()->setLocale($locale);
+
+            expect(__('doctor.fixes.php_isolation_unknown'))
+                ->not->toBe('doctor.fixes.php_isolation_unknown');
+        }
+    });
+});
+
+it('fails when the panel is configured for a different web server than the box runs', function () {
+    // The check must look at the value the panel actually writes vhosts with, not detect on its
+    // own; otherwise doctor reports healthy while every site creation fails.
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'lamp',
+        'web_server' => 'apache',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    Process::fake(fn () => Process::result(output: ''));
+
+    // The box runs nginx; /etc exists so detection finds it. Apache's directory
+    // is present too, which is what keeps reconcileWebServer() out of this —
+    // this is the reported case, not the repaired one.
+    config()->set('server.web_servers', ['nginx' => ['/etc'], 'apache' => ['/etc']]);
+    config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    expect($report['checks'][0]['status'])->toBe('fail')
+        ->and($report['healthy'])->toBeFalse()
+        ->and($report['checks'][0]['detail'])->toContain('apache')
+        ->and($report['checks'][0]['detail'])->toContain('nginx');
+});
+
+it('does not report a stack mismatch on a healthy OpenLiteSpeed box', function () {
+    // `/etc/apache2` is shipped by php-fpm on every stack, so a plain directory walk (apache before
+    // openlitespeed) reported a false mismatch on OpenLiteSpeed servers. The check must use the
+    // same detection as ServerCapabilities.
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'ols',
+        'web_server' => 'openlitespeed',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    Process::fake(fn () => Process::result(output: ''));
+
+    // A fixture tree in a temp directory with the real config's paths rebased onto it, so this
+    // asks the shipped values. Reverting `web_servers` to `/etc/apache2` lets the phantom below
+    // satisfy it and this test fail.
+    $root = sys_get_temp_dir().'/ols-phantom-'.Str::random(8);
+
+    // What php-fpm ships, and all it ships. No sites-available: Apache is not
+    // installed on this box and never has been.
+    mkdir($root.'/etc/apache2/conf-available', 0755, true);
+    mkdir($root.'/usr/local/lsws/conf/vhosts', 0755, true);
+
+    config()->set('server.web_servers', collect(config('server.web_servers'))
+        ->map(fn (array $paths) => array_map(fn (string $path) => $root.$path, $paths))
+        ->all());
+
+    config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    File::deleteDirectory($root);
+
+    expect($report['checks'][0]['detail'])->not->toContain('apache')
+        ->and($report['checks'][0]['status'])->not->toBe('fail');
+});
+
+it('asks systemd which web server is running rather than trusting config order', function () {
+    // A box with two web servers genuinely installed, which the phantom directory alone does not
+    // prove. One detector, or the check disagrees with the code it is checking: OpenLiteSpeed
+    // running beside a leftover nginx must not be reported as a stack mismatch.
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'ols',
+        'web_server' => 'openlitespeed',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer',
+        'verified_at' => now(),
+    ]);
+
+    // OpenLiteSpeed is up; nginx is installed and stopped.
+    Process::fake(function ($process) {
+        $args = ($process->command[0] ?? '') === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($args[0] ?? '') === 'systemctl' && in_array('is-active', $args, true)) {
+            return Process::result(exitCode: in_array('lshttpd', $args, true) ? 0 : 1);
+        }
+
+        return Process::result(output: '');
+    });
+
+    $root = sys_get_temp_dir().'/ols-both-'.Str::random(8);
+
+    mkdir($root.'/etc/nginx/sites-available', 0755, true);
+    mkdir($root.'/usr/local/lsws/conf/vhosts', 0755, true);
+
+    config()->set('server.web_servers', collect(config('server.web_servers'))
+        ->map(fn (array $paths) => array_map(fn (string $path) => $root.$path, $paths))
+        ->all());
+
+    config()->set('server.doctor.checks', [WebServerCheck::class]);
+
+    $report = app(Doctor::class)->run();
+
+    File::deleteDirectory($root);
+
+    // nginx is listed first, so config order alone would answer nginx and
+    // report a mismatch against a record that is entirely correct.
+    expect($report['checks'][0]['status'])->not->toBe('fail')
+        ->and($report['checks'][0]['detail'])->not->toContain('nginx');
+});
+
+/*
+ * The OpenLiteSpeed isolation boundary, checked on disk.
+ *
+ * OlsDriver refuses to write a vhost with no `extUser`; this covers the ones already on the
+ * server (written before that guard, adopted, or hand-edited). Without extUser every site's PHP
+ * runs as the server's own user and can read the others' `.env`, credentials and uploads.
+ */
+it('fails when an OpenLiteSpeed site has no extUser', function () {
+    $root = sys_get_temp_dir().'/ols-vhosts-'.Str::random(8);
+
+    mkdir($root.'/isolated', 0755, true);
+    mkdir($root.'/shared', 0755, true);
+
+    file_put_contents($root.'/isolated/vhconf.conf', <<<'CONF'
+    extprocessor lsphp84 {
+      type                    lsapi
+      extUser                 siteowner
+      extGroup                siteowner
+    }
+    CONF);
+
+    // The same vhost with the one line that matters missing.
+    file_put_contents($root.'/shared/vhconf.conf', <<<'CONF'
+    extprocessor lsphp84 {
+      type                    lsapi
+    }
+    CONF);
+
+    config()->set('server.web_server_drivers.openlitespeed.vhost_root', $root);
+    config()->set('server.doctor.checks', [PhpIsolationCheck::class]);
+
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'ols', 'web_server' => 'openlitespeed',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    Process::fake(fn () => Process::result(output: ''));
+
+    $report = app(Doctor::class)->run();
+
+    File::deleteDirectory($root);
+
+    expect($report['checks'][0]['status'])->toBe('fail')
+        ->and($report['checks'][0]['detail'])->toContain('shared')
+        // The site that is configured correctly must not be named.
+        ->and($report['checks'][0]['detail'])->not->toContain('isolated');
+});
+
+/*
+ * Every vhost can name its own user and still not run as it: the panel wrote `extprocessor
+ * lsphp84` into every vhost, and OpenLiteSpeed keeps one external app per name, so the first
+ * vhost loaded supplied the user for all of them.
+ */
+function olsVhostsWithProcessors(array $vhosts): array
+{
+    $root = sys_get_temp_dir().'/ols-shared-'.Str::random(8);
+
+    foreach ($vhosts as $vhost => [$processor, $user]) {
+        mkdir($root.'/'.$vhost, 0755, true);
+        file_put_contents($root."/{$vhost}/vhconf.conf", <<<CONF
+        extprocessor {$processor} {
+          type                    lsapi
+          extUser                 {$user}
+          extGroup                {$user}
+        }
+
+        scripthandler {
+          add                     lsapi:{$processor} php
+        }
+        CONF);
+    }
+
+    config()->set('server.web_server_drivers.openlitespeed.vhost_root', $root);
+    config()->set('server.doctor.checks', [PhpIsolationCheck::class]);
+
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'ols', 'web_server' => 'openlitespeed',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    Process::fake(fn () => Process::result(output: ''));
+
+    $check = app(Doctor::class)->run()['checks'][0];
+
+    File::deleteDirectory($root);
+
+    return $check;
+}
+
+it('fails when OpenLiteSpeed sites share a PHP processor name, even with their own extUser', function () {
+    $check = olsVhostsWithProcessors([
+        'shop' => ['lsphp84', 'shopuser'],
+        'blog' => ['lsphp84', 'bloguser'],
+        'wiki' => ['lsphp84-wiki', 'wikiuser'],
+    ]);
+
+    expect($check['status'])->toBe('fail')
+        ->and($check['fix'])->toBe(__('doctor.fixes.ols_shared_processor'))
+        ->and($check['detail'])->toContain('lsphp84 is defined by')
+        ->and($check['detail'])->toContain('shop')
+        ->and($check['detail'])->toContain('blog')
+        // The site with a processor of its own is not part of the problem.
+        ->and($check['detail'])->not->toContain('wiki');
+});
+
+it('passes when every OpenLiteSpeed site has a processor of its own', function () {
+    $check = olsVhostsWithProcessors([
+        'shop' => ['lsphp84-shop', 'shopuser'],
+        'blog' => ['lsphp84-blog', 'bloguser'],
+    ]);
+
+    expect($check['status'])->toBe('pass');
+});
+
+// A static or proxy vhost has no PHP process and needs no extUser. Reporting
+// one would train people to ignore this check.
+it('does not ask a non-PHP OpenLiteSpeed vhost for an extUser', function () {
+    $root = sys_get_temp_dir().'/ols-static-'.Str::random(8);
+
+    mkdir($root.'/staticsite', 0755, true);
+    file_put_contents($root.'/staticsite/vhconf.conf', "docRoot \$VH_ROOT\nenableGzip 1\n");
+
+    config()->set('server.web_server_drivers.openlitespeed.vhost_root', $root);
+    config()->set('server.doctor.checks', [PhpIsolationCheck::class]);
+
+    ServerCapability::query()->delete();
+    ServerCapability::query()->create([
+        'stack' => 'ols', 'web_server' => 'openlitespeed',
+        'capabilities' => ['php' => true, 'node' => false],
+        'source' => 'installer', 'verified_at' => now(),
+    ]);
+
+    Process::fake(fn () => Process::result(output: ''));
+
+    $report = app(Doctor::class)->run();
+
+    File::deleteDirectory($root);
+
+    expect($report['checks'][0]['status'])->not->toBe('fail');
+});
+
+it('answers each check\'s finding in the viewer\'s language (FS-C37)', function () {
+    Process::fake(function ($process) {
+        return $process->command[1] === 'cat'
+            ? Process::result(errorOutput: 'No files found.', exitCode: 1)
+            : Process::result(output: 'inactive', exitCode: 3);
+    });
+    config()->set('server.doctor.checks', [ServicesCheck::class]);
+
+    $detail = $this->withHeaders(['Authorization' => "Bearer {$this->token}", 'Accept-Language' => 'de'])
+        ->getJson('/api/admin/doctor')
+        ->assertOk()
+        ->json('doctor.checks.0.detail');
+
+    // The unit names are values, not words: they stay as they are.
+    expect($detail)->toStartWith('keine solche Unit: ')
+        ->and($detail)->not->toContain('no such unit');
+});
+
+it('has every finding in every language, with the same values in each (FS-C37)', function () {
+    $english = trans('doctor.details', [], 'en');
+
+    foreach (['de', 'es', 'fr', 'pt', 'ja', 'ru', 'hi'] as $locale) {
+        $translated = trans('doctor.details', [], $locale);
+        expect(array_keys($translated))->toEqualCanonicalizing(array_keys($english));
+
+        foreach ($english as $key => $sentence) {
+            preg_match_all('/:[a-z]+/', $sentence, $want);
+            preg_match_all('/:[a-z]+/', $translated[$key], $got);
+            expect(array_unique($got[0]))->toEqualCanonicalizing(array_unique($want[0]), "{$locale}.{$key}");
+        }
+    }
+});

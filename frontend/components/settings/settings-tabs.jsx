@@ -1,0 +1,73 @@
+"use client";
+
+import Link from "@/components/ui/app-link";
+import { usePathname } from "next/navigation";
+import { useTranslations } from "next-intl";
+import {
+  Server,
+  ShieldCheck,
+  Gauge,
+  Wrench,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { ScrollFade } from "@/components/ui/scroll-fade";
+import { useUnsaved } from "@/components/ui/unsaved-guard";
+
+const SECTIONS = [
+  { key: "server", href: "/settings/server", icon: Server },
+  { key: "security", href: "/settings/security", icon: ShieldCheck },
+  { key: "performance", href: "/settings/performance", icon: Gauge },
+  { key: "maintenance", href: "/settings/maintenance", icon: Wrench },
+];
+
+const TAB =
+  "relative inline-flex h-auto flex-none items-center justify-center gap-2 rounded-md border border-transparent px-4 py-2 text-sm font-medium whitespace-nowrap text-muted-foreground transition-all hover:bg-background/60 hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none [&_svg]:size-4 [&_svg]:shrink-0";
+const TAB_ACTIVE =
+  "bg-card text-foreground shadow-sm dark:border-input dark:bg-input/30";
+
+export function SettingsTabs({ badges = {} }) {
+  const t = useTranslations("settings");
+  const pathname = usePathname();
+  const { guardNavigation } = useUnsaved();
+
+  return (
+    <ScrollFade className="-mx-1 px-1 pb-1">
+      <nav
+        aria-label={t("tabs.label")}
+        className="inline-flex w-fit gap-1 rounded-lg bg-muted p-1"
+      >
+        {SECTIONS.map(({ key, href, icon: Icon }) => {
+          const active = pathname === href;
+          const badge = badges[key];
+          return (
+            <Link
+              key={key}
+              href={href}
+              aria-current={active ? "page" : undefined}
+              className={cn(TAB, active && TAB_ACTIVE)}
+              onClick={(event) => {
+                if (!active && guardNavigation(href)) event.preventDefault();
+              }}
+            >
+              <Icon />
+              {t(`tabs.${key}`)}
+              {badge ? (
+                <>
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "size-1.5 rounded-full",
+                      badge === "warning" ? "bg-warning" : "bg-primary",
+                    )}
+                  />
+                  <span className="sr-only">{t(`tabs.needsAttention`)}</span>
+                </>
+              ) : null}
+            </Link>
+          );
+        })}
+      </nav>
+
+    </ScrollFade>
+  );
+}

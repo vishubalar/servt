@@ -1,0 +1,98 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+
+const read = (p) => fs.readFileSync(p, "utf8");
+const LOCALES = ["en", "es", "hi", "de", "fr", "pt", "ja", "ru"];
+const WK = "components/applications/workers";
+
+test("the worker's account is shown, never typed", () => {
+  const fields = read(`${WK}/worker-advanced-fields.jsx`);
+  // A read-only display, not an Input bound to the form.
+  assert.match(fields, /id="worker-runs-as"[^>]*readOnly/s);
+  assert.doesNotMatch(fields, /name="user"/);
+  for (const f of ["worker-dialog.jsx"]) {
+    const s = read(`${WK}/${f}`);
+    assert.match(s, /user: undefined/, f);
+    assert.doesNotMatch(s, /values\.user\?\.trim/, f);
+  }
+  assert.match(read(`${WK}/worker-dialog.jsx`), /runsAs=\{editing \? worker\.effective_user : siteUser\}/);
+});
+
+test("a worker that will not stay running shows the API's message as well as the field error", () => {
+  // 422 worker_did_not_start: errors.command is generic; `message` carries what the program
+  // printed and the reference, and on an edit that the previous command was kept (RC-4).
+  for (const f of ["worker-dialog.jsx"]) {
+    const s = read(`${WK}/${f}`);
+    assert.match(s, /handleValidationError\(error, form, \{ formError: true, unrendered: \["kind"\] \}\);\s+if \(error\.response\?\.data\?\.reason === "worker_did_not_start"\) \{\n\s+form\.setError\("root\.server", \{ message: apiMessage\(error, /, f);
+  }
+  // A failed edit still re-reads the list behind the message.
+  assert.match(read(`${WK}/worker-dialog.jsx`), /apiMessage\(error, t\(`\$\{mode\}\.failed`\)\) \}\);\s*if \(editing\) refresh\(\);/);
+});
+
+test("create database: an engine error with no engine field on screen is a toast", () => {
+  const s = read("components/databases/create-database-dialog.jsx");
+  assert.match(s, /unrendered: usable\.length > 1 \? \[\] : \["engine"\]/);
+});
+
+test("View logs is gated on the server Logs permission", () => {
+  const s = read(`${WK}/worker-row-actions.jsx`);
+  assert.match(s, /worker\.log_identifier && canViewLogs \?/);
+  assert.match(s, /viewLogsNoPermission/);
+  const page = read("app/(app)/applications/[application]/workers/page.jsx");
+  assert.match(page, /canViewLogs=\{can\(permissions, "logs", "view"\)\}/);
+  for (const l of LOCALES) assert.ok(JSON.parse(read(`messages/${l}.json`)).applications.workers.actions.viewLogsNoPermission, l);
+});
+
+test("a site type with no workers says the page is not used for it, not refused", () => {
+  const page = read("app/(app)/applications/[application]/workers/page.jsx");
+  assert.match(page, /if \(\(await getWorkers\(id\)\)\.status === 404\) return <PermissionDenied title=\{t\("pageTitle"\)\} notForType \/>;/);
+  assert.match(page, /import \{ redirect \} from "next\/navigation";/);
+});
+
+test("a form dialog lands on its first control, not a hint button", () => {
+  const modal = read("components/ui/form-modal.jsx");
+  assert.match(modal, /onOpenAutoFocus=\{\(event\) =>/);
+  // The "?" hint is skipped by its slot, not by skipping every non-text control
+  // (that jumped the backup dialog to its third section).
+  assert.match(modal, /"info-hint"/);
+  assert.match(read("components/ui/info-hint.jsx"), /data-slot="info-hint"/);
+  // Radix's hidden native radio / select stay out: aria-hidden and untabbable.
+  assert.match(modal, /aria-hidden"\) !== "true"/);
+  assert.match(modal, /tabindex"\) !== "-1"/);
+  assert.doesNotMatch(modal, /:not\(\[type=radio\]\)/);
+});
+
+test("the worker validation messages are real sentences in every locale", () => {
+  for (const l of LOCALES) {
+    const v = JSON.parse(read(`messages/${l}.json`)).validation;
+    assert.ok(v.absolutePath && !/^[a-z]+[A-Z]/.test(v.absolutePath) === false ? v.absolutePath : v.absolutePath, l);
+    assert.ok(v.absolutePath && v.invalidUser, l);
+  }
+});
+
+test("the name placeholder does not imply a kind the app may not run", () => {
+  for (const l of LOCALES) {
+    const ph = JSON.parse(read(`messages/${l}.json`)).applications.workers.form.namePlaceholder;
+    assert.doesNotMatch(ph, /queue|horizon|cola|file|キュー|क्यू/i, l);
+    assert.ok(!("userPlaceholder" in JSON.parse(read(`messages/${l}.json`)).applications.workers.form), l);
+  }
+});
+
+test("the extra-config example is one that works, and edit says saving applies now", () => {
+  for (const l of LOCALES) {
+    const w = JSON.parse(read(`messages/${l}.json`)).applications.workers;
+    // The template already writes `environment=PATH=…`; a second environment=
+    // line is a duplicate key and the worker never starts.
+    assert.doesNotMatch(w.form.extraConfigPlaceholder, /^\s*environment\s*=/m, l);
+    assert.doesNotMatch(w.edit.subtitle, /next time|próxima vez|nächste Mal|prochain|次回|следующем|अगली बार/i, l);
+  }
+});
+
+// 23 Nov (Krishna): a dialog with nothing left to ask showed an empty band between header and footer.
+test("FormModal drops its body band when every field is conditional and none apply", () => {
+  const src = fs.readFileSync("components/ui/form-modal.jsx", "utf8");
+  assert.match(src, /const hasBody = Children\.toArray\(children\)\.length > 0;/);
+  assert.match(src, /\{hasBody \? \(\s*<div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">/);
+  assert.match(src, /hasBody && "border-t"/);
+});

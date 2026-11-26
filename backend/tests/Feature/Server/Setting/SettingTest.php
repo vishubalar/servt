@@ -1,0 +1,1341 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\FirewallRule;
+use App\Models\User;
+use App\Services\Server\Fail2ban\Fail2banManager;
+use App\Services\Server\Settings\SettingChangeLog;
+use App\Services\Server\Settings\SettingsManager;
+use App\Support\ServerTimezone;
+use App\Support\SshPort;
+use Carbon\Carbon;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    $this->dir = sys_get_temp_dir().'/sv-oss-set-'.uniqid();
+    File::ensureDirectoryExists($this->dir);
+    $this->redisCli = $this->dir.'/redis-cli';
+    File::put($this->redisCli, '');
+    File::put($this->dir.'/meminfo', "SwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n");
+    $this->swapFile = $this->dir.'/swapfile';
+    $this->fstab = $this->dir.'/fstab';
+
+    config([
+        'server.sshd_config_dir' => $this->dir,
+        'server.unattended_upgrades_file' => $this->dir.'/99-panel-upgrades',
+        'server.reboot_required_file' => $this->dir.'/reboot-required',
+        'server.redis_cli' => $this->redisCli,
+        'server.proc_dir' => $this->dir,
+        'server.swap_file' => $this->swapFile,
+        'server.fstab' => $this->fstab,
+        'server.hosts_file' => $this->dir.'/hosts',
+    ]);
+});
+
+afterEach(fn () => File::deleteDirectory($this->dir));
+
+function fakeSettings(bool $swapActive = false, bool $swapoffOk = true, bool $sshSocket = false, bool $remembers = false): void
+{
+    $redis = test()->redisCli;
+    $swapFile = test()->swapFile;
+    $dir = test()->dir;
+    // `$remembers`: sshd and Redis answer with what was last written to them,
+    // as the real ones do, so a save has a before and an after that differ.
+    $redisSet = [];
+    Process::fake(function ($process) use ($redis, $swapActive, $swapoffOk, $swapFile, $sshSocket, $remembers, $dir, &$redisSet) {
+        $cmd = $process->command;
+        // ServerOps prefixes privileged operations with sudo in this test
+        // environment; fakes assert the underlying command semantics.
+        if (($cmd[0] ?? null) === 'sudo' && ($cmd[1] ?? null) === '-n') {
+            $cmd = array_slice($cmd, 2);
+        }
+        $bin = $cmd[0] ?? '';
+
+        // No authorized_keys on disk unless a test says otherwise: the key check asks the server
+        // (SecuritySettings::hasSshKey()), and a catch-all success would read as a key for root.
+        if ($bin === 'test' && ($cmd[1] ?? '') === '-s' && str_ends_with((string) end($cmd), '/.ssh/authorized_keys')) {
+            return Process::result(exitCode: 1);
+        }
+
+        // Checked before the `swapon` case below, which is the activation
+        // call rather than the query and shares its binary.
+        if ($bin === 'swapon' && ($cmd[1] ?? '') === '--show=NAME') {
+            return Process::result(output: $swapActive ? $swapFile."\n" : '');
+        }
+
+        if ($bin === 'swapoff') {
+            // What the kernel says when there is not enough free RAM to take
+            // back the pages that are currently swapped out.
+            return $swapoffOk
+                ? Process::result(exitCode: 0)
+                : Process::result(exitCode: 255, errorOutput: 'swapoff: '.$swapFile.': Cannot allocate memory');
+        }
+
+        // Config writes go through ServerOps, not File::put, so the fake must perform them or the
+        // file never appears and the assertions check nothing.
+        if ($bin === 'tee') {
+            File::put($cmd[1], (string) $process->input);
+
+            return Process::result(exitCode: 0);
+        }
+        // `cat` reads for real too — a fake that answers empty would have the
+        // code believe a system file is blank.
+        if ($bin === 'cat' && is_file($cmd[1] ?? '')) {
+            return Process::result(output: File::get($cmd[1]));
+        }
+        if ($bin === 'rm') {
+            File::delete(end($cmd));
+
+            return Process::result(exitCode: 0);
+        }
+
+        if ($bin === 'timedatectl' && ($cmd[1] ?? '') === 'show') {
+            $value = str_contains(implode(' ', $cmd), 'NTP') ? 'yes' : 'Etc/UTC';
+
+            return Process::result(output: $value);
+        }
+        if ($bin === 'hostnamectl' && ($cmd[1] ?? '') === '--static') {
+            return Process::result(output: 'server.example');
+        }
+        if ($cmd === ['systemctl', 'is-active', 'ssh.socket']) {
+            return Process::result(output: $sshSocket ? "active\n" : "inactive\n", exitCode: $sshSocket ? 0 : 3);
+        }
+        if ($bin === 'sshd' && ($cmd[1] ?? '') === '-T' && $remembers && is_file($dir.'/00-panel.conf')) {
+            return Process::result(output: strtolower((string) File::get($dir.'/00-panel.conf')));
+        }
+        if ($bin === 'sshd' && ($cmd[1] ?? '') === '-T') {
+            return Process::result(output: "port 22\npermitrootlogin prohibit-password\npasswordauthentication yes\n");
+        }
+        if ($bin === 'ufw') {
+            return Process::result(output: "Status: inactive\n");
+        }
+        if ($remembers && $bin === $redis && ($cmd[1] ?? '') === 'config' && ($cmd[2] ?? '') === 'set') {
+            // Redis answers a size in bytes, whatever unit it was given.
+            $value = (string) ($cmd[4] ?? '');
+            $redisSet[$cmd[3]] = preg_match('/^(\d+)mb$/i', $value, $mb) ? (string) ($mb[1] * 1048576) : $value;
+
+            return Process::result(output: 'OK');
+        }
+        if ($bin === $redis && ($cmd[1] ?? '') === 'config' && ($cmd[2] ?? '') === 'get') {
+            $key = $cmd[3] ?? '';
+            $value = $redisSet[$key] ?? match ($key) {
+                'maxmemory' => '0',
+                'maxmemory-policy' => 'noeviction',
+                default => '',
+            };
+
+            return Process::result(output: "{$key}\n{$value}");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+it('reads all available setting groups', function () {
+    fakeSettings();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/settings')->assertOk();
+
+    $response->assertJsonPath('settings.general.timezone', 'Etc/UTC')
+        ->assertJsonPath('settings.general.ntp', true)
+        ->assertJsonPath('settings.general.hostname', 'server.example')
+        ->assertJsonPath('settings.security.port', 22)
+        ->assertJsonPath('settings.security.password_authentication', true)
+        ->assertJsonPath('settings.updates.reboot_required', false)
+        ->assertJsonPath('settings.redis.has_password', false)
+        // `enabled` is whether the *panel's* swap file is on, not whether the machine has swap. The
+        // fixture's 2 GB belongs to the system, so it is reported separately as unmanaged.
+        ->assertJsonPath('settings.swap.enabled', false)
+        ->assertJsonPath('settings.swap.size', 0)
+        ->assertJsonPath('settings.swap.system_total', 2048000000)
+        ->assertJsonPath('settings.swap.unmanaged', true)
+        ->assertJsonPath('settings.swap.path', $this->swapFile);
+});
+
+it('creates a swap file, activates it and adds an fstab entry', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/swap', ['size_mb' => 2048])->assertOk()
+        ->assertJsonPath('swap.path', $this->swapFile);
+
+    // Allocated beside the live file and moved in, so a failed allocation
+    // cannot leave the server with no swap at all.
+    Process::assertRan(fn ($p) => $p->command === ['fallocate', '-l', '2048M', $this->swapFile.'.new']);
+    Process::assertRan(fn ($p) => $p->command === ['mkswap', $this->swapFile.'.new']);
+    Process::assertRan(fn ($p) => $p->command === ['mv', $this->swapFile.'.new', $this->swapFile]);
+    Process::assertRan(fn ($p) => $p->command === ['swapon', $this->swapFile]);
+    expect(File::get($this->fstab))->toContain($this->swapFile.' none swap sw 0 0');
+    $this->assertDatabaseHas('activity_logs', ['type' => 'setting', 'action' => 'updated']);
+});
+
+it('disables swap and strips only its fstab line', function () {
+    fakeSettings();
+    File::put($this->fstab, "UUID=abc / ext4 defaults 0 1\n{$this->swapFile} none swap sw 0 0\n");
+    File::put($this->swapFile, 'x');
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/swap', ['size_mb' => 0])->assertOk();
+
+    expect(File::exists($this->swapFile))->toBeFalse();
+    expect(File::get($this->fstab))
+        ->toContain('UUID=abc / ext4 defaults 0 1')
+        ->not->toContain($this->swapFile);
+});
+
+it('allocates a fresh file so a smaller size really shrinks', function () {
+    // fallocate only allocates: given a length smaller than the file it succeeds and changes
+    // nothing, so shrinking 2 GB to 1.5 GB left a 2 GB file. Growing worked, so it only looked
+    // broken one way.
+    fakeSettings(swapActive: true);
+    File::put(test()->swapFile, 'x');
+
+    test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->putJson('/api/settings/swap', ['size_mb' => 1536])->assertOk();
+
+    // A fresh file at the requested size, then moved over the old one. The old file is never
+    // removed first: allocation usually fails on the full disk that prompted the resize, which
+    // would leave the server with no swap at all.
+    Process::assertRan(fn ($p) => $p->command === ['fallocate', '-l', '1536M', test()->swapFile.'.new']);
+    Process::assertRan(fn ($p) => $p->command === ['mv', test()->swapFile.'.new', test()->swapFile]);
+});
+
+it('refuses to resize swap the server cannot give up, and says why', function () {
+    // swapoff reads every swapped-out page back into RAM and refuses when there is not enough free
+    // memory, the state a server changing its swap is most likely to be in.
+    fakeSettings(swapActive: true, swapoffOk: false);
+
+    test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->putJson('/api/settings/swap', ['size_mb' => 1536])
+        ->assertStatus(422)
+        ->assertJsonPath('message', __('errors/setting.swap_in_use'));
+
+    // The part that matters: mkswap must not have rewritten the header of a
+    // swap file the kernel is still using.
+    Process::assertNotRan(fn ($p) => $p->command === ['mkswap', test()->swapFile]);
+    Process::assertNotRan(fn ($p) => $p->command === ['rm', '-f', test()->swapFile]);
+});
+
+it('refuses to disable swap the server cannot give up', function () {
+    fakeSettings(swapActive: true, swapoffOk: false);
+    File::put(test()->swapFile, 'x');
+
+    test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->putJson('/api/settings/swap', ['size_mb' => 0])
+        ->assertStatus(422);
+
+    // Deleting the file out from under an active swap is worse than refusing.
+    expect(File::exists(test()->swapFile))->toBeTrue();
+});
+
+it('rejects a swap size over the configured ceiling', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/swap', ['size_mb' => 999999])
+        ->assertStatus(422)->assertJsonValidationErrorFor('size_mb');
+});
+
+it('schedules a server reboot and logs it', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/settings/reboot')->assertStatus(202)
+        ->assertJsonPath('reboot.scheduled', true)
+        ->assertJsonPath('reboot.when', 'now');
+
+    Process::assertRan(fn ($p) => $p->command === ['shutdown', '-r', 'now']);
+    $this->assertDatabaseHas('activity_logs', ['type' => 'setting', 'action' => 'reboot_requested']);
+});
+
+it('reboots with a grace delay when requested', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->postJson('/api/settings/reboot', ['delay_minutes' => 5])->assertStatus(202)
+        ->assertJsonPath('reboot.when', '+5');
+
+    Process::assertRan(fn ($p) => $p->command === ['shutdown', '-r', '+5']);
+});
+
+it('denies reboot for a viewer without manage', function () {
+    fakeSettings();
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'setting', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->postJson('/api/settings/reboot')->assertForbidden();
+});
+
+it('updates general settings and logs it', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', ['timezone' => 'Asia/Kolkata', 'hostname' => 'web-01', 'ntp' => true])
+        ->assertOk();
+
+    Process::assertRan(fn ($p) => $p->command === ['timedatectl', 'set-timezone', 'Asia/Kolkata']);
+    Process::assertRan(fn ($p) => $p->command === ['hostnamectl', 'set-hostname', 'web-01']);
+    expect(ActivityLog::where('type', 'setting')->where('action', 'updated')->exists())->toBeTrue();
+});
+
+it('rejects an invalid timezone', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', ['timezone' => 'Not/AZone', 'hostname' => 'web-01', 'ntp' => true])
+        ->assertJsonValidationErrors('timezone');
+});
+
+it('writes the ssh drop-in, tests then reloads', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+        ->assertOk()
+        ->assertJsonPath('security.port', 22); // read is re-run via fake (still 22)
+
+    $dropIn = File::get($this->dir.'/00-panel.conf');
+    expect($dropIn)->toContain('Port 2222')->toContain('PermitRootLogin no')->toContain('PasswordAuthentication yes')
+        // `root` explicitly: AllowGroups is a whitelist over every account and
+        // is consulted before PermitRootLogin, so a list without it locks root
+        // out of a box most providers hand you as root.
+        ->toContain('AllowGroups ssh-users sudo root');
+    Process::assertRan(fn ($p) => in_array('sshd', $p->command, true) && in_array('-t', $p->command, true));
+    Process::assertRan(fn ($p) => in_array('rm', $p->command, true) && in_array($this->dir.'/99-panel.conf', $p->command, true));
+    Process::assertRan(fn ($p) => in_array('systemctl', $p->command, true) && in_array('try-reload-or-restart', $p->command, true) && in_array('ssh', $p->command, true));
+});
+
+describe('a socket-activated SSH (Ubuntu 24.04+)', function () {
+    // The port sshd listens on belongs to ssh.socket, generated from sshd_config at daemon-reload.
+    // Reloading ssh alone leaves it answering on the old port while the screen says the new one.
+    it('moves the socket when the port changes', function () {
+        fakeSettings(sshSocket: true);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        Process::assertRan(fn ($p) => array_slice($p->command, -2) === ['systemctl', 'daemon-reload']);
+        Process::assertRan(fn ($p) => array_slice($p->command, -3) === ['systemctl', 'restart', 'ssh.socket']);
+    });
+
+    // The port SSH left is closed, not left open for the user to find. A rule the user made for
+    // that port is theirs and stays.
+    it('closes the port SSH left, and keeps the new one protected', function () {
+        fakeSettings(sshSocket: true);
+        $old = FirewallRule::create(['port_from' => 22, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'default']);
+        $web = FirewallRule::create(['port_from' => 443, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'default']);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        expect($old->fresh())->toBeNull()
+            ->and($web->fresh()->isProtected())->toBeTrue();
+        Process::assertRan(fn ($p) => array_slice($p->command, -4) === ['ufw', 'delete', 'allow', '22/tcp']);
+    });
+
+    it('leaves a rule the user made for the old port, and releases one ufw will not delete', function () {
+        fakeSettings(sshSocket: true);
+        $theirs = FirewallRule::create(['port_from' => 22, 'protocol' => 'tcp', 'action' => 'allow', 'source_ip' => '203.0.113.7', 'origin' => 'user']);
+        $ours = FirewallRule::create(['port_from' => 22, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'default']);
+        Process::fake(function ($process) {
+            $cmd = ($process->command[0] ?? null) === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            return match (true) {
+                ($cmd[0] ?? '') === 'ufw' && ($cmd[1] ?? '') === 'delete' => Process::result(errorOutput: 'ERROR', exitCode: 1),
+                ($cmd[0] ?? '') === 'ufw' => Process::result(output: "Status: active\n"),
+                ($cmd[0] ?? '') === 'sshd' && ($cmd[1] ?? '') === '-T' => Process::result(output: "port 22\npermitrootlogin no\npasswordauthentication yes\n"),
+                ($cmd[0] ?? '') === 'tee' => (function () use ($cmd, $process) {
+                    File::put($cmd[1], (string) $process->input);
+
+                    return Process::result();
+                })(),
+                default => Process::result(),
+            };
+        });
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        expect($theirs->fresh())->not->toBeNull()
+            ->and($ours->fresh()?->origin)->toBe('user');
+    });
+
+    it('protects the rule again when SSH moves back to a port it left', function () {
+        fakeSettings(sshSocket: true);
+        Process::fake(function ($process) {
+            $cmd = ($process->command[0] ?? null) === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            return match (true) {
+                ($cmd[0] ?? '') === 'ufw' => Process::result(output: "Status: active\n"),
+                ($cmd[0] ?? '') === 'sshd' && ($cmd[1] ?? '') === '-T' => Process::result(output: "port 2222\npermitrootlogin no\npasswordauthentication yes\n"),
+                ($cmd[0] ?? '') === 'tee' => (function () use ($cmd, $process) {
+                    File::put($cmd[1], (string) $process->input);
+
+                    return Process::result();
+                })(),
+                default => Process::result(),
+            };
+        });
+        $released = FirewallRule::create(['port_from' => 22, 'protocol' => 'tcp', 'action' => 'allow', 'origin' => 'user']);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        expect($released->fresh()->isProtected())->toBeTrue();
+    });
+
+    /**
+     * A socket-activated box: `ss` reports `$listeners`, the socket is in
+     * `$socketState`, and restarting it fails while the drop-in names
+     * `$unbindable`. The drop-in is really written, so a rollback is visible.
+     */
+    function fakeSocketBox(string $listeners = '', string $socketState = 'active', ?int $unbindable = null): void
+    {
+        $dir = test()->dir;
+
+        Process::fake(function ($process) use ($listeners, $socketState, $unbindable, $dir) {
+            $cmd = ($process->command[0] ?? null) === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            return match (true) {
+                ($cmd[0] ?? '') === 'ss' => Process::result(output: $listeners),
+                ($cmd[0] ?? '') === 'ufw' => Process::result(output: "Status: inactive\n"),
+                ($cmd[0] ?? '') === 'sshd' && ($cmd[1] ?? '') === '-T' => Process::result(output: "port 22\npermitrootlogin no\npasswordauthentication yes\n"),
+                $cmd === ['systemctl', 'is-active', 'ssh.socket'] => Process::result(output: "{$socketState}\n", exitCode: $socketState === 'active' ? 0 : 3),
+                $cmd === ['systemctl', 'restart', 'ssh.socket'] => $unbindable !== null && str_contains((string) @file_get_contents($dir.'/00-panel.conf'), "Port {$unbindable}\n")
+                    ? Process::result(errorOutput: 'Job for ssh.socket failed.', exitCode: 1)
+                    : Process::result(),
+                ($cmd[0] ?? '') === 'tee' => (function () use ($cmd, $process) {
+                    File::put($cmd[1], (string) $process->input);
+
+                    return Process::result();
+                })(),
+                default => Process::result(),
+            };
+        });
+    }
+
+    it('refuses a port another program already listens on', function () {
+        fakeSocketBox("tcp LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:((\"apache2\",pid=900,fd=4))\n");
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 80, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['port' => __('errors/setting.ssh_port_in_use', ['port' => 80])]);
+
+        Process::assertDidntRun(fn ($p) => in_array('tee', $p->command, true));
+        Process::assertDidntRun(fn ($p) => in_array('ssh.socket', $p->command, true) && in_array('restart', $p->command, true));
+    });
+
+    it('does not count SSH itself as the program in the way', function () {
+        fakeSocketBox("tcp LISTEN 0 4096 0.0.0.0:2222 0.0.0.0:* users:((\"systemd\",pid=1,fd=60))\n");
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+    });
+
+    it('brings a failed socket back even when the port stays the same', function () {
+        fakeSocketBox(socketState: 'failed');
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        Process::assertRan(fn ($p) => array_slice($p->command, -3) === ['systemctl', 'restart', 'ssh.socket']);
+    });
+
+    it('puts the old port back when the socket will not bind the new one', function () {
+        fakeSocketBox(unbindable: 2222);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertServerError();
+
+        expect(File::get($this->dir.'/00-panel.conf'))->toContain("Port 22\n")->not->toContain('Port 2222');
+        Process::assertRanTimes(fn ($p) => array_slice($p->command, -3) === ['systemctl', 'restart', 'ssh.socket'], 2);
+    });
+
+    // jail.local resolves {ssh_port} when written, so after a move the SSH jail kept banning 22.
+    it('moves the fail2ban SSH jail to the new port, after SSH has moved', function () {
+        fakeSettings(sshSocket: true);
+        $seenPort = null;
+        $fail2ban = Mockery::mock(Fail2banManager::class);
+        $fail2ban->shouldReceive('installed')->andReturnTrue();
+        $fail2ban->shouldReceive('configuredJails')->andReturn(['sshd' => true]);
+        $fail2ban->shouldReceive('settings')->andReturn(['bantime' => 600]);
+        $fail2ban->shouldReceive('ignoreIps')->andReturn([]);
+        $fail2ban->shouldReceive('write')->once()->andReturnUsing(function () use (&$seenPort): void {
+            $seenPort = SshPort::current();
+        });
+        // And restarted, or its firewall rule stays on the old port.
+        $fail2ban->shouldReceive('restartSshJails')->once();
+        app()->instance(Fail2banManager::class, $fail2ban);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        // Written once SSH is on 2222, so {ssh_port} resolves to the new port.
+        expect($seenPort)->toBe(2222);
+    });
+
+    it('keeps the SSH move when the jail cannot be rewritten', function () {
+        fakeSettings(sshSocket: true);
+        $fail2ban = Mockery::mock(Fail2banManager::class);
+        $fail2ban->shouldReceive('installed')->andReturnTrue();
+        $fail2ban->shouldReceive('configuredJails')->andReturn(['sshd' => true]);
+        $fail2ban->shouldReceive('settings')->andReturn([]);
+        $fail2ban->shouldReceive('ignoreIps')->andReturn([]);
+        $fail2ban->shouldReceive('write')->andThrow(new RuntimeException('reload failed'));
+        app()->instance(Fail2banManager::class, $fail2ban);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        expect(File::get($this->dir.'/00-panel.conf'))->toContain('Port 2222');
+    });
+
+    it('does not touch fail2ban when the port stays the same', function () {
+        fakeSettings(sshSocket: true);
+        $fail2ban = Mockery::mock(Fail2banManager::class);
+        $fail2ban->shouldNotReceive('write');
+        $fail2ban->shouldReceive('installed', 'configuredJails', 'settings', 'ignoreIps')->andReturn(true, [], [], []);
+        app()->instance(Fail2banManager::class, $fail2ban);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+    });
+
+    it('leaves the socket alone when the port stays the same', function () {
+        fakeSettings(sshSocket: true);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        Process::assertDidntRun(fn ($p) => in_array('ssh.socket', $p->command, true) && in_array('restart', $p->command, true));
+    });
+
+    it('does not touch a socket that is not in use', function () {
+        fakeSettings();
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        Process::assertDidntRun(fn ($p) => in_array('restart', $p->command, true));
+    });
+});
+
+it('blocks disabling password auth with no ssh key (lockout guard)', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'prohibit-password', 'password_authentication' => false])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('password_authentication');
+});
+
+it('returns a translated error with reference when sshd -t fails', function () {
+    Process::fake(function ($process) {
+        if (($process->command[0] ?? '') === 'sshd' && ($process->command[1] ?? '') === '-t') {
+            return Process::result(output: '', errorOutput: 'bad config', exitCode: 1);
+        }
+        if (($process->command[0] ?? '') === 'sshd') {
+            return Process::result(output: "port 22\npermitrootlogin yes\npasswordauthentication yes\n");
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'yes', 'password_authentication' => true])
+        ->assertStatus(500)
+        ->assertJsonStructure(['message', 'reference']);
+});
+
+it('writes the unattended-upgrades drop-in', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/updates', ['security_updates_enabled' => true, 'auto_reboot' => true, 'reboot_time' => '03:30'])
+        ->assertOk();
+
+    $conf = File::get($this->dir.'/99-panel-upgrades');
+    expect($conf)->toContain('APT::Periodic::Unattended-Upgrade "1"')
+        ->toContain('Unattended-Upgrade::Automatic-Reboot "true"')
+        ->toContain('Automatic-Reboot-Time "03:30"');
+});
+
+// Writing the file only proved it was correct on disk; nothing read it back. Every apt key it
+// writes contains a hyphen and the parser's key pattern excluded one, so the whole group read as
+// its defaults and the toggle forgot itself on every reload.
+it('reads the updates group back exactly as it was saved', function () {
+    fakeSettings();
+
+    $saved = [
+        'security_updates_enabled' => true,
+        'auto_reboot' => true,
+        'reboot_time' => '03:30',
+        'reboot_with_users' => true,
+    ];
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/updates', $saved)->assertOk();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/settings')->assertOk();
+
+    foreach ($saved as $field => $value) {
+        $response->assertJsonPath("settings.updates.{$field}", $value);
+    }
+});
+
+// The all-true pass alone would also pass against a parser that lost the file
+// and happened to default the other way, so the off state is asserted too.
+it('reads the updates group back when everything is switched off', function () {
+    fakeSettings();
+
+    $saved = [
+        'security_updates_enabled' => false,
+        'auto_reboot' => false,
+        'reboot_time' => '02:00',
+        'reboot_with_users' => false,
+    ];
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/updates', $saved)->assertOk();
+
+    $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/settings')->assertOk();
+
+    foreach ($saved as $field => $value) {
+        $response->assertJsonPath("settings.updates.{$field}", $value);
+    }
+});
+
+it('applies redis settings via redis-cli', function () {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/redis', ['maxmemory' => '256mb', 'maxmemory_policy' => 'allkeys-lru', 'password' => null])
+        ->assertOk();
+
+    Process::assertRan(fn ($p) => $p->command === [$this->redisCli, 'config', 'set', 'maxmemory', '256mb']);
+    Process::assertRan(fn ($p) => $p->command === [$this->redisCli, 'config', 'rewrite']);
+});
+
+it('refuses an allkeys policy while the panel queues its jobs in redis', function (string $policy) {
+    config(['queue.default' => 'redis']);
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/redis', ['maxmemory' => '256mb', 'maxmemory_policy' => $policy])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['maxmemory_policy' => __('setting.redis.policy_evicts_panel_queue')]);
+
+    Process::assertDidntRun(fn ($p) => ($p->command[1] ?? null) === 'config' && ($p->command[2] ?? null) === 'set');
+})->with(['allkeys-lru', 'allkeys-lfu', 'allkeys-random']);
+
+it('still accepts noeviction and volatile policies while the panel queues in redis', function (string $policy) {
+    config(['queue.default' => 'redis']);
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/redis', ['maxmemory' => '256mb', 'maxmemory_policy' => $policy])
+        ->assertOk();
+})->with(['noeviction', 'volatile-lru', 'volatile-ttl']);
+
+it('names the refused policies so the form can disable them', function () {
+    config(['queue.default' => 'redis']);
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/settings')->assertOk()
+        ->assertJsonPath('settings.redis.unsafe_policies', ['allkeys-lru', 'allkeys-lfu', 'allkeys-random']);
+
+    config(['queue.default' => 'database']);
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/settings')->assertOk()
+        ->assertJsonPath('settings.redis.unsafe_policies', []);
+});
+
+it('omits redis and 404s its update when redis-cli is absent', function () {
+    config(['server.redis_cli' => $this->dir.'/nope']);
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->getJson('/api/settings')->assertOk()
+        ->assertJsonMissingPath('settings.redis');
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/redis', ['maxmemory' => '0', 'maxmemory_policy' => 'noeviction'])
+        ->assertNotFound();
+});
+
+it('denies a viewer without manage from changing settings', function () {
+    fakeSettings();
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'setting', view: true, manage: false);
+    $token = $viewer->createToken('t')->plainTextToken;
+
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->getJson('/api/settings')->assertOk();
+    $this->withHeader('Authorization', "Bearer {$token}")
+        ->putJson('/api/settings/general', ['timezone' => 'Etc/UTC', 'hostname' => 'x', 'ntp' => true])
+        ->assertForbidden();
+});
+
+describe('the ssh whitelist cannot lock the administrator out', function () {
+    /** `sshd -T` reporting whatever policy the box already has. */
+    function fakeSshdPolicy(string $extra): void
+    {
+        Process::fake(function ($process) use ($extra) {
+            $cmd = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($cmd[0] ?? '') === 'sshd' && ($cmd[1] ?? '') === '-T') {
+                return Process::result(output: "port 22\npermitrootlogin prohibit-password\npasswordauthentication yes\n".$extra);
+            }
+
+            if (($cmd[0] ?? '') === 'ufw') {
+                return Process::result(output: "Status: inactive\n");
+            }
+
+            // `tee` and `rm` are how ManagedFile works, so the fake has to do
+            // them or the assertions below inspect a file that never appeared.
+            if (($cmd[0] ?? '') === 'tee') {
+                File::put($cmd[1], (string) $process->input);
+            }
+
+            if (($cmd[0] ?? '') === 'rm') {
+                File::delete(end($cmd));
+            }
+
+            return Process::result(exitCode: 0);
+        });
+    }
+
+    it('always leaves root a way in', function () {
+        fakeSshdPolicy('');
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'prohibit-password', 'password_authentication' => true])
+            ->assertOk();
+
+        // PermitRootLogin still governs root; this only stops AllowGroups
+        // refusing it before that setting is ever read.
+        expect(File::get($this->dir.'/00-panel.conf'))->toContain('root');
+    });
+
+    it('widens a policy the server already had rather than narrowing it', function () {
+        fakeSshdPolicy("allowgroups devops\n");
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        // Someone chose `devops` deliberately. Dropping it would cut off
+        // whoever that group exists for.
+        expect(File::get($this->dir.'/00-panel.conf'))->toContain('devops');
+    });
+
+    it('keeps every group sshd reports, not just the last one', function () {
+        // `sshd -T` prints a list keyword once PER ENTRY (`AllowGroups admins devs ops`). Keeping
+        // the last line wrote a drop-in that wins and locks out `admins` and `devs`.
+        fakeSshdPolicy("allowgroups admins\nallowgroups devs\nallowgroups ops\n");
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        expect(File::get($this->dir.'/00-panel.conf'))->toContain('AllowGroups ssh-users sudo root admins devs ops');
+    });
+
+    it('writes no group whitelist at all when the server restricts by user', function () {
+        fakeSshdPolicy("allowusers deployer\n");
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        // AllowUsers and AllowGroups are ANDed: a user must match both. Adding
+        // ours could only take access away from a list somebody else chose.
+        expect(File::get($this->dir.'/00-panel.conf'))->not->toContain('AllowGroups');
+    });
+
+    it('creates the group before naming it in the config', function () {
+        fakeSshdPolicy('');
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        // A whitelist entry matching no group matches no user — it does not
+        // fail, it just quietly stops being one of the ways in.
+        Process::assertRan(fn ($p) => in_array('groupadd', $p->command, true)
+            && in_array('ssh-users', $p->command, true));
+    });
+});
+
+it('keeps the existing swap when the new one cannot be allocated', function () {
+    // A full disk is the usual reason `fallocate` fails, and the reason somebody resizes swap.
+    // Removing the old file first would leave the server with no swap and an fstab line pointing
+    // at nothing.
+    fakeSettings(swapActive: true);
+    File::put(test()->swapFile, 'the swap in use right now');
+
+    Process::fake(function ($process) {
+        $cmd = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($cmd[0] ?? '') === 'swapon' && ($cmd[1] ?? '') === '--show=NAME') {
+            return Process::result(output: test()->swapFile."\n");
+        }
+
+        if (($cmd[0] ?? '') === 'fallocate') {
+            return Process::result(exitCode: 1, errorOutput: 'fallocate: no space left on device');
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->putJson('/api/settings/swap', ['size_mb' => 4096])
+        ->assertStatus(500);
+
+    // Still there, still the swap the server is running on.
+    expect(File::exists(test()->swapFile))->toBeTrue()
+        ->and(File::get(test()->swapFile))->toBe('the swap in use right now');
+    Process::assertNotRan(fn ($p) => $p->command === ['rm', '-f', test()->swapFile]);
+});
+
+it('refuses a hostname the kernel would not keep as given', function (string $hostname) {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', ['timezone' => 'Etc/UTC', 'hostname' => $hostname, 'ntp' => true])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('hostname');
+
+    Process::assertDidntRun(fn ($p) => ($p->command[0] ?? '') === 'hostnamectl' && ($p->command[1] ?? '') === 'set-hostname');
+})->with([
+    'empty label' => 'a..b',
+    'trailing dot' => 'web.',
+    'longer than 64' => str_repeat('x', 70),
+    'label longer than 63' => str_repeat('a', 64).'.b',
+    'hyphen at label end' => 'web-.example',
+    'underscore' => 'web_01',
+]);
+
+it('accepts ordinary hostnames up to 64 characters', function (string $hostname) {
+    fakeSettings();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', ['timezone' => 'Etc/UTC', 'hostname' => $hostname, 'ntp' => true])
+        ->assertOk();
+})->with([
+    'single label' => 'web-01',
+    'fqdn' => 'srv1.example.com',
+    'exactly 64' => str_repeat('a', 31).'.'.str_repeat('b', 32),
+]);
+
+it('makes the new hostname resolve, so sudo does not hang on it', function () {
+    fakeSettings();
+    File::put($this->dir.'/hosts', "127.0.0.1\tlocalhost\n127.0.1.1\tserver.example\n10.0.0.5\tinternal\n");
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', [
+            'timezone' => 'Etc/UTC', 'ntp' => true, 'hostname' => 'renamed.example',
+        ])->assertOk();
+
+    $hosts = File::get($this->dir.'/hosts');
+
+    // `hostnamectl` changes the name and nothing else; a name that does not
+    // resolve makes every `sudo` wait out a DNS timeout, which reads as a
+    // network fault rather than a settings change.
+    expect($hosts)->toContain("127.0.1.1\trenamed.example")
+        // One 127.0.1.1 line, not one per rename — otherwise the first one
+        // wins and after two renames that is nobody's current hostname.
+        ->and(substr_count($hosts, '127.0.1.1'))->toBe(1)
+        // Somebody else's entries are not ours to tidy away.
+        ->and($hosts)->toContain('10.0.0.5')
+        ->and($hosts)->toContain('localhost');
+});
+
+it('leaves the hosts file alone when the hostname did not change', function () {
+    fakeSettings();
+    File::put($this->dir.'/hosts', "127.0.1.1\tserver.example\n");
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', [
+            'timezone' => 'Europe/Berlin', 'ntp' => true, 'hostname' => 'server.example',
+        ])->assertOk();
+
+    Process::assertNotRan(fn ($p) => in_array('hostnamectl', $p->command, true)
+        && in_array('set-hostname', $p->command, true));
+});
+
+it('never rewrites the hosts file from a read that came back empty', function () {
+    fakeSettings();
+    File::put($this->dir.'/hosts', "127.0.0.1\tlocalhost\n127.0.1.1\told.example\n");
+
+    // Read succeeds but returns nothing. An empty hosts file does not exist in
+    // reality — every machine has a localhost line — so believing this one
+    // would replace localhost with our single entry.
+    Process::fake(function ($process) {
+        $cmd = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+        if (($cmd[0] ?? '') === 'hostnamectl' && ($cmd[1] ?? '') === '--static') {
+            return Process::result(output: 'server.example');
+        }
+
+        if (($cmd[0] ?? '') === 'cat') {
+            return Process::result(output: '');
+        }
+
+        if (($cmd[0] ?? '') === 'tee') {
+            File::put($cmd[1], (string) $process->input);
+        }
+
+        return Process::result(exitCode: 0);
+    });
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', [
+            'timezone' => 'Etc/UTC', 'ntp' => true, 'hostname' => 'renamed.example',
+        ])->assertOk();
+
+    expect(File::get($this->dir.'/hosts'))->toContain('localhost');
+});
+
+describe('a scheduled restart', function () {
+    it('answers when it will happen, from the server\'s own clock', function () {
+        // `when` is "+60". A client turning that into a time with its own clock is wrong by however
+        // far the two have drifted, and `shutdown` obeys the server's clock, so the server answers.
+        fakeSettings();
+
+        $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->postJson('/api/settings/reboot', ['delay_minutes' => 30])
+            ->assertStatus(202);
+
+        expect($response->json('reboot.delay_minutes'))->toBe(30)
+            ->and($response->json('reboot.at'))
+            ->toBe(now()->addMinutes(30)->format('d-m-Y H:i:s'));
+    });
+
+    it('says the time in the server\'s timezone, as the reboot schedule does (FS-C7)', function () {
+        fakeSettings();
+        File::put($this->dir.'/timezone', "Europe/Berlin\n");
+        config(['server.timezone_file' => $this->dir.'/timezone']);
+        ServerTimezone::forget();
+
+        $response = $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->postJson('/api/settings/reboot', ['delay_minutes' => 30])
+            ->assertStatus(202);
+
+        $expected = now()->addMinutes(30)->setTimezone('Europe/Berlin');
+
+        expect($response->json('reboot.timezone'))->toBe('Europe/Berlin')
+            ->and($response->json('reboot.at'))->toBe($expected->format('d-m-Y H:i:s'))
+            ->and($response->json('reboot.at_iso'))->toBe($expected->toIso8601String());
+
+        ServerTimezone::forget();
+    });
+
+    it('reports one that is already pending, read from systemd', function () {
+        // Read rather than remembered: a reboot can be scheduled from a shell
+        // without the panel, and a panel that only knew about its own would
+        // report "none" while the machine counts down.
+        $at = now()->addHour()->startOfSecond();
+        $file = $this->dir.'/shutdown-scheduled';
+        File::put($file, 'USEC='.($at->getTimestamp() * 1_000_000)."\nWARN_WALL=1\nMODE=reboot\n");
+        config(['server.reboot.scheduled_file' => $file]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.scheduled', true)
+            ->assertJsonPath('reboot.at', $at->format('d-m-Y H:i:s'));
+    });
+
+    it('reports none when systemd has no pending shutdown', function () {
+        config(['server.reboot.scheduled_file' => $this->dir.'/no-such-file']);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.scheduled', false)
+            ->assertJsonPath('reboot.at', null);
+    });
+
+    it('needs no elevated privilege to answer', function () {
+        // sudo is not needed: /run/systemd/shutdown is 0755 root. Asking it returned 500 on a server
+        // whose grant was out of date, from an endpoint the settings screen calls on load.
+        $file = $this->dir.'/shutdown-scheduled';
+        File::put($file, 'USEC='.(now()->addHour()->getTimestamp() * 1_000_000)."\n");
+        config(['server.reboot.scheduled_file' => $file]);
+
+        // Every command refused. The answer must not depend on one.
+        Process::fake(fn () => Process::result(
+            errorOutput: 'sudo: a password is required',
+            exitCode: 1,
+        ));
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.scheduled', true);
+    });
+
+    it('can be cancelled', function () {
+        // `shutdown -c`: a restart scheduled an hour out must be stoppable, not only watchable.
+        fakeSettings();
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->deleteJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.scheduled', false);
+
+        Process::assertRan(fn ($p) => $p->command === ['shutdown', '-c']);
+        $this->assertDatabaseHas('activity_logs', ['type' => 'setting', 'action' => 'reboot_cancelled']);
+    });
+
+    it('measures how long is left here, so the browser only has to tick', function () {
+        // The countdown cannot subtract `at` from the browser's clock: the string carries no offset
+        // and the clocks drift. So the server says how many seconds are left and the browser only
+        // counts them off. Frozen, or this asserts against how long the request took.
+        $this->freezeTime();
+
+        $at = now()->addMinutes(15)->startOfSecond();
+        $file = $this->dir.'/shutdown-scheduled';
+        File::put($file, 'USEC='.($at->getTimestamp() * 1_000_000)."\nMODE=reboot\n");
+        config(['server.reboot.scheduled_file' => $file]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.seconds_remaining', 900);
+    });
+
+    it('opens at the delay that was asked for, not one second under it', function () {
+        // The request lands a fraction of a second after systemd's whole-second USEC, so a
+        // 15-minute restart measures 899.4 seconds away; truncating would open the countdown at
+        // 14:59 for a delay the user set to 15 minutes.
+        $this->travelTo(Carbon::parse('2026-01-01 00:00:00.600'));
+
+        $file = $this->dir.'/shutdown-scheduled';
+        File::put($file, 'USEC='.(Carbon::parse('2026-01-01 00:15:00')->getTimestamp() * 1_000_000)."\n");
+        config(['server.reboot.scheduled_file' => $file]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.seconds_remaining', 900);
+    });
+
+    it('never counts down past zero on a deadline already gone', function () {
+        // systemd leaves the file in place between the deadline passing and the machine going
+        // down; a negative number would render as a countdown running backwards.
+        $file = $this->dir.'/shutdown-scheduled';
+        File::put($file, 'USEC='.(now()->subMinutes(5)->getTimestamp() * 1_000_000)."\n");
+        config(['server.reboot.scheduled_file' => $file]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.scheduled', true)
+            ->assertJsonPath('reboot.seconds_remaining', 0);
+    });
+
+    it('says it cannot measure rather than guessing, when systemd wrote no timestamp', function () {
+        $file = $this->dir.'/shutdown-scheduled';
+        File::put($file, "MODE=reboot\nWARN_WALL=1\n");
+        config(['server.reboot.scheduled_file' => $file]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.scheduled', true)
+            ->assertJsonPath('reboot.at', null)
+            ->assertJsonPath('reboot.seconds_remaining', null);
+    });
+
+    it('carries the same measurement on the response that schedules one', function () {
+        // So the card counts down from the moment it is scheduled, without
+        // waiting for the next read of systemd to tell it what it just did.
+        fakeSettings();
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->postJson('/api/settings/reboot', ['delay_minutes' => 5])
+            ->assertStatus(202)
+            ->assertJsonPath('reboot.seconds_remaining', 300);
+    });
+
+    it('always answers with the field, so a stripped key cannot pass unnoticed', function () {
+        // The frontend schema requires it. Every branch must carry it, or the
+        // countdown vanishes from the screen with nothing failing anywhere.
+        config(['server.reboot.scheduled_file' => $this->dir.'/no-such-file']);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.seconds_remaining', null);
+
+        fakeSettings();
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->deleteJson('/api/settings/reboot')
+            ->assertOk()
+            ->assertJsonPath('reboot.seconds_remaining', null);
+    });
+
+    it('refuses to cancel for a viewer without manage', function () {
+        fakeSettings();
+        $viewer = User::factory()->create();
+        grantPermission($viewer, 'setting', view: true, manage: false);
+
+        $this->withHeader('Authorization', 'Bearer '.$viewer->createToken('t')->plainTextToken)
+            ->deleteJson('/api/settings/reboot')
+            ->assertForbidden();
+    });
+});
+
+describe('the Redis password in the settings response', function () {
+    /**
+     * A panel configured with a Redis password, and a Redis that accepts it.
+     *
+     * The value comes from the panel's own config, not `CONFIG GET`; the ping decides whether it
+     * is still true.
+     */
+    function fakeRedisWithPassword(string $password = 's3cr3t-redis', bool $accepted = true): void
+    {
+        config(['database.redis.default.password' => $password]);
+
+        $redis = test()->redisCli;
+
+        Process::fake(function ($process) use ($redis, $accepted) {
+            $cmd = $process->command[0] === 'sudo' ? array_slice($process->command, 2) : $process->command;
+
+            if (($cmd[0] ?? '') !== $redis) {
+                return Process::result(exitCode: 0);
+            }
+
+            if (($cmd[1] ?? '') === 'ping') {
+                return $accepted
+                    ? Process::result(output: 'PONG')
+                    : Process::result(errorOutput: 'NOAUTH Authentication required.', exitCode: 1);
+            }
+
+            if (($cmd[1] ?? '') === 'config' && ($cmd[2] ?? '') === 'get') {
+                $key = $cmd[3] ?? '';
+
+                return Process::result(output: $key."\n".match ($key) {
+                    'maxmemory' => '0',
+                    'maxmemory-policy' => 'noeviction',
+                    default => '',
+                });
+            }
+
+            return Process::result(exitCode: 0);
+        });
+    }
+
+    it('sends the value to someone who could change it anyway', function () {
+        // The panel shows and copies this the way it already shows a system user's password.
+        fakeRedisWithPassword();
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings')->assertOk()
+            ->assertJsonPath('settings.redis.has_password', true)
+            ->assertJsonPath('settings.redis.password', 's3cr3t-redis');
+    });
+
+    it('withholds it from a read-only role, which still learns one is set', function () {
+        // Not a system user's password: Redis backs the panel's sessions, cache and queue, so it
+        // unlocks the panel, not one customer's account. A viewer can see that a password exists
+        // but cannot act on the value, so it does not travel.
+        fakeRedisWithPassword();
+
+        $viewer = User::factory()->create();
+        grantPermission($viewer, 'setting', view: true, manage: false);
+
+        $this->withHeader('Authorization', 'Bearer '.$viewer->createToken('t')->plainTextToken)
+            ->getJson('/api/settings')->assertOk()
+            ->assertJsonPath('settings.redis.has_password', true)
+            ->assertJsonPath('settings.redis.password', null);
+    });
+
+    it('says when the stored password no longer opens Redis', function () {
+        // Someone changed `requirepass` on the server, so the panel's copy is stale. The value is
+        // still shown: it is what the panel uses, and seeing it is how you notice Redis wants
+        // something else.
+        fakeRedisWithPassword('stale-value', accepted: false);
+
+        $redis = $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings')->assertOk()->json('settings.redis');
+
+        expect($redis['password_out_of_sync'])->toBeTrue()
+            ->and($redis['has_password'])->toBeTrue()
+            ->and($redis['password'])->toBe('stale-value')
+            // Rejecting a credential is still an answer: Redis is up.
+            ->and($redis['running'])->toBeTrue();
+    });
+
+    it('leaves the sync question unanswered when Redis is not running', function () {
+        // Nothing to compare against, so the credential is unverified rather
+        // than wrong. Null, not false — a false here would say "checked, fine".
+        config(['database.redis.default.password' => 'whatever']);
+
+        Process::fake(fn () => Process::result(errorOutput: 'Could not connect', exitCode: 1));
+
+        $redis = $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings')->assertOk()->json('settings.redis');
+
+        expect($redis['running'])->toBeFalse()
+            ->and($redis['password_out_of_sync'])->toBeNull();
+    });
+
+    it('sends null when no password is set, not an empty string', function () {
+        // `has_password: false` is the answer; an empty string in a password
+        // field renders as a password that is blank.
+        fakeRedisWithPassword('');
+        config(['database.redis.default.password' => '']);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/settings')->assertOk()
+            ->assertJsonPath('settings.redis.has_password', false)
+            ->assertJsonPath('settings.redis.password', null);
+    });
+});
+
+describe('whether the SSH-access toggle is enforced', function () {
+    it('says not enforced until an AllowGroups names ssh-users', function () {
+        // A fresh server: the toggle reads off and the person logs in anyway. The list says so
+        // instead of implying it.
+        fakeSshdPolicy('');
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/system-users')
+            ->assertOk()
+            ->assertJsonPath('meta.ssh_access_enforced', false);
+    });
+
+    it('says enforced once ssh-users is whitelisted, wherever it falls in the list', function () {
+        fakeSshdPolicy("allowgroups admins\nallowgroups ssh-users\nallowgroups sudo\n");
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/system-users')
+            ->assertOk()
+            ->assertJsonPath('meta.ssh_access_enforced', true);
+    });
+
+    it('says unknown, not no, when sshd cannot be asked', function () {
+        Process::fake(fn () => Process::result(exitCode: 1, errorOutput: 'sudo: a password is required'));
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/system-users')
+            ->assertOk()
+            ->assertJsonPath('meta.ssh_access_enforced', null);
+    });
+});
+
+/*
+ * GET /settings was cached whole, sentences included, so the first request's language won: a
+ * Russian page read "Проверено: há 6 horas" right after a Portuguese request.
+ */
+it('answers each language in its own words when the settings are cached', function () {
+    config(['server.probe_cache_seconds' => 60]);
+    $manager = Mockery::mock(SettingsManager::class);
+    $manager->shouldReceive('all')->andReturnUsing(fn () => ['updates' => ['lists_refreshed_at_human' => now()->subHours(6)->diffForHumans()]]);
+    app()->instance(SettingsManager::class, $manager);
+
+    $ask = fn (string $locale) => $this->withHeaders(['Authorization' => "Bearer {$this->token}", 'Accept-Language' => $locale])
+        ->getJson('/api/settings')->assertOk()->json('settings.updates.lists_refreshed_at_human');
+
+    $pt = $ask('pt');
+    $ru = $ask('ru');
+
+    expect($pt)->toContain('há')
+        ->and($ru)->not->toBe($pt)
+        ->and($ru)->toContain('назад');
+});
+
+describe('the activity log says what a save changed', function () {
+    $changes = fn (string $group) => ActivityLog::where('type', 'setting')->where('action', 'updated')
+        ->where('properties->group', $group)->latest('id')->first()->properties['changes'];
+
+    it('records the SSH port and each other field that moved, old and new', function () use ($changes) {
+        fakeSettings(remembers: true);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk()
+            ->assertJsonPath('security.port', 2222);
+
+        // password_authentication was already on: sent, but not a change.
+        expect($changes('security'))->toBe([
+            ['field' => 'port', 'from' => 22, 'to' => 2222],
+            ['field' => 'permit_root_login', 'from' => 'prohibit-password', 'to' => 'no'],
+        ]);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/activity-log?filter[type]=setting')
+            ->assertOk()
+            ->assertJsonPath('activity_log.0.changes.0.label', 'SSH port')
+            ->assertJsonPath('activity_log.0.changes.0.text', 'SSH port changed from 22 to 2222')
+            ->assertJsonPath('activity_log.0.description', fn (string $d) => str_contains($d, 'SSH port changed from 22 to 2222'));
+    });
+
+    it('says nothing changed when the same values are saved again', function () use ($changes) {
+        fakeSettings(remembers: true);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 22, 'permit_root_login' => 'prohibit-password', 'password_authentication' => true])
+            ->assertOk();
+
+        expect($changes('security'))->toBe([]);
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->getJson('/api/activity-log?filter[type]=setting')
+            ->assertJsonPath('activity_log.0.changes', [])
+            ->assertJsonPath('activity_log.0.description', fn (string $d) => str_ends_with($d, '(nothing changed)'));
+    });
+
+    it('records the Redis memory limit and policy', function () use ($changes) {
+        fakeSettings(remembers: true);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/redis', ['maxmemory' => '256mb', 'maxmemory_policy' => 'volatile-lru'])
+            ->assertOk();
+
+        expect($changes('redis'))->toBe([
+            // Redis answers in bytes; 0 is "no limit".
+            ['field' => 'maxmemory', 'from' => null, 'to' => '256 MB'],
+            ['field' => 'maxmemory_policy', 'from' => 'noeviction', 'to' => 'volatile-lru'],
+        ]);
+    });
+
+    it('keeps the setting history readable for its group', function () {
+        fakeSettings(remembers: true);
+
+        $this->withHeader('Authorization', "Bearer {$this->token}")
+            ->putJson('/api/settings/security', ['port' => 2222, 'permit_root_login' => 'no', 'password_authentication' => true])
+            ->assertOk();
+
+        expect(app(SettingChangeLog::class)->forGroups(['security']))->toHaveKey('security');
+    });
+});

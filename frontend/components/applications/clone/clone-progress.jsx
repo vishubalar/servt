@@ -1,0 +1,370 @@
+import { useEffect, useRef, useState } from "react";
+import Link from "@/components/ui/app-link";
+import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
+import { ArrowRight, Check, CircleAlert, CircleCheck, Clock3, Copy, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { CLONE_IN_FLIGHT, cloneFailureTitle } from "@/lib/schemas/clone";
+import { fetchClone } from "@/lib/api/clone";
+import { apiDuration } from "@/lib/format/api-date";
+import { Badge } from "@/components/ui/badge";
+import { useRefresh } from "@/hooks/use-refresh";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { CopyButton } from "@/components/ui/copy-button";
+import { FACT_LABEL } from "@/lib/theme/facts";
+import { BreakableDomain } from "@/components/ui/breakable-domain";
+
+const POLL_MS = 2000;
+
+const POLL_LIMIT_MS = 20 * 60 * 1000;
+
+// The queue can drop a duplicate clone, so give up waiting after this.
+const NOT_STARTING_MS = 2 * 60 * 1000;
+
+export function CloneProgress({ clone: initial, sourceApplication, onDone, onAgain, onRetry }) {
+  const t = useTranslations("applications.clone.progress");
+  const { refresh, pending: refreshing } = useRefresh();
+  const router = useRouter();
+  const [clone, setClone] = useState(initial);
+  const [stalled, setStalled] = useState(false);
+  const [notStarting, setNotStarting] = useState(false);
+  const timer = useRef(null);
+
+  const inFlight = CLONE_IN_FLIGHT.includes(clone?.status);
+  const id = clone?.id;
+
+  useEffect(() => {
+    if (!inFlight || !id) return undefined;
+
+    async function poll() {
+      try {
+        const response = await fetchClone(id);
+        const next = response.data?.clone;
+        if (!next) return;
+        setClone(next);
+        if (!CLONE_IN_FLIGHT.includes(next.status)) {
+          router.refresh();
+          onDone?.(next);
+        }
+      } catch {
+        // retry on the next poll
+      }
+    }
+
+    timer.current = setInterval(poll, POLL_MS);
+    const stop = setTimeout(() => {
+      clearInterval(timer.current);
+      setStalled(true);
+    }, POLL_LIMIT_MS);
+    const waiting = setTimeout(() => setNotStarting(true), NOT_STARTING_MS);
+
+    return () => {
+      clearInterval(timer.current);
+      clearTimeout(stop);
+      clearTimeout(waiting);
+    };
+  }, [inFlight, id, router, onDone]);
+
+  if (!clone) return null;
+
+  if (clone.status === "completed") {
+    return <Completed clone={clone} sourceApplication={sourceApplication} onAgain={onAgain} />;
+  }
+  if (clone.status === "failed") return <Failed clone={clone} onAgain={() => (onRetry ?? onAgain)?.(clone)} />;
+
+  const total = clone.total_steps ?? STEP_KEYS.length;
+  const step = clone.step_number ?? 0;
+  const percent = total > 0 ? Math.round((step / total) * 100) : 0;
+
+  const queued = clone.status === "pending";
+  const neverStarted = queued && notStarting && !stalled;
+  const giveUp = stalled || neverStarted;
+
+  const stepsMatch = total === STEP_KEYS.length;
+
+  return (
+    <Card className="gap-0 overflow-hidden py-0">
+      <div className="flex items-start gap-3 border-b px-5 py-4">
+        <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary/10">
+          <Loader2 className="size-6 animate-spin text-primary" aria-hidden />
+        </span>
+        <div className="min-w-0 flex-1 space-y-1">
+          <p className="font-medium">
+            {stalled ? t("stalled") : neverStarted ? t("notStarting") : queued ? t("queued") : t("running")}
+          </p>
+          <p className="text-sm text-muted-foreground">
+            {stalled ? t("stalledBody") : neverStarted ? t("notStartingBody") : t("target", { domain: clone.domain })}
+          </p>
+          {!stalled && clone.started_at_human ? (
+            <p className="text-xs text-muted-foreground">
+              {t("started", { when: clone.started_at_human })}
+            </p>
+          ) : null}
+        </div>
+      </div>
+
+      <CardContent className="space-y-4 px-5 py-4">
+        <Progress value={percent} className="h-1.5" />
+
+        {stepsMatch ? (
+        <ol className="space-y-2.5">
+          {STEP_KEYS.map((key, index) => {
+            const position = index + 1;
+            const done = step > position;
+            const current = step === position;
+            return (
+              <li key={key} className="flex items-center gap-3 text-sm">
+                <span
+                  className={cn(
+                    "flex size-5 shrink-0 items-center justify-center rounded-full border",
+                    done && "border-success bg-success/10 text-success",
+                    current && "border-primary bg-primary/10 text-[color-mix(in_oklch,var(--primary)_80%,var(--foreground))] dark:text-primary",
+                    !done && !current && "border-muted-foreground/30 text-muted-foreground/50",
+                  )}
+                >
+                  {done ? (
+                    <Check className="size-3" />
+                  ) : current ? (
+                    <Loader2 className="size-3 animate-spin" />
+                  ) : (
+                    <span className="text-[0.625rem] tabular-nums">{position}</span>
+                  )}
+                </span>
+                <span className={cn(current && "font-medium", !done && !current && "text-muted-foreground")}>
+                  {t(`steps.${key}`)}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+        ) : (
+          <p className="text-sm">
+            {clone.current_step_title ?? t("step", { step, total })}
+          </p>
+        )}
+
+        {giveUp ? (
+          <div className="flex flex-col gap-2 sm:flex-row">
+            {stalled ? (
+              <Button
+                variant="outline"
+                onClick={refresh}
+                disabled={refreshing}
+                className="w-full sm:w-auto"
+              >
+                {refreshing ? <Loader2 className="size-4 animate-spin" /> : null}
+                {t("checkAgain")}
+              </Button>
+            ) : null}
+            <Button variant="outline" onClick={onAgain} className="w-full sm:w-auto">
+              {t("stopWatching")}
+            </Button>
+          </div>
+        ) : (
+          <p className="border-t pt-3 text-xs text-muted-foreground">{t("canLeave")}</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+const STEP_KEYS = ["provisioning", "copying_files", "cloning_database", "starting_process"];
+
+function Completed({ clone, sourceApplication, onAgain }) {
+  const t = useTranslations("applications.clone.progress");
+  const duration = apiDuration(clone.started_at, clone.finished_at);
+  const sourceName = sourceApplication?.name ?? clone.source_application_name;
+  const sourceDomain = sourceApplication?.domain;
+  const destinationName = clone.name || clone.domain;
+  const sourceHasSeparateDomain =
+    sourceDomain && String(sourceName ?? "").toLowerCase() !== sourceDomain.toLowerCase();
+  const destinationHasSeparateDomain =
+    clone.domain && destinationName.toLowerCase() !== clone.domain.toLowerCase();
+
+  return (
+    <Card className="h-full gap-0 overflow-hidden border-success/30 py-0">
+      <CardContent className="flex h-full flex-col p-0">
+        <div className="flex items-start gap-3 border-b bg-success/[0.04] px-5 py-5 sm:gap-4 sm:px-6">
+          <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-success/10 ring-1 ring-success/15">
+            <CircleCheck className="size-6 text-success" aria-hidden />
+          </span>
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="font-semibold tracking-tight">{t("doneTitle")}</h2>
+              <Badge
+                variant="outline"
+                className="border-success/30 bg-success/10 font-normal text-success"
+              >
+                {t("completedBadge")}
+              </Badge>
+            </div>
+            <p className="text-sm text-muted-foreground">{t("doneBody")}</p>
+          </div>
+        </div>
+
+        <div className="flex-1 space-y-4 px-5 py-5 sm:px-6">
+          <dl className="grid gap-2 rounded-xl border bg-muted/20 p-3 sm:grid-cols-[minmax(0,1fr)_2.5rem_minmax(0,1.2fr)] sm:items-stretch">
+            <div className="min-w-0 rounded-lg border bg-background/80 px-3 py-2.5">
+              <dt className={FACT_LABEL}>
+                {t("source")}
+              </dt>
+              <dd className="mt-1 truncate text-sm font-medium">{sourceName ?? "—"}</dd>
+              {sourceHasSeparateDomain ? (
+                <dd className="mt-0.5 font-mono text-xs break-words text-muted-foreground">
+                  <BreakableDomain domain={sourceDomain} />
+                </dd>
+              ) : null}
+            </div>
+
+            <span className="hidden items-center gap-1 text-muted-foreground/70 sm:flex" aria-hidden>
+              <span className="h-px flex-1 bg-border" />
+              <ArrowRight className="size-4 shrink-0" />
+            </span>
+
+            <div className="min-w-0 rounded-lg border border-success/20 bg-success/[0.06] px-3 py-2.5">
+              <dt className="text-xs font-medium text-success">
+                {t("destination")}
+              </dt>
+              <dd className="mt-1 flex min-w-0 items-center gap-1.5">
+                <span className="min-w-0 text-sm font-semibold break-words">
+                  {destinationHasSeparateDomain ? destinationName : <BreakableDomain domain={destinationName} />}
+                </span>
+                {!destinationHasSeparateDomain ? (
+                  <CopyButton value={clone.domain} label={t("copyDomain")} />
+                ) : null}
+              </dd>
+              {destinationHasSeparateDomain ? (
+                <dd className="mt-0.5 flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 font-mono text-xs break-words text-muted-foreground">
+                    <BreakableDomain domain={clone.domain} />
+                  </span>
+                  <CopyButton value={clone.domain} label={t("copyDomain")} />
+                </dd>
+              ) : null}
+            </div>
+          </dl>
+
+          {duration || clone.finished_at_human ? (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              {duration ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <Clock3 className="size-3.5" aria-hidden />
+                  {t("duration", { duration })}
+                </span>
+              ) : null}
+              {clone.finished_at_human ? (
+                <span>{t("finished", { when: clone.finished_at_human })}</span>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="flex flex-col-reverse gap-2 border-t px-5 py-4 sm:flex-row sm:justify-end sm:px-6">
+          <Button variant="outline" onClick={onAgain} className="w-full sm:w-auto">
+            <Copy className="size-4" />
+            {t("again")}
+          </Button>
+          {clone.target_application_id ? (
+            <Button asChild className="w-full sm:w-auto">
+              <Link href={`/applications/${clone.target_application_id}`}>
+                {t("open")}
+                <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+          ) : null}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function Failed({ clone, onAgain }) {
+  const t = useTranslations("applications.clone.progress");
+
+  return (
+    <Card className="gap-0 overflow-hidden border-destructive/30 py-0">
+      <CardContent className="space-y-4 px-5 py-5">
+        <div className="flex items-start gap-3">
+          <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-destructive/10">
+            <CircleAlert className="size-6 text-destructive" aria-hidden />
+          </span>
+          <div className="min-w-0 space-y-1">
+            <p className="font-medium">{t("failedTitle")}</p>
+            <p className="text-sm">{cloneFailureTitle(clone) ?? t("failedUnknown")}</p>
+            <p className="text-sm text-muted-foreground">{t("failedSafe")}</p>
+            {clone.reference ? (
+              <p className="pt-1 font-mono text-xs text-muted-foreground">
+                {t("reference", { reference: clone.reference })}
+              </p>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:justify-end">
+          <Button variant="outline" onClick={onAgain} className="w-full sm:w-auto">
+            {t("tryAgain")}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function CloneNextSteps({ applicationId, sourceProtected, sourceHasRepository = false, webhook = null }) {
+  const t = useTranslations("applications.clone.result.next");
+
+  const steps = [
+    ...(sourceProtected ? [{ key: "password", href: `/applications/${applicationId}/security` }] : []),
+    { key: "ssl", href: `/applications/${applicationId}/domains` },
+    { key: "backups", href: `/applications/${applicationId}/backups` },
+    ...(sourceHasRepository && !webhook?.url
+      ? [{ key: "deploys", href: `/applications/${applicationId}/deployment` }]
+      : []),
+  ];
+
+  return (
+    <Card className="h-full gap-0 overflow-hidden py-0">
+      <div className="border-b px-5 py-4">
+        <h2 className="font-semibold tracking-tight">{t("title")}</h2>
+        <p className="text-sm text-muted-foreground">{t("subtitle", { count: steps.length + (webhook?.url ? 1 : 0) })}</p>
+      </div>
+      <CardContent className="min-h-0 flex-1 p-0">
+        {webhook?.url ? (
+          <div className="space-y-2 border-b bg-warning/5 px-5 py-4">
+            <p className="text-sm font-medium text-warning">{t("webhook.title")}</p>
+            <p className="text-xs text-muted-foreground">{t("webhook.body")}</p>
+            <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
+              <code className="min-w-0 flex-1 truncate font-mono text-xs">{webhook.url}</code>
+              <CopyButton value={webhook.url} label={t("webhook.copyUrl")} />
+            </div>
+            {webhook.secret ? (
+              <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5">
+                <span className="shrink-0 text-xs text-muted-foreground">{t("webhook.secret")}</span>
+                <code className="min-w-0 flex-1 truncate font-mono text-xs">{webhook.secret}</code>
+                <CopyButton value={webhook.secret} label={t("webhook.copySecret")} />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <ul className="grid auto-rows-fr divide-y">
+          {steps.map((step) => (
+            <li key={step.key}>
+              <Link
+                href={step.href}
+                className="flex h-full items-center gap-3 px-5 py-3.5 transition-colors hover:bg-muted/40"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">{t(`items.${step.key}.title`)}</p>
+                  <p className="text-xs text-muted-foreground">{t(`items.${step.key}.body`)}</p>
+                </div>
+                <ArrowRight className="size-4 shrink-0 text-muted-foreground" />
+              </Link>
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
+  );
+}

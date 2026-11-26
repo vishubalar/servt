@@ -1,0 +1,563 @@
+<?php
+
+use App\Models\ActivityLog;
+use App\Models\SshKey;
+use App\Models\SystemUser;
+use App\Models\User;
+use Database\Seeders\PermissionSeeder;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Testing\TestResponse;
+
+/**
+ * The read-only facts the settings UI needs to say something true about each section: pending
+ * updates, the last unattended run, whether a key exists, clock sync, whether Redis is up.
+ *
+ * The recurring assertion is `null` rather than a value: each read can fail for ordinary reasons
+ * (a package not installed, a log the panel cannot open), and a confident `0` or `false` there has
+ * the same shape as a real answer.
+ */
+beforeEach(function () {
+    $this->seed(PermissionSeeder::class);
+    $this->admin = User::factory()->admin()->create();
+    $this->token = $this->admin->createToken('t')->plainTextToken;
+
+    $this->dir = sys_get_temp_dir().'/sv-oss-facts-'.uniqid();
+    File::ensureDirectoryExists($this->dir);
+
+    $this->aptCheck = $this->dir.'/apt-check';
+    $this->stamp = $this->dir.'/update-success-stamp';
+    $this->redisCli = $this->dir.'/redis-cli';
+    File::put($this->redisCli, '');
+
+    config([
+        'server.sshd_config_dir' => $this->dir,
+        'server.unattended_upgrades_file' => $this->dir.'/99-panel-upgrades',
+        'server.reboot_required_file' => $this->dir.'/reboot-required',
+        'server.apt_check' => $this->aptCheck,
+        'server.apt_update_stamp' => $this->stamp,
+        'server.unattended_upgrades_log' => $this->dir.'/unattended.log',
+        'server.unattended_upgrades_dpkg_log' => $this->dir.'/unattended-dpkg.log',
+        'server.redis_cli' => $this->redisCli,
+        'server.proc_dir' => $this->dir,
+        'server.swap_file' => $this->dir.'/swapfile',
+        'server.fstab' => $this->dir.'/fstab',
+    ]);
+
+    File::put($this->dir.'/meminfo', "SwapTotal:             0 kB\nSwapFree:              0 kB\n");
+});
+
+afterEach(fn () => File::deleteDirectory($this->dir));
+
+/**
+ * @param  array<string, mixed>  $overrides
+ */
+function fakeFacts(array $overrides = []): void
+{
+    $aptCheck = test()->aptCheck;
+    $redis = test()->redisCli;
+
+    $dpkgLog = (string) config('server.unattended_upgrades_dpkg_log');
+
+    Process::fake(function ($process) use ($aptCheck, $redis, $dpkgLog, $overrides) {
+        $cmd = $process->command;
+        $bin = $cmd[0] ?? '';
+
+        // No authorized_keys on disk unless a test says otherwise: the key check asks the server
+        // (SecuritySettings::hasSshKey()), and a catch-all success would read as a key for root and
+        // every sudoer.
+        if ($bin === 'test' && ($cmd[1] ?? '') === '-s' && str_ends_with((string) end($cmd), '/.ssh/authorized_keys')) {
+            return Process::result(exitCode: 1);
+        }
+
+        if ($bin === 'tee') {
+            File::put($cmd[1], (string) $process->input);
+
+            return Process::result(exitCode: 0);
+        }
+
+        // apt-check answers on stderr and says nothing on stdout.
+        if ($bin === $aptCheck) {
+            return array_key_exists('apt_check', $overrides)
+                ? $overrides['apt_check']
+                : Process::result(errorOutput: '43;1');
+        }
+
+        // Two logs are tailed and say different things, so tell them apart by path, not binary.
+        if ($bin === 'tail') {
+            return in_array($dpkgLog, $cmd, true)
+                ? ($overrides['unattended_dpkg'] ?? Process::result(exitCode: 1))
+                : ($overrides['unattended'] ?? Process::result(exitCode: 1));
+        }
+
+        if ($bin === 'timedatectl' && ($cmd[1] ?? '') === 'show') {
+            $property = $cmd[2] ?? '';
+
+            if (str_contains($property, 'NTPSynchronized')) {
+                return Process::result(output: $overrides['synchronized'] ?? 'yes');
+            }
+            if (str_contains($property, 'NTP')) {
+                return Process::result(output: 'yes');
+            }
+
+            return $overrides['timezone'] ?? Process::result(output: 'Etc/UTC');
+        }
+
+        if ($bin === 'hostnamectl') {
+            return Process::result(output: 'server.example');
+        }
+        if ($bin === 'sshd' && ($cmd[1] ?? '') === '-T') {
+            return Process::result(output: "port 22\npermitrootlogin prohibit-password\npasswordauthentication yes\n".($overrides['sshd_extra'] ?? ''));
+        }
+        if ($bin === 'ufw') {
+            return Process::result(output: "Status: inactive\n");
+        }
+
+        if ($bin === $redis) {
+            if (($cmd[1] ?? '') === 'ping') {
+                return $overrides['ping'] ?? Process::result(output: 'PONG');
+            }
+            if (($cmd[1] ?? '') === 'info') {
+                return $overrides['info'] ?? Process::result(
+                    output: "# Memory\nused_memory:1048576\nused_memory_human:1.00M\n",
+                );
+            }
+            if (($cmd[1] ?? '') === 'config') {
+                $key = $cmd[3] ?? '';
+
+                return Process::result(output: $key."\n".match ($key) {
+                    'maxmemory' => '0',
+                    'maxmemory-policy' => 'noeviction',
+                    default => '',
+                });
+            }
+        }
+
+        return Process::result(exitCode: 0);
+    });
+}
+
+function readSettings(): TestResponse
+{
+    return test()->withHeader('Authorization', 'Bearer '.test()->token)
+        ->getJson('/api/settings')->assertOk();
+}
+
+it('counts pending and security updates from apt-check stderr', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts();
+
+    readSettings()
+        ->assertJsonPath('settings.updates.updates_available', 43)
+        ->assertJsonPath('settings.updates.security_updates_available', 1);
+});
+
+it('reports null update counts when apt-check is not installed', function () {
+    fakeFacts();
+    // No file at the configured path — update-notifier-common is absent.
+
+    readSettings()
+        ->assertJsonPath('settings.updates.updates_available', null)
+        ->assertJsonPath('settings.updates.security_updates_available', null);
+});
+
+it('reports null rather than zero when apt-check fails', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['apt_check' => Process::result(exitCode: 1, errorOutput: 'boom')]);
+
+    // Zero would claim the server is up to date on the strength of a failure.
+    readSettings()
+        ->assertJsonPath('settings.updates.updates_available', null)
+        ->assertJsonPath('settings.updates.security_updates_available', null);
+});
+
+it('reads the last successful apt refresh from the stamp file', function () {
+    File::put($this->aptCheck, '');
+    File::put($this->stamp, '');
+    touch($this->stamp, mktime(9, 30, 0, 7, 14, 2026));
+    fakeFacts();
+
+    readSettings()->assertJsonPath('settings.updates.lists_refreshed_at', '14-07-2026 09:30:00');
+});
+
+it('reports a successful unattended-upgrades run', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-07-30 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-07-30 06:00:02,002 ERROR something went wrong in a previous run',
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:09,123 INFO All upgrades installed',
+    ]))]);
+
+    // The older run's ERROR sits before the last start marker and must not
+    // colour today's result.
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_result', 'success')
+        ->assertJsonPath('settings.updates.unattended_last_run_at', '01-08-2026 06:00:09');
+});
+
+it('reports a failed unattended-upgrades run', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:04,004 ERROR Could not fetch archives',
+    ]))]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_result', 'failed')
+        ->assertJsonPath('settings.updates.unattended_last_run_at', '01-08-2026 06:00:04');
+});
+
+it('reports nulls when the unattended log cannot be read', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(exitCode: 1, errorOutput: 'Permission denied')]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_run_at', null)
+        ->assertJsonPath('settings.updates.unattended_last_result', null);
+});
+
+it('reports whether the server has any ssh key', function () {
+    fakeFacts();
+
+    readSettings()->assertJsonPath('settings.security.has_ssh_key', false);
+
+    $systemUser = SystemUser::query()->create([
+        'username' => 'deploy',
+        'shell' => '/bin/bash',
+        'home_path' => '/home/deploy',
+    ]);
+    SshKey::query()->create([
+        'system_user_id' => $systemUser->id,
+        'name' => 'laptop',
+        'public_key' => 'ssh-ed25519 AAAAC3Nz key',
+        'fingerprint' => 'SHA256:abc',
+    ]);
+
+    // Its owner has SSH access off: the save writes AllowGroups ssh-users sudo root, so this key
+    // would let nobody in.
+    readSettings()->assertJsonPath('settings.security.has_ssh_key', false);
+
+    $systemUser->update(['ssh_access' => true]);
+    readSettings()->assertJsonPath('settings.security.has_ssh_key', true);
+
+    $systemUser->update(['shell' => '/usr/sbin/nologin']);
+    readSettings()->assertJsonPath('settings.security.has_ssh_key', false);
+
+    $systemUser->update(['shell' => '/bin/bash', 'ssh_access' => false, 'sudo' => true]);
+    readSettings()->assertJsonPath('settings.security.has_ssh_key', true);
+});
+
+it('says whether a save will start enforcing SSH access (FS-C6)', function () {
+    fakeFacts();
+    readSettings()->assertJsonPath('settings.security.save_enforces_ssh_access', true);
+
+    // Already written by an earlier save: nothing new happens.
+    fakeFacts(['sshd_extra' => "allowgroups ssh-users\nallowgroups sudo\nallowgroups root\n"]);
+    readSettings()->assertJsonPath('settings.security.save_enforces_ssh_access', false);
+
+    // AllowUsers in charge: the panel writes no AllowGroups at all.
+    fakeFacts(['sshd_extra' => "allowusers admin\n"]);
+    readSettings()->assertJsonPath('settings.security.save_enforces_ssh_access', false);
+});
+
+it('says the clock is unknown when timedatectl does not answer (OLD-3)', function () {
+    fakeFacts(['timezone' => Process::result(exitCode: 1, errorOutput: 'Failed to connect to bus')]);
+
+    readSettings()
+        ->assertJsonPath('settings.general.timezone', null)
+        ->assertJsonPath('settings.general.ntp', null)
+        ->assertJsonPath('settings.general.clock_synchronized', null);
+});
+
+it('distinguishes a synchronised clock from an enabled ntp daemon', function () {
+    fakeFacts(['synchronized' => 'no']);
+
+    readSettings()
+        ->assertJsonPath('settings.general.ntp', true)
+        ->assertJsonPath('settings.general.clock_synchronized', false);
+});
+
+it('reports redis memory usage when redis is running', function () {
+    fakeFacts();
+
+    readSettings()
+        ->assertJsonPath('settings.redis.running', true)
+        ->assertJsonPath('settings.redis.memory_used', 1048576)
+        ->assertJsonPath('settings.redis.memory_used_human', '1.00M');
+});
+
+it('reports redis as running when it answers NOAUTH', function () {
+    fakeFacts(['ping' => Process::result(exitCode: 1, errorOutput: 'NOAUTH Authentication required.')]);
+
+    // A refusal to answer without a password is still proof of a live server.
+    readSettings()->assertJsonPath('settings.redis.running', true);
+});
+
+it('reports redis as not running when it does not answer', function () {
+    fakeFacts([
+        'ping' => Process::result(exitCode: 1, errorOutput: 'Could not connect to Redis'),
+    ]);
+
+    readSettings()
+        ->assertJsonPath('settings.redis.running', false)
+        ->assertJsonPath('settings.redis.memory_used', null);
+});
+
+it('reports who last changed each settings group', function () {
+    fakeFacts();
+
+    $this->withHeader('Authorization', "Bearer {$this->token}")
+        ->putJson('/api/settings/general', [
+            'timezone' => 'Etc/UTC',
+            'hostname' => 'server.example',
+            'ntp' => true,
+        ])->assertOk();
+
+    readSettings()
+        ->assertJsonPath('last_changed.general.user.username', $this->admin->username)
+        ->assertJsonPath('last_changed.general.user.id', $this->admin->id);
+});
+
+it('omits groups that have never been changed', function () {
+    fakeFacts();
+
+    $response = readSettings();
+
+    expect($response->json('last_changed'))->toBe([]);
+});
+
+it('finds the reboot schedule change under its own verb', function () {
+    fakeFacts();
+
+    // It logs `setting.reboot_schedule_updated` with no `group` property, so a
+    // lookup keyed on the group alone would report it as never changed.
+    ActivityLog::query()->create([
+        'user_id' => $this->admin->id,
+        'type' => 'setting',
+        'action' => 'reboot_schedule_updated',
+        'properties' => ['enabled' => 'yes'],
+    ]);
+
+    readSettings()->assertJsonPath('last_changed.reboot_schedule.user.username', $this->admin->username);
+});
+
+/*
+ * Why the automatic update failed, not only that it did. The commonest cause is a transient apt
+ * lock that needs no action, which the screen could not tell from a held package or a broken
+ * post-install script.
+ */
+
+it('says why the last unattended run failed', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:04,004 ERROR Lock could not be acquired (another package manager running?)',
+    ]))]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_result', 'failed')
+        // The sentence unattended-upgrades wrote, without the timestamp and level.
+        ->assertJsonPath(
+            'settings.updates.unattended_last_error',
+            'Lock could not be acquired (another package manager running?)',
+        );
+});
+
+it('reports no reason when the run succeeded', function () {
+    // A stale reason beside a green state would be worse than none.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:09,123 INFO All upgrades installed',
+    ]))]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_result', 'success')
+        ->assertJsonPath('settings.updates.unattended_last_error', null);
+});
+
+it('redacts a credential an apt error quoted back', function () {
+    // An apt failure can echo the repository URL it could not reach, and anyone who can open the
+    // settings page can read this field.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:04,004 ERROR Failed to fetch https://deploy:s3cr3t@repo.example.com/ubuntu',
+    ]))]);
+
+    $error = readSettings()->json('settings.updates.unattended_last_error');
+
+    expect($error)->not->toContain('s3cr3t')
+        ->and($error)->toContain('repo.example.com');
+});
+
+it('keeps a Traceback to its first line', function () {
+    // A Python stack is not what a settings card needs; the full text stays in the log.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:04,004 ERROR '.str_repeat('very long detail ', 60),
+    ]))]);
+
+    $error = (string) readSettings()->json('settings.updates.unattended_last_error');
+
+    // 300 plus the ellipsis Str::limit appends; the marker tells the reader there is more.
+    expect(strlen($error))->toBeLessThanOrEqual(303)
+        ->and($error)->toEndWith('...');
+});
+
+/*
+ * The run, not only the line that decided it. One line answers "is this urgent" but not "why did
+ * this package refuse": unattended-upgrades narrates that across several lines, and dpkg narrates
+ * the part that matters in a different file.
+ */
+
+it('includes the failed run as a log excerpt', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-07-30 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-07-30 06:00:02,002 INFO a previous run nobody is asking about',
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:03,003 INFO Packages that will be upgraded: curl',
+        '2026-08-01 06:00:04,004 ERROR Could not fetch archives',
+    ]))]);
+
+    $log = (string) readSettings()->json('settings.updates.unattended_last_log');
+
+    expect($log)->toContain('Packages that will be upgraded: curl')
+        ->and($log)->toContain('Could not fetch archives')
+        // Scoped to the run being reported, the same way the verdict is.
+        ->and($log)->not->toContain('a previous run nobody is asking about');
+});
+
+it('reports no excerpt when the run succeeded', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:09,123 INFO All upgrades installed',
+    ]))]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_log', null)
+        ->assertJsonPath('settings.updates.unattended_last_log_truncated', false);
+});
+
+it('carries the dpkg log, where the reason for a failed package actually is', function () {
+    // unattended-upgrades says a package failed; dpkg says why.
+    File::put($this->aptCheck, '');
+    fakeFacts([
+        'unattended' => Process::result(output: implode("\n", [
+            '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+            '2026-08-01 06:00:04,004 ERROR installing the upgrades failed!',
+        ])),
+        'unattended_dpkg' => Process::result(output: implode("\n", [
+            'Log started: 2026-07-01  06:00:00',
+            'an earlier upgrade that succeeded',
+            'Log started: 2026-08-01  06:00:02',
+            'Setting up nginx (1.24.0-1ubuntu1) ...',
+            'dpkg: error processing package nginx (--configure):',
+            ' installed nginx package post-installation script subprocess returned error exit status 1',
+        ])),
+    ]);
+
+    $log = (string) readSettings()->json('settings.updates.unattended_last_log');
+
+    expect($log)->toContain('post-installation script subprocess returned error exit status 1')
+        // Named, so dpkg's "Setting up ..." chatter is not read as unattended-upgrades' own.
+        ->and($log)->toContain('unattended-dpkg.log')
+        // Its own blocks are scoped too.
+        ->and($log)->not->toContain('an earlier upgrade that succeeded');
+});
+
+it('redacts every line of the excerpt, not only the headline', function () {
+    // The reason line is redacted already; a credentialled mirror can just as well be quoted by
+    // the INFO line above it, which is published too.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:02,002 INFO Using https://deploy:s3cr3t@repo.example.com/ubuntu',
+        '2026-08-01 06:00:04,004 ERROR Could not fetch archives',
+    ]))]);
+
+    $log = (string) readSettings()->json('settings.updates.unattended_last_log');
+
+    expect($log)->not->toContain('s3cr3t')
+        ->and($log)->toContain('repo.example.com');
+});
+
+it('says the excerpt is partial when the run began before the window', function () {
+    // No start marker in the tail means this is the end of a run, not all of it; presented as the
+    // whole story it would suggest the upgrade began with the error.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:03,003 INFO Packages that will be upgraded: curl',
+        '2026-08-01 06:00:04,004 ERROR Could not fetch archives',
+    ]))]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_last_result', 'failed')
+        ->assertJsonPath('settings.updates.unattended_last_log_truncated', true);
+});
+
+it('bounds the excerpt and says so', function () {
+    File::put($this->aptCheck, '');
+    $noise = array_map(
+        fn (int $i) => '2026-08-01 06:00:02,002 INFO '.str_repeat("padding line {$i} ", 20),
+        range(1, 400),
+    );
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        ...$noise,
+        '2026-08-01 06:00:04,004 ERROR Could not fetch archives',
+    ]))]);
+
+    $response = readSettings();
+    $log = (string) $response->json('settings.updates.unattended_last_log');
+
+    expect(strlen($log))->toBeLessThanOrEqual(8 * 1024)
+        // Bounded from the end: the failure is the last thing that happened and must survive.
+        ->and($log)->toContain('Could not fetch archives');
+
+    $response->assertJsonPath('settings.updates.unattended_last_log_truncated', true);
+});
+
+it('distinguishes a log it could not read from a box that has never run one', function () {
+    // Both read as all-nulls, but one of them is a broken panel.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(exitCode: 1, errorOutput: 'Permission denied')]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_log_readable', false)
+        ->assertJsonPath('settings.updates.unattended_last_result', null);
+});
+
+it('calls the log readable when it simply holds no run', function () {
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: '')]);
+
+    readSettings()
+        ->assertJsonPath('settings.updates.unattended_log_readable', true)
+        ->assertJsonPath('settings.updates.unattended_last_result', null);
+});
+
+it('withholds the excerpt from a viewer who cannot manage settings', function () {
+    // A dpkg excerpt can carry conffile diffs, debconf answers and mirror URLs.
+    // Viewing this group needs `setting`; this follows `setting,manage`.
+    File::put($this->aptCheck, '');
+    fakeFacts(['unattended' => Process::result(output: implode("\n", [
+        '2026-08-01 06:00:01,001 INFO Starting unattended upgrades script',
+        '2026-08-01 06:00:04,004 ERROR Could not fetch archives',
+    ]))]);
+
+    $viewer = User::factory()->create();
+    grantPermission($viewer, 'setting', view: true, manage: false);
+
+    $this->withHeader('Authorization', 'Bearer '.$viewer->createToken('t')->plainTextToken)
+        ->getJson('/api/settings')
+        ->assertOk()
+        ->assertJsonPath('settings.updates.unattended_last_log', null)
+        // The one-line reason stays: it tells a viewer whether to escalate, and is bounded and
+        // redacted.
+        ->assertJsonPath('settings.updates.unattended_last_error', 'Could not fetch archives');
+});
