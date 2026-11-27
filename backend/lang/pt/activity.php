@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'Definiu o registo de atividade para eliminar entradas com mais de :months meses',
     'setting.activity_retention_cleared' => 'Definiu o registo de atividade para manter todas as entradas',
     'setting.updated' => 'Atualizou as configurações de :group',
+    'setting.branding_updated' => 'Atualizou a identidade visual do painel',
+    'setting.branding_reset' => 'Redefiniu a identidade visual do painel para os padrões',
     'setting.reboot_schedule_updated' => 'Alterou o agendamento de reinício automático',
     'setting.security_updates_started' => 'Começou a instalar as atualizações de segurança',
     'setting.security_updates_installed' => 'Instalou as atualizações de segurança',

@@ -319,7 +319,8 @@
       "panelUpdate": "Atualização do painel",
       "doctor": "Saúde do sistema",
       "errorLogs": "Log de erros",
-      "central": "Central"
+      "central": "Central",
+      "branding": "Marca"
     },
     "unknown": "Desconhecido",
     "attention": {
@@ -8299,5 +8300,48 @@
       "application_install": "Instalação de aplicação",
       "container_redeploy": "Obter e reimplantar"
     }
+  },
+  "branding": {
+    "title": "Marca",
+    "subtitle": "Personalize o nome do painel, a cor de destaque, os logotipos e o favicon.",
+    "loadFailed": "Não foi possível carregar as configurações de marca.",
+    "centralNotice": "A marca central está ativa no momento e substitui os padrões do painel quando conectado.",
+    "identityTitle": "Identidade da marca",
+    "identityDesc": "Defina o nome do painel e a cor primária exibidos em toda a interface.",
+    "nameLabel": "Nome do painel",
+    "namePlaceholder": "ex.: Acme Cloud",
+    "colorLabel": "Cor primária",
+    "colorHint": "Escolha uma cor hexadecimal de destaque usada em botões, estados ativos e realces.",
+    "presetsLabel": "Predefinições",
+    "assetsTitle": "Logotipos e favicon",
+    "assetsDesc": "Envie arquivos SVG, PNG, JPG, WEBP ou ICO personalizados (máx. 2 MB cada).",
+    "logoLight": "Logotipo (modo claro)",
+    "logoDark": "Logotipo (modo escuro)",
+    "iconLight": "Ícone compacto (modo claro)",
+    "iconDark": "Ícone compacto (modo escuro)",
+    "favicon": "Favicon",
+    "uploadHint": "Clique para enviar ou solte uma imagem",
+    "resetAsset": "Restaurar padrão",
+    "previewTitle": "Pré-visualização ao vivo",
+    "previewDashboard": "Pré-visualização do painel",
+    "previewLogin": "Pré-visualização de login",
+    "previewButton": "Ação principal",
+    "resetAll": "Redefinir tudo para os padrões",
+    "resetConfirmTitle": "Redefinir marca para os padrões?",
+    "resetConfirmDesc": "Isso remove seu nome personalizado, cor e logotipos enviados.",
+    "resetConfirmAction": "Redefinir marca",
+    "saved": "Marca atualizada.",
+    "saveFailed": "Não foi possível salvar as configurações de marca.",
+    "resetSuccess": "Marca redefinida para os padrões.",
+    "resetFailed": "Não foi possível redefinir a marca.",
+    "invalidHex": "Digite uma cor hexadecimal válida de 6 dígitos, como #3B82F6.",
+    "invalidFile": "Escolha uma imagem SVG, PNG, JPG, WEBP ou ICO com menos de 2 MB.",
+    "setupStepBadge": "Etapa 1 de 2 — Opcional",
+    "setupTitle": "Personalize a marca do seu painel",
+    "setupSubtitle": "Defina o nome, a cor e o logotipo da sua marca antes de criar a conta de administrador.",
+    "setupSaveAndContinue": "Salvar marca e continuar",
+    "setupSkip": "Pular por enquanto",
+    "setupCustomizeButton": "Personalizar marca primeiro",
+    "setupBackToRegister": "Voltar para a configuração da conta"
   }
 }

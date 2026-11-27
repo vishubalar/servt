@@ -313,4 +313,5 @@ return [
     'git_repository_unreachable' => 'No se pudo acceder al repositorio. Comprueba la dirección y que la cuenta (o el repositorio, si es público) permite el acceso.',
     'git_host_unreachable' => 'El servidor no pudo conectar con el servidor git. Comprueba su conexión de red e inténtalo de nuevo.',
     'git_branch_missing' => 'La rama ":branch" no existe en este repositorio.',
+    'branding_unsafe_svg' => 'El archivo SVG subido para :attribute contiene scripts o manejadores de eventos no permitidos.',
 ];

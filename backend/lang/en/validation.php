@@ -327,4 +327,5 @@ return [
     'git_repository_unreachable' => 'The repository could not be reached. Check the address, and that the account (or the repository, if public) allows access.',
     'git_host_unreachable' => 'The server could not reach the git host. Check its network connection and try again.',
     'git_branch_missing' => 'The branch ":branch" does not exist in this repository.',
+    'branding_unsafe_svg' => 'The uploaded :attribute SVG contains disallowed scripts or event handlers.',
 ];

@@ -14,3 +14,15 @@ export const brandingSchema = z
     primary_color: brandingField,
   })
   .loose();
+
+export const adminBrandingResponseSchema = z
+  .object({
+    branding: brandingSchema
+      .extend({
+        custom: brandingSchema.optional(),
+        defaults: brandingSchema.optional(),
+        central_active: z.boolean().optional(),
+      })
+      .loose(),
+  })
+  .loose();

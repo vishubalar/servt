@@ -288,4 +288,5 @@ return [
     'git_repository_unreachable' => 'Le dépôt est inaccessible. Vérifiez l’adresse et que le compte (ou le dépôt, s’il est public) autorise l’accès.',
     'git_host_unreachable' => 'Le serveur n’a pas pu joindre l’hébergeur git. Vérifiez sa connexion réseau et réessayez.',
     'git_branch_missing' => 'La branche ":branch" n’existe pas dans ce dépôt.',
+    'branding_unsafe_svg' => 'Le fichier SVG envoyé pour :attribute contient des scripts ou des gestionnaires d’événements non autorisés.',
 ];

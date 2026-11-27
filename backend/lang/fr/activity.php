@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'A réglé le journal d’activité pour supprimer les entrées de plus de :months mois',
     'setting.activity_retention_cleared' => 'A réglé le journal d’activité pour conserver toutes les entrées',
     'setting.updated' => 'A mis à jour les paramètres :group',
+    'setting.branding_updated' => 'A mis à jour l’identité visuelle du panneau',
+    'setting.branding_reset' => 'A réinitialisé l’identité visuelle du panneau aux valeurs par défaut',
     'setting.reboot_schedule_updated' => 'A modifié la planification du redémarrage automatique',
     'setting.security_updates_started' => 'A lancé l’installation des mises à jour de sécurité',
     'setting.security_updates_installed' => 'A installé les mises à jour de sécurité',

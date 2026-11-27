@@ -319,7 +319,8 @@
       "panelUpdate": "パネルの更新",
       "doctor": "システムヘルス",
       "errorLogs": "エラーログ",
-      "central": "セントラル"
+      "central": "セントラル",
+      "branding": "ブランディング"
     },
     "unknown": "不明",
     "attention": {
@@ -8299,5 +8300,48 @@
       "application_install": "アプリケーションのインストール",
       "container_redeploy": "取得して再デプロイ"
     }
+  },
+  "branding": {
+    "title": "ブランディング",
+    "subtitle": "パネル名、アクセントカラー、ロゴ、ファビコンをカスタマイズします。",
+    "loadFailed": "ブランディング設定を読み込めませんでした。",
+    "centralNotice": "現在、セントラルブランディングが有効になっており、接続時はパネルのデフォルト設定より優先されます。",
+    "identityTitle": "ブランドアイデンティティ",
+    "identityDesc": "インターフェース全体に表示されるパネル名とプライマリカラーを設定します。",
+    "nameLabel": "パネル名",
+    "namePlaceholder": "例: Acme Cloud",
+    "colorLabel": "プライマリカラー",
+    "colorHint": "ボタン、アクティブ状態、ハイライトに使用するアクセント用の16進カラーコードを選択してください。",
+    "presetsLabel": "プリセット",
+    "assetsTitle": "ロゴとファビコン",
+    "assetsDesc": "カスタムの SVG、PNG、JPG、WEBP、または ICO ファイルをアップロードします（各最大 2 MB）。",
+    "logoLight": "ロゴ（ライトモード）",
+    "logoDark": "ロゴ（ダークモード）",
+    "iconLight": "コンパクトアイコン（ライトモード）",
+    "iconDark": "コンパクトアイコン（ダークモード）",
+    "favicon": "ファビコン",
+    "uploadHint": "クリックしてアップロード、または画像をドロップ",
+    "resetAsset": "デフォルトに戻す",
+    "previewTitle": "ライブプレビュー",
+    "previewDashboard": "パネルプレビュー",
+    "previewLogin": "ログインプレビュー",
+    "previewButton": "プライマリアクション",
+    "resetAll": "すべてデフォルトにリセット",
+    "resetConfirmTitle": "ブランディングをデフォルトにリセットしますか？",
+    "resetConfirmDesc": "これにより、カスタム名、カラー、アップロードされたロゴが削除されます。",
+    "resetConfirmAction": "ブランディングをリセット",
+    "saved": "ブランディングを更新しました。",
+    "saveFailed": "ブランディング設定を保存できませんでした。",
+    "resetSuccess": "ブランディングをデフォルトにリセットしました。",
+    "resetFailed": "ブランディングをリセットできませんでした。",
+    "invalidHex": "#3B82F6 のような有効な6桁の16進カラーコードを入力してください。",
+    "invalidFile": "2 MB 未満の SVG、PNG、JPG、WEBP、または ICO 画像を選択してください。",
+    "setupStepBadge": "ステップ 1 / 2 — 任意",
+    "setupTitle": "パネルをホワイトラベル化",
+    "setupSubtitle": "管理者アカウントを作成する前に、ブランド名、カラー、ロゴを設定してください。",
+    "setupSaveAndContinue": "ブランディングを保存して続行",
+    "setupSkip": "あとで",
+    "setupCustomizeButton": "先にブランドをカスタマイズ",
+    "setupBackToRegister": "アカウント設定に戻る"
   }
 }

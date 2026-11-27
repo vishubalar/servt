@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'Configuró el registro de actividad para eliminar entradas con más de :months meses',
     'setting.activity_retention_cleared' => 'Configuró el registro de actividad para conservar todas las entradas',
     'setting.updated' => 'Actualizó la configuración de :group',
+    'setting.branding_updated' => 'Actualizó la marca del panel',
+    'setting.branding_reset' => 'Restableció la marca del panel a los valores predeterminados',
     'setting.reboot_schedule_updated' => 'Cambió la programación de reinicio automático',
     'setting.security_updates_started' => 'Empezó a instalar las actualizaciones de seguridad',
     'setting.security_updates_installed' => 'Instaló las actualizaciones de seguridad',

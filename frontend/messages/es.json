@@ -319,7 +319,8 @@
       "panelUpdate": "Actualización del panel",
       "doctor": "Estado del sistema",
       "errorLogs": "Registro de errores",
-      "central": "Central"
+      "central": "Central",
+      "branding": "Marca"
     },
     "unknown": "Desconocido",
     "attention": {
@@ -8299,5 +8300,48 @@
       "application_install": "Instalación de aplicación",
       "container_redeploy": "Descargar y volver a desplegar"
     }
+  },
+  "branding": {
+    "title": "Marca",
+    "subtitle": "Personaliza el nombre del panel, el color de acento, los logotipos y el favicon.",
+    "loadFailed": "No se pudieron cargar los ajustes de marca.",
+    "centralNotice": "La marca centralizada está activa actualmente y anula los valores predeterminados del panel cuando está conectado.",
+    "identityTitle": "Identidad de marca",
+    "identityDesc": "Define el nombre del panel y el color principal mostrados en toda la interfaz.",
+    "nameLabel": "Nombre del panel",
+    "namePlaceholder": "p. ej. Acme Cloud",
+    "colorLabel": "Color principal",
+    "colorHint": "Elige un color hexadecimal de acento para botones, estados activos y resaltados.",
+    "presetsLabel": "Preajustes",
+    "assetsTitle": "Logotipos y favicon",
+    "assetsDesc": "Sube archivos SVG, PNG, JPG, WEBP o ICO personalizados (máx. 2 MB cada uno).",
+    "logoLight": "Logotipo (modo claro)",
+    "logoDark": "Logotipo (modo oscuro)",
+    "iconLight": "Icono compacto (modo claro)",
+    "iconDark": "Icono compacto (modo oscuro)",
+    "favicon": "Favicon",
+    "uploadHint": "Haz clic para subir o suelta una imagen",
+    "resetAsset": "Restaurar predeterminado",
+    "previewTitle": "Vista previa en vivo",
+    "previewDashboard": "Vista previa del panel",
+    "previewLogin": "Vista previa de inicio de sesión",
+    "previewButton": "Acción principal",
+    "resetAll": "Restablecer todo a los valores predeterminados",
+    "resetConfirmTitle": "¿Restablecer la marca a los valores predeterminados?",
+    "resetConfirmDesc": "Esto elimina tu nombre personalizado, color y logotipos subidos.",
+    "resetConfirmAction": "Restablecer marca",
+    "saved": "Marca actualizada.",
+    "saveFailed": "No se pudieron guardar los ajustes de marca.",
+    "resetSuccess": "Marca restablecida a los valores predeterminados.",
+    "resetFailed": "No se pudo restablecer la marca.",
+    "invalidHex": "Introduce un color hexadecimal válido de 6 dígitos, como #3B82F6.",
+    "invalidFile": "Elige una imagen SVG, PNG, JPG, WEBP o ICO de menos de 2 MB.",
+    "setupStepBadge": "Paso 1 de 2 — Opcional",
+    "setupTitle": "Personaliza la marca de tu panel",
+    "setupSubtitle": "Define el nombre de tu marca, color y logotipo antes de crear la cuenta de administrador.",
+    "setupSaveAndContinue": "Guardar marca y continuar",
+    "setupSkip": "Omitir por ahora",
+    "setupCustomizeButton": "Personalizar marca primero",
+    "setupBackToRegister": "Volver a la configuración de la cuenta"
   }
 }

@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'Журнал активности теперь удаляет записи старше :months мес.',
     'setting.activity_retention_cleared' => 'Журнал активности теперь хранит все записи',
     'setting.updated' => 'Обновил настройки :group',
+    'setting.branding_updated' => 'Обновил брендирование панели',
+    'setting.branding_reset' => 'Сбросил брендирование панели к значениям по умолчанию',
     'setting.reboot_schedule_updated' => 'Изменил расписание автоматической перезагрузки',
     'setting.security_updates_started' => 'Начата установка обновлений безопасности',
     'setting.security_updates_installed' => 'Обновления безопасности установлены',

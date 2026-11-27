@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'Aktivitätsprotokoll löscht jetzt Einträge, die älter als :months Monate sind',
     'setting.activity_retention_cleared' => 'Aktivitätsprotokoll behält jetzt alle Einträge',
     'setting.updated' => 'Einstellungen :group aktualisiert',
+    'setting.branding_updated' => 'Panel-Branding aktualisiert',
+    'setting.branding_reset' => 'Panel-Branding auf Standardwerte zurückgesetzt',
     'setting.reboot_schedule_updated' => 'Zeitplan für automatischen Neustart geändert',
     'setting.security_updates_started' => 'Installation der Sicherheitsupdates gestartet',
     'setting.security_updates_installed' => 'Sicherheitsupdates installiert',

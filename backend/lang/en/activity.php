@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'Set the activity log to delete entries older than :months months',
     'setting.activity_retention_cleared' => 'Set the activity log to keep every entry',
     'setting.updated' => 'Updated :group settings',
+    'setting.branding_updated' => 'Updated the panel branding',
+    'setting.branding_reset' => 'Reset the panel branding to defaults',
     'setting.reboot_schedule_updated' => 'Changed the automatic reboot schedule',
     'setting.security_updates_started' => 'Started installing security updates',
     'setting.security_updates_installed' => 'Installed security updates',

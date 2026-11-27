@@ -319,7 +319,8 @@
       "panelUpdate": "Panel Update",
       "doctor": "System Health",
       "errorLogs": "Error Log",
-      "central": "Central"
+      "central": "Central",
+      "branding": "Branding"
     },
     "unknown": "Unknown",
     "attention": {
@@ -8299,5 +8300,48 @@
       "application_install": "Application install",
       "container_redeploy": "Pull and redeploy"
     }
+  },
+  "branding": {
+    "title": "Branding",
+    "subtitle": "Customise your panel name, accent colour, logos, and favicon.",
+    "loadFailed": "Branding settings could not be loaded.",
+    "centralNotice": "Central branding is currently active and overrides panel defaults when connected.",
+    "identityTitle": "Brand identity",
+    "identityDesc": "Set the panel name and primary colour shown across the interface.",
+    "nameLabel": "Panel name",
+    "namePlaceholder": "e.g. Acme Cloud",
+    "colorLabel": "Primary colour",
+    "colorHint": "Choose an accent hex colour used for buttons, active states, and highlights.",
+    "presetsLabel": "Presets",
+    "assetsTitle": "Logos & favicon",
+    "assetsDesc": "Upload custom SVG, PNG, JPG, WEBP, or ICO files (max 2 MB each).",
+    "logoLight": "Logo (light mode)",
+    "logoDark": "Logo (dark mode)",
+    "iconLight": "Compact icon (light mode)",
+    "iconDark": "Compact icon (dark mode)",
+    "favicon": "Favicon",
+    "uploadHint": "Click to upload or drop an image",
+    "resetAsset": "Restore default",
+    "previewTitle": "Live preview",
+    "previewDashboard": "Panel preview",
+    "previewLogin": "Sign-in preview",
+    "previewButton": "Primary action",
+    "resetAll": "Reset all to defaults",
+    "resetConfirmTitle": "Reset branding to defaults?",
+    "resetConfirmDesc": "This removes your custom name, colour, and uploaded logos.",
+    "resetConfirmAction": "Reset branding",
+    "saved": "Branding updated.",
+    "saveFailed": "Branding settings could not be saved.",
+    "resetSuccess": "Branding reset to defaults.",
+    "resetFailed": "Branding could not be reset.",
+    "invalidHex": "Enter a valid 6-digit hex colour such as #3B82F6.",
+    "invalidFile": "Choose an SVG, PNG, JPG, WEBP, or ICO image under 2 MB.",
+    "setupStepBadge": "Step 1 of 2 — Optional",
+    "setupTitle": "White-label your panel",
+    "setupSubtitle": "Set your brand name, colour, and logo before creating the administrator account.",
+    "setupSaveAndContinue": "Save branding & continue",
+    "setupSkip": "Skip for now",
+    "setupCustomizeButton": "Customise brand first",
+    "setupBackToRegister": "Back to account setup"
   }
 }

@@ -1,34 +1,25 @@
 import { redirect } from "next/navigation";
-import { getTranslations } from "next-intl/server";
 
 export const dynamic = "force-dynamic";
 
-import Link from "@/components/ui/app-link";
 import { getCurrentUser } from "@/lib/auth/get-current-user";
 import { getBasicInfo } from "@/lib/basic-info/get-basic-info";
+import { getBranding } from "@/lib/branding/get-branding";
 import { PanelUnavailableCard } from "@/components/sections/panel-unavailable";
 import { isPanelUnavailable } from "@/lib/api/unavailable";
 import { RateLimitedCard } from "@/components/sections/rate-limited";
 import { isRateLimited } from "@/lib/api/rate-limited";
 import { RequestFailedCard } from "@/components/sections/request-failed";
 import { isRequestFailed, requestFailureProps } from "@/lib/api/request-failed";
-import { RegisterForm } from "@/components/forms/register-form";
-import { Logo } from "@/components/logo";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-  CardDescription,
-} from "@/components/ui/card";
+import { FirstRunWizard } from "@/components/auth/first-run-wizard";
 
 export default async function RegisterPage() {
-  let user, basicInfo, t;
+  let user, basicInfo, branding;
   try {
-    [user, basicInfo, t] = await Promise.all([
+    [user, basicInfo, branding] = await Promise.all([
       getCurrentUser(),
       getBasicInfo(),
-      getTranslations("auth"),
+      getBranding(),
     ]);
   } catch (error) {
     if (isRateLimited(error)) return <RateLimitedCard />;
@@ -41,21 +32,9 @@ export default async function RegisterPage() {
   if (!basicInfo.registration_open) redirect("/login");
 
   return (
-    <Card className="w-full gap-0 shadow-xl shadow-black/5">
-      <CardHeader className="flex flex-col items-center gap-2 pb-6 text-center">
-        <Logo className="mb-2 h-9 w-auto" />
-        <CardTitle className="text-xl">{t("registerTitle")}</CardTitle>
-        <CardDescription>{t("registerSubtitle")}</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-6 pt-6">
-        <RegisterForm policy={basicInfo.password_policy} />
-        <p className="text-center text-sm text-muted-foreground">
-          {t("haveAccount")}{" "}
-          <Link href="/login" className="font-medium text-primary hover:underline">
-            {t("loginLink")}
-          </Link>
-        </p>
-      </CardContent>
-    </Card>
+    <FirstRunWizard
+      initialBranding={branding}
+      policy={basicInfo.password_policy}
+    />
   );
 }

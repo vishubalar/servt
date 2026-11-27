@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'गतिविधि लॉग को :months महीने से पुरानी प्रविष्टियाँ हटाने पर सेट किया',
     'setting.activity_retention_cleared' => 'गतिविधि लॉग को सभी प्रविष्टियाँ रखने पर सेट किया',
     'setting.updated' => ':group सेटिंग्स अपडेट कीं',
+    'setting.branding_updated' => 'पैनल ब्रांडिंग अपडेट की',
+    'setting.branding_reset' => 'पैनल ब्रांडिंग को डिफ़ॉल्ट पर रीसेट किया',
     'setting.reboot_schedule_updated' => 'स्वचालित रीबूट शेड्यूल बदला',
     'setting.security_updates_started' => 'सिक्योरिटी अपडेट इंस्टॉल करना शुरू किया',
     'setting.security_updates_installed' => 'सिक्योरिटी अपडेट इंस्टॉल किए',

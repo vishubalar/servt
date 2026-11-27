@@ -19,6 +19,8 @@ return [
     'setting.activity_retention_updated' => 'アクティビティログを :months か月より古いエントリを削除する設定にしました',
     'setting.activity_retention_cleared' => 'アクティビティログをすべてのエントリを保持する設定にしました',
     'setting.updated' => ':group の設定を更新しました',
+    'setting.branding_updated' => 'パネルのブランディングを更新しました',
+    'setting.branding_reset' => 'パネルのブランディングを既定値にリセットしました',
     'setting.reboot_schedule_updated' => '自動再起動のスケジュールを変更しました',
     'setting.security_updates_started' => 'セキュリティ更新のインストールを開始しました',
     'setting.security_updates_installed' => 'セキュリティ更新をインストールしました',

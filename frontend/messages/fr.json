@@ -319,7 +319,8 @@
       "panelUpdate": "Mise à jour du panneau",
       "doctor": "Santé du système",
       "errorLogs": "Journal d'erreurs",
-      "central": "Central"
+      "central": "Central",
+      "branding": "Image de marque"
     },
     "unknown": "Inconnu",
     "attention": {
@@ -8299,5 +8300,48 @@
       "application_install": "Installation d'application",
       "container_redeploy": "Récupérer et redéployer"
     }
+  },
+  "branding": {
+    "title": "Image de marque",
+    "subtitle": "Personnalisez le nom de votre panneau, la couleur d'accentuation, les logos et le favicon.",
+    "loadFailed": "Impossible de charger les paramètres d'image de marque.",
+    "centralNotice": "L'image de marque centrale est actuellement active et remplace les paramètres par défaut du panneau lorsqu'il est connecté.",
+    "identityTitle": "Identité visuelle",
+    "identityDesc": "Définissez le nom du panneau et la couleur principale affichés dans l'interface.",
+    "nameLabel": "Nom du panneau",
+    "namePlaceholder": "ex. Acme Cloud",
+    "colorLabel": "Couleur principale",
+    "colorHint": "Choisissez une couleur hexadécimale d'accentuation pour les boutons, les états actifs et les surbrillances.",
+    "presetsLabel": "Préréglages",
+    "assetsTitle": "Logos et favicon",
+    "assetsDesc": "Téléversez des fichiers SVG, PNG, JPG, WEBP ou ICO personnalisés (2 Mo max chacun).",
+    "logoLight": "Logo (mode clair)",
+    "logoDark": "Logo (mode sombre)",
+    "iconLight": "Icône compacte (mode clair)",
+    "iconDark": "Icône compacte (mode sombre)",
+    "favicon": "Favicon",
+    "uploadHint": "Cliquez pour téléverser ou déposez une image",
+    "resetAsset": "Rétablir par défaut",
+    "previewTitle": "Aperçu en direct",
+    "previewDashboard": "Aperçu du panneau",
+    "previewLogin": "Aperçu de connexion",
+    "previewButton": "Action principale",
+    "resetAll": "Tout réinitialiser par défaut",
+    "resetConfirmTitle": "Réinitialiser l'image de marque par défaut ?",
+    "resetConfirmDesc": "Cela supprime votre nom personnalisé, votre couleur et vos logos téléversés.",
+    "resetConfirmAction": "Réinitialiser l'image de marque",
+    "saved": "Image de marque mise à jour.",
+    "saveFailed": "Impossible d'enregistrer les paramètres d'image de marque.",
+    "resetSuccess": "Image de marque réinitialisée par défaut.",
+    "resetFailed": "Impossible de réinitialiser l'image de marque.",
+    "invalidHex": "Saisissez une couleur hexadécimale valide à 6 chiffres telle que #3B82F6.",
+    "invalidFile": "Choisissez une image SVG, PNG, JPG, WEBP ou ICO de moins de 2 Mo.",
+    "setupStepBadge": "Étape 1 sur 2 — Facultatif",
+    "setupTitle": "Personnalisez votre panneau en marque blanche",
+    "setupSubtitle": "Définissez le nom, la couleur et le logo de votre marque avant de créer le compte administrateur.",
+    "setupSaveAndContinue": "Enregistrer l'image de marque et continuer",
+    "setupSkip": "Ignorer pour le moment",
+    "setupCustomizeButton": "Personnaliser la marque d'abord",
+    "setupBackToRegister": "Retour à la configuration du compte"
   }
 }

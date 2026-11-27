@@ -319,7 +319,8 @@
       "panelUpdate": "Panel-Update",
       "doctor": "Systemzustand",
       "errorLogs": "Fehlerprotokoll",
-      "central": "Central"
+      "central": "Central",
+      "branding": "Branding"
     },
     "unknown": "Unbekannt",
     "attention": {
@@ -8299,5 +8300,48 @@
       "application_install": "Anwendungsinstallation",
       "container_redeploy": "Laden und neu ausrollen"
     }
+  },
+  "branding": {
+    "title": "Branding",
+    "subtitle": "Passen Sie Ihren Panel-Namen, Ihre Akzentfarbe, Logos und das Favicon an.",
+    "loadFailed": "Die Branding-Einstellungen konnten nicht geladen werden.",
+    "centralNotice": "Zentrales Branding ist derzeit aktiv und überschreibt bei bestehender Verbindung die Standardwerte des Panels.",
+    "identityTitle": "Markenidentität",
+    "identityDesc": "Legen Sie den Panel-Namen und die Primärfarbe fest, die in der gesamten Oberfläche angezeigt werden.",
+    "nameLabel": "Panel-Name",
+    "namePlaceholder": "z. B. Acme Cloud",
+    "colorLabel": "Primärfarbe",
+    "colorHint": "Wählen Sie eine Hex-Akzentfarbe für Schaltflächen, aktive Zustände und Hervorhebungen.",
+    "presetsLabel": "Voreinstellungen",
+    "assetsTitle": "Logos & Favicon",
+    "assetsDesc": "Laden Sie benutzerdefinierte SVG-, PNG-, JPG-, WEBP- oder ICO-Dateien hoch (max. 2 MB pro Datei).",
+    "logoLight": "Logo (Heller Modus)",
+    "logoDark": "Logo (Dunkler Modus)",
+    "iconLight": "Kompaktsymbol (Heller Modus)",
+    "iconDark": "Kompaktsymbol (Dunkler Modus)",
+    "favicon": "Favicon",
+    "uploadHint": "Zum Hochladen klicken oder Bild hierher ziehen",
+    "resetAsset": "Standard wiederherstellen",
+    "previewTitle": "Live-Vorschau",
+    "previewDashboard": "Panel-Vorschau",
+    "previewLogin": "Anmelde-Vorschau",
+    "previewButton": "Primäre Aktion",
+    "resetAll": "Alles auf Standard zurücksetzen",
+    "resetConfirmTitle": "Branding auf Standard zurücksetzen?",
+    "resetConfirmDesc": "Dadurch werden Ihr benutzerdefinierter Name, Ihre Farbe und hochgeladene Logos entfernt.",
+    "resetConfirmAction": "Branding zurücksetzen",
+    "saved": "Branding aktualisiert.",
+    "saveFailed": "Die Branding-Einstellungen konnten nicht gespeichert werden.",
+    "resetSuccess": "Branding auf Standard zurückgesetzt.",
+    "resetFailed": "Branding konnte nicht zurückgesetzt werden.",
+    "invalidHex": "Geben Sie eine gültige 6-stellige Hex-Farbe wie #3B82F6 ein.",
+    "invalidFile": "Wählen Sie ein SVG-, PNG-, JPG-, WEBP- oder ICO-Bild unter 2 MB.",
+    "setupStepBadge": "Schritt 1 von 2 — Optional",
+    "setupTitle": "Panel mit eigenem Branding versehen",
+    "setupSubtitle": "Legen Sie Ihren Markennamen, Ihre Farbe und Ihr Logo fest, bevor Sie das Administratorkonto erstellen.",
+    "setupSaveAndContinue": "Branding speichern & fortfahren",
+    "setupSkip": "Später",
+    "setupCustomizeButton": "Marke zuerst anpassen",
+    "setupBackToRegister": "Zurück zur Kontoeinrichtung"
   }
 }
