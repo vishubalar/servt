@@ -66,21 +66,28 @@ a small server.
 including MongoDB unavailability on Ubuntu 26.04 and LSPHP version differences.
 Recheck dated vendor availability before choosing a platform.
 
-## Pre-Installation White-Label Setup
+## Branding (white-label)
 
-Before installing or deploying the panel, you can customize its branding using the included pre-installation web UI (requires Node.js):
+After installation, the **first browser visit** opens a registration page with
+an optional branding step. Set your Brand Name, Primary Colour and upload logos
+before creating the administrator — these values are stored in the database and
+take effect immediately without a rebuild.
+
+Administrators can update or reset branding at any time from
+**Admin → Branding** in the web interface.
+
+### Pre-installation setup (optional, advanced)
+
+If you prefer to bake defaults into the source tree before deploying — for
+example, when distributing your own fork — the `preinstall/` directory contains
+a zero-dependency Node.js web UI that patches config files and assets on disk:
 
 ```bash
-node preinstall/server.mjs
+node preinstall/server.mjs        # then open http://127.0.0.1:3456
 ```
 
-Open the local URL printed in the terminal to configure:
-
-- **Brand Name**
-- **Primary Hex Color**
-- **Logos & Favicon** (upload your own light/dark logos and favicon)
-
-Save your changes in the UI before running the installer or building the frontend/backend so your custom branding is applied to the deployment.
+See [`preinstall/README.md`](preinstall/README.md) for details. This is entirely
+optional; most deployments only need the in-browser setup above.
 
 ## Installation
 
@@ -127,9 +134,10 @@ Without a domain, the installer derives a nip.io hostname from the server's IP.
 Certificate issuance can hit shared rate limits; the installer can fall back to a
 self-signed certificate. Use your own hostname for a publicly trusted deployment.
 
-On completion, open the printed URL. Unless an administrator was supplied during
-installation, the first registered account becomes administrator and public
-registration closes. Finish the setup checks before creating applications.
+On completion, open the printed URL. The first visit shows a registration page
+where you can optionally customise the panel's branding (name, colour, logos)
+before creating the administrator account. Public registration closes after the
+first account. Finish the setup checks before creating applications.
 
 The fresh-server guard refuses conflicting panels, sites, databases and other
 existing workloads. A recognised installation can be rerun after fixing a failed
@@ -246,6 +254,7 @@ backend/                 Laravel API, server operations and Pest tests
 backend/API_REFERENCE.md API contracts and restrictions
 frontend/                Next.js interface and frontend checks
 install.sh               server installer
+preinstall/              optional pre-install branding tool (Node.js)
 SUPPORTED_PLATFORMS.md   OS and upstream-package caveats
 ```
 

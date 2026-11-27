@@ -213,3 +213,45 @@ If you have not already picked this up: `modified` → `modified_at`,
 - **`has_staging`** is on the application resource but only one of the two
   endpoints returning an application loads the relation. Branch on the staging
   endpoint returning `null` instead.
+
+---
+
+## 2026-11-27
+
+### Branding — first-run wizard and admin studio
+
+Three new endpoints manage panel branding from the browser:
+
+- **`POST /branding/setup`** — available before the first user registers
+  (throttled as `login`). Accepts multipart form with `name`, `primary_color`
+  and file uploads for `logo`, `logo_dark`, `icon`, `icon_dark`, `favicon`.
+  Each field also accepts `clear_<field>: true` to reset to config defaults.
+  Returns `{"branding": {…}}` same as `GET /branding`. 403 once someone has
+  registered.
+
+- **`GET /admin/branding`** — (`access-admin` view) returns resolved branding
+  plus `custom` (DB overrides only), `defaults` (`config/branding.php`) and
+  `central_active` (bool). The studio needs all three to show which values
+  differ from defaults and whether Central is overriding anything.
+
+- **`POST /admin/branding`** — (`access-admin` manage) same fields/rules as
+  setup. Activity: `setting.branding_updated`.
+
+- **`DELETE /admin/branding`** — (`access-admin` manage) resets all to defaults
+  and deletes uploaded assets. Activity: `setting.branding_reset`.
+
+**File validation:** max 2 MB, extensions `svg`, `png`, `jpg`, `jpeg`, `webp`,
+`ico`. SVG is sanitized; `text/plain` MIME accepted only for `.svg` extension.
+
+**Migration:** `2026_11_27_000001_add_branding_to_settings_table` adds
+`brand_name`, `brand_primary_color`, `brand_logo`, `brand_logo_dark`,
+`brand_icon`, `brand_icon_dark`, `brand_favicon`, `brand_updated_at` to
+`settings`. Runs on next `php artisan migrate`.
+
+**Uploaded assets** are served via `GET /branding/assets/{filename}` with
+immutable cache headers. URLs in the branding response look like
+`/api/branding/assets/logo-abc123.svg`.
+
+**i18n:** `setting.branding_updated` and `setting.branding_reset` added to all
+8 `lang/*/activity.php`; `branding_unsafe_svg` added to all 8
+`lang/*/validation.php`.

@@ -524,6 +524,81 @@ Unauthenticated. (The example here was out of date; corrected 2026-10-20.)
 
 `tag_line`, `links` (only the ones set) and `display_message` (Central's banner) are new and `null` without Central. Logos are root-relative paths for the panel's own files and absolute URLs for Central's.
 
+**DB overrides** (2026-11-27): administrators can customise branding from the web UI. When a value is stored in the `settings` table it takes precedence over `config/branding.php` defaults while still being overridable by Central.
+
+---
+
+### GET `/branding/assets/{filename}`
+Unauthenticated. Serves uploaded branding files from `storage/app/branding/`.
+
+Returns the binary file with correct `Content-Type`, `X-Content-Type-Options: nosniff` and one-year immutable cache headers. 404 when the filename does not match a stored asset.
+
+---
+
+### POST `/branding/setup`
+Unauthenticated · **Throttle:** `login`
+
+First-run branding setup — available **only before the first user has registered**. Returns `403` once a non-system user exists. Accepts the same fields as the admin branding endpoint below.
+
+**Request** (`multipart/form-data`):
+
+| Field | Type | Rules |
+|---|---|---|
+| `name` | string | max 80 chars |
+| `primary_color` | string | `#` + 6 hex digits |
+| `logo` | file | max 2 MB; svg, png, jpg, webp, ico |
+| `logo_dark` | file | same |
+| `icon` | file | same |
+| `icon_dark` | file | same |
+| `favicon` | file | same |
+| `clear_<field>` | boolean | Reset that field to config default |
+
+All fields are optional. SVG files are validated for safe content; `text/plain` MIME is accepted only with `.svg` extension. The `clear_*` flags accept `true`/`false` strings or booleans.
+
+**Response `200`:** `{"branding": {…}}` — same shape as `GET /branding`.
+
+---
+
+### GET `/admin/branding`
+**Permission:** `access-admin` (view)
+
+Returns current branding state plus admin-only metadata:
+
+```json
+{"branding": {
+  "name": "My Panel", "primary_color": "#3b82f6",
+  "logo": "/api/branding/assets/logo-abc123.svg",
+  "logo_dark": null, "icon": null, "icon_dark": null, "favicon": null,
+  "custom": {"name": "My Panel", "primary_color": "#3b82f6", "logo": "/api/branding/assets/logo-abc123.svg"},
+  "defaults": {"name": "Control Panel", "primary_color": "#3B82F6", "logo": "/brand/panel-horizontal-light.svg", "…": "…"},
+  "central_active": false
+}}
+```
+
+`custom` contains only the fields that differ from defaults (DB overrides). `defaults` is `config/branding.php`. `central_active` is whether Central branding is currently in effect.
+
+---
+
+### POST `/admin/branding`
+**Permission:** `access-admin` (manage)
+
+**Request** (`multipart/form-data`): same fields and rules as `POST /branding/setup`.
+
+**Response `200`:** same shape as `GET /admin/branding`.
+
+Activity: `setting.branding_updated`.
+
+---
+
+### DELETE `/admin/branding`
+**Permission:** `access-admin` (manage)
+
+Resets all branding to `config/branding.php` defaults: clears DB overrides and deletes uploaded files.
+
+**Response `200`:** same shape as `GET /admin/branding` (with defaults restored).
+
+Activity: `setting.branding_reset`.
+
 ---
 
 ## Operations — every long job in one list

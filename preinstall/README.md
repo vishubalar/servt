@@ -1,5 +1,15 @@
 # Pre-Installation White-Label Configurator
 
+> **Optional.** Most deployments don't need this tool. After installing the panel
+> with `install.sh`, the first browser visit shows a registration page with a
+> built-in branding step — set your Brand Name, Primary Colour and upload logos
+> right there. Administrators can also change branding at any time from
+> **Admin → Branding** in the running panel.
+
+This tool is for fork maintainers and distributors who want to bake branding
+defaults into the **source tree** before deploying, so every installation of
+their fork ships with custom defaults out of the box.
+
 Zero-dependency local Web UI to customize your panel's **Brand Name**, **Primary Hex Color**, **Logos / Marks / Favicons**, and optional repository/deployment settings before running `install.sh` or committing to your fork.
 
 ## Quick Start

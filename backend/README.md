@@ -8,6 +8,12 @@ browser interface lives in [`../frontend/`](../frontend/).
 - [Supported platforms](../SUPPORTED_PLATFORMS.md)
 - [API reference](API_REFERENCE.md) — routes, permissions, response shapes and restrictions
 
+**White-label branding:** the panel supports runtime branding customisation.
+Defaults live in `config/branding.php` and `app/Support/BrandColor.php`; the
+`PanelBranding` service reads DB overrides from the `settings` table and stores
+uploaded assets in `storage/app/branding/`. See the [API reference](API_REFERENCE.md#branding)
+for the public, first-run and admin branding endpoints.
+
 This guide describes the current source and a development setup. It is **not**
 a production provisioning runbook. For a real panel, use the root install guide
 on a fresh supported server.
